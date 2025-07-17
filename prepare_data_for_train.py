@@ -351,6 +351,26 @@ class PREPARE_DATA_FOR_TRAIN:
             if any(tok in c for tok in ["hour", "day_of_week", "is_weekend"])
         ]
         feat_cols = [c for c in data.columns if c not in time_cols + [close_col]]
+        
+        # ------------------------------------------------------------
+        # --- NEW ▸ drop RAW columns that are constant-zero در کل دیتاست ---
+        # ------------------------------------------------------------
+        if not strict_cols:
+            # هر ستونی که در کل data مقدارش تقریباً صفر است و باینری واقعی نیست
+            is_binary_raw = (data[feat_cols].nunique() <= 2).to_dict()
+            zero_raw_cols = [
+                c for c in feat_cols
+                if pd.api.types.is_numeric_dtype(data[c])          # فقط ستون‌های عددی
+                and data[c].abs().max() < 1e-12
+                and not is_binary_raw.get(c, False)
+            ]
+            if zero_raw_cols:
+                if self.verbose:
+                    print(f"[FILTER] drop {len(zero_raw_cols)} constant-zero RAW cols")
+                # هم از دیتافریم و هم از فهرست فیچرها حذف می‌کنیم
+                data      = data.drop(columns=zero_raw_cols, errors="ignore")
+                feat_cols = [c for c in feat_cols if c not in zero_raw_cols]
+
         # ------------------------------------------------------------
         # NEW ▸ ffill روی صفرهای پُرکنندهٔ 1H_* (غیرباینری) 
         # ------------------------------------------------------------

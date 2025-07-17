@@ -74,12 +74,12 @@ logging.getLogger("daal4py").setLevel(logging.WARNING)
 # ---------------------------------------------------------------------------
 @dataclass
 class GAConfig:
-    population_size: int = 8
-    n_generations: int = 3
+    population_size: int = 16
+    n_generations: int = 4
     cx_pb: float = 0.8
     mut_pb: float = 0.4
     early_stopping_threshold: float = 0.85
-    possible_window_sizes: Tuple[int, ...] = (3, 4, 5, 6, 7, 8, 9, 10)
+    possible_window_sizes: Tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 
 CFG = GAConfig()
 
