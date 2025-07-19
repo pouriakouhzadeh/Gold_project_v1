@@ -440,12 +440,24 @@ class PREPARE_DATA_FOR_TRAIN:
         
 
         # ---------------- Feature Selection ----------------
-        if selected_features is None:
-            feats = self.select_features(df_diff, y)
-        elif selected_features == []:
-            feats = df_diff.columns.tolist()
+# ---------------- Feature Selection (+tminus support) ----------------
+# --- تشخیص اینکه آیا کاربر لیست post-window (با _tminus) داده است؟
+        tminus_regex = re.compile(r"_tminus\d+$")
+        has_tminus   = bool(selected_features and any(tminus_regex.search(f) for f in selected_features))
+
+        if has_tminus:
+            # ❶ استخراج نامِ ستون پایه (قبل از پنجره‌بندی)
+            base_feats = {tminus_regex.sub("", f) for f in selected_features}
+            # ❷ ستون‌هایی که در df_diff واقعاً موجودند نگه می‌داریم
+            feats = [f for f in base_feats if f in df_diff.columns]
+            strict_cols = True                 # فیلترهای بعدی اعمال نشود
         else:
-            feats = [f for f in selected_features if f in df_diff]
+            if selected_features is None:
+                feats = self.select_features(df_diff, y)
+            elif selected_features == []:
+                feats = df_diff.columns.tolist()
+            else:                              # لیستِ معمولیِ pre-window
+                feats = [f for f in selected_features if f in df_diff]
 
         # --- حذف فیچرهای معیوبِ شناسایی‌شده ---
         if (not strict_cols) and self.bad_cols_tf:
@@ -474,6 +486,10 @@ class PREPARE_DATA_FOR_TRAIN:
                 columns=[f"{c}_tminus{i}" for i in range(window) for c in feats],
             )
             y = y.iloc[window - 1 :].reset_index(drop=True)
+            # --- اگر ورودیِ selected_features ستونی با _tminus داشت، اینجا فیلتر کن
+            if has_tminus:
+                wanted = [c for c in selected_features if c in X_f.columns]
+                X_f = X_f[wanted].copy()
 
         # ---------------- Final Clean ----------------
         X_f.replace([np.inf, -np.inf], np.nan, inplace=True)
