@@ -82,6 +82,12 @@ def _safe_agg_group(grp: pd.DataFrame, agg_dict: dict[str, callable]):
 
 # ---------------- MAIN CLASS ----------------
 class PREPARE_DATA_FOR_TRAIN:
+        # ------------------------------------------------------------------
+    # LIVE incremental internal state  (keep last two raw rows)
+    # ------------------------------------------------------------------
+    _live_prev2: pd.DataFrame | None = None       # آخرین دو ردیف خام
+    _live_prev_time: pd.Timestamp | None = None   # فقط اگر خواستی ترتیب را چک کنی
+
         # --------- NEW ---------
     bad_cols_tf: dict[str, set[str]] = defaultdict(set)   # {"30T": {"colA", ...}, "1H": {...}}
     allow_regex = re.compile(r"(?:is_weekend|day_of_week|hour)$", re.I)
@@ -504,12 +510,41 @@ class PREPARE_DATA_FOR_TRAIN:
 
         return X_f.reset_index(drop=True), y.reset_index(drop=True), feats, price_raw
 
-    # ================= 4) READY_INCREMENTAL =================) READY_INCREMENTAL =================
-    def ready_incremental(self, data_window: pd.DataFrame, window=1, selected_features: List[str] | None = None):
-        # print("Ready incremental start ...")
-        X, _, feats, _ = self.ready(data_window, window, selected_features, mode="predict")
-        # print("Ready incremental finished")
-        return X.tail(1).reset_index(drop=True), feats
+    # ================= 4) READY_INCREMENTAL =================
+    def ready_incremental(
+        self,
+        data_window: pd.DataFrame,
+        window: int = 1,
+        selected_features: List[str] | None = None,
+    ):
+        """
+        حالت Live:
+        آخرین دو ردیف خام را نگه می‌داریم تا diff همیشه مثل batch محاسبه شود.
+        """
+        # ── اولین فراخوان: فقط بافر را پُر می‌کنیم ─────────────────────────
+        if self._live_prev2 is None:
+            self._live_prev2 = data_window.iloc[-2:].copy()
+            # خروجی خالی؛ اولین تیک هنوز آماده نیست
+            return pd.DataFrame(), []
+
+        # ── چسباندن دو ردیف قبلی به ابتدای پنجرۀ جدید ────────────────────
+        concat = pd.concat([self._live_prev2, data_window], ignore_index=True)
+
+        # حالا آماده‌سازی طبق روال معمول
+        X_full, _, feats, _ = self.ready(
+            concat,
+            window=window,
+            selected_features=selected_features,
+            mode="predict",
+        )
+
+        # به‌روز کردن بافر برای فراخوان بعد
+        self._live_prev2 = data_window.iloc[-2:].copy()
+
+        # ممکن است X_full بیش از یک ردیف بدهد → فقط سطر «فعلی» را برمی‌گردانیم
+        if X_full.empty:
+            return pd.DataFrame(), feats
+        return X_full.tail(1).reset_index(drop=True), feats
 
     # ================= 5) LOAD & MERGE =================
     def load_data(self) -> pd.DataFrame:
