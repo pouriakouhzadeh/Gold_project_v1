@@ -518,19 +518,21 @@ class PREPARE_DATA_FOR_TRAIN:
         selected_features: List[str] | None = None,
     ):
         """
-        حالت Live:
-        آخرین دو ردیف خام را نگه می‌داریم تا diff همیشه مثل batch محاسبه شود.
+        Live-safe wrapper around ``ready``.
+        آخرین دو رکورد خام نگه داشته می‌شود تا عملیات diff دقیقاً مثل حالت
+        batch باشد و هیچ ستونِ _tminus از داده بی‌خبر نماند.
         """
-        # ── اولین فراخوان: فقط بافر را پُر می‌کنیم ─────────────────────────
-        if self._live_prev2 is None:
+        if not hasattr(self, "_live_prev2"):
+            # اولین فراخوان: فقط بافر را پر می‌کنیم
             self._live_prev2 = data_window.iloc[-2:].copy()
-            # خروجی خالی؛ اولین تیک هنوز آماده نیست
             return pd.DataFrame(), []
 
-        # ── چسباندن دو ردیف قبلی به ابتدای پنجرۀ جدید ────────────────────
-        concat = pd.concat([self._live_prev2, data_window], ignore_index=True)
+        # چسباندن دو رکورد قبلی به ابتدای پنجرهٔ جدید
+        concat = pd.concat(
+            [self._live_prev2, data_window], ignore_index=True
+        )
 
-        # حالا آماده‌سازی طبق روال معمول
+        # حساب دقیق ویژگی‌ها – عین ready
         X_full, _, feats, _ = self.ready(
             concat,
             window=window,
@@ -538,12 +540,13 @@ class PREPARE_DATA_FOR_TRAIN:
             mode="predict",
         )
 
-        # به‌روز کردن بافر برای فراخوان بعد
+        # بافر را برای فراخوان بعد به‌روزرسانی کن
         self._live_prev2 = data_window.iloc[-2:].copy()
 
-        # ممکن است X_full بیش از یک ردیف بدهد → فقط سطر «فعلی» را برمی‌گردانیم
+        # ممکن است چند ردیف بدهد (اگر window>1) → فقط آخرین رکورد
         if X_full.empty:
             return pd.DataFrame(), feats
+
         return X_full.tail(1).reset_index(drop=True), feats
 
     # ================= 5) LOAD & MERGE =================

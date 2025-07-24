@@ -42,7 +42,7 @@ LIVE_CSV = "live_snapshot.csv"
 COMPARE_CSV = "comparison_differences.csv"
 
 STRICT = False   # if True ⇒ abort as soon as a suspect row/column is detected
-
+WARM_UP_EXTRA = 2
 # ──────────────────────────────────────────────────────────────────────────────
 # LOGGING
 # ──────────────────────────────────────────────────────────────────────────────
@@ -112,7 +112,7 @@ def main(max_rows: int | None = None) -> None:
     rk = re.compile(r"_(\d{1,3})(?:$|_)")
     lookbacks = [int(m.group(1)) for m in map(rk.search, final_cols) if m]
     max_lb    = max(lookbacks) if lookbacks else 1
-    PAD       = window + max_lb + 1
+    PAD       = window + max_lb + 2
     LOG.info("📏 max‑lookback=%d  |  PAD=%d", max_lb, PAD)
 
     # 2️⃣  ── Load & merge raw CSVs ────────────────────────────────────────────
@@ -149,7 +149,9 @@ def main(max_rows: int | None = None) -> None:
         sys.exit(1)
 
     X_eval = align_columns(X_all.copy(), final_cols).astype("float32")
-    TRAIN_MEDIANS = X_eval.median()
+    X_eval.replace([np.inf, -np.inf], np.nan, inplace=True)   # مثل live
+    TRAIN_MEDIANS = X_eval.median()                           # محاسبه‌ی مدین واحد
+    X_eval.fillna(TRAIN_MEDIANS, inplace=True)   
 
     times = merged[TIME_COL].iloc[window : window + len(X_eval)].reset_index(drop=True)
 
@@ -183,8 +185,18 @@ def main(max_rows: int | None = None) -> None:
     live_rows:  list[dict] = []
 
     for idx in range(PAD, len(merged) - 1):
+            # مرحلهٔ گرم‌کردن؛ هنوز پیش‌بینی نمی‌گیریم
+        if idx < PAD * WARM_UP_EXTRA:
+            continue
+
         win_df = merged.iloc[idx - PAD : idx + 1]
-        X_live, _ = prep.ready_incremental(win_df, window=window, selected_features=feats)
+
+        X_live, _ = prep.ready_incremental(
+            win_df,
+            window=window,
+            selected_features=feats,
+        )
+
         if X_live.empty:
             continue
 
