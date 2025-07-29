@@ -22,6 +22,7 @@ from AllIndicatorsNoLeak import AllIndicatorsNoLeak
 from custotechIndicators import CustomTechIndicators
 import numpy as np
 import pandas as pd
+from collections import defaultdict, Counter
 from leakfree_indicators import LeakFreeBatchLive
 from joblib import Parallel, delayed
 from numba import config as numba_config
@@ -97,74 +98,92 @@ class PREPARE_DATA_FOR_TRAIN:
         self,
         df: pd.DataFrame,
         tf: str,
-        windows: tuple[int, ...] = (1, 2, 3, 4, 5, 6),
-        stride: int = 500,
+        *,
+        windows: tuple[int, ...] = (1,2,3,4,5,6,9,12,20,24,30,34),
+        stride: int = 75,
+        ratio_thr: float = 0.12,     # ← حتی 12 ٪ خطا کافی است
+        min_fail:  int   = 8,        # ← یا حداقل 8 بار خرابی
     ) -> None:
         """
-        • ستون‌هایی را که در سطرِ پایانیِ هر پنجره مقدار 0 یا NaN می‌گیرند        ⇒ bad_zero_nan
-        • ستون‌هایی که مقدار «سطرِ ماقبل‌آخرشان» پس از اضافه شدنِ یک ردیف تغییر می‌کند ⇒ bad_forward
-        (رفتار forward-looking)
-        -------------------------------------------------------------
-        خروجی‌ها در  self.bad_cols_tf[tf]  ذخیره می‌شود.
+        • bad_zero_nan  : صفر/NaN در آخر پنجره
+        • bad_forward   : تغییر ردیف ماقبل‌آخر پس از ورود رکورد جدید
+        ستون حذف می‌شود اگر  (fails / tests  >= ratio_thr)  «یا»  fails >= min_fail
         """
-        # ───────── جمع‌کننده‌ها ─────────
-        bad_zero_nan: set[str] = set()
-        bad_forward:  set[str] = set()
-        bad_all:      set[str] = set()
+
+        # ─── شمارنده‌های ستونی ─────────────────────────────────
+        zero_nan_fail   : Counter[str] = Counter()
+        forward_fail    : Counter[str] = Counter()
+        zero_nan_tests  : Counter[str] = Counter()
+        forward_tests   : Counter[str] = Counter()
 
         n_segments = 8
-        seg_len = len(df) // n_segments or len(df)
+        seg_len    = len(df) // n_segments or len(df)
 
         for seg_idx in range(n_segments):
-            segment = df.iloc[seg_idx * seg_len : (seg_idx + 1) * seg_len]
+            seg = df.iloc[seg_idx*seg_len : (seg_idx+1)*seg_len]
 
             for win in windows:
-                if len(segment) <= win:
+                if len(seg) <= win:  # پنجره‌ جا نمی‌شود
                     continue
-                for start in range(0, len(segment) - win, stride):
-                    # ---------- ۱) تشخیص 0 / NaN در آخر پنجره ----------
-                    last_row = segment.iloc[start + win - 1]
-                    mask_bad = last_row.isna() | np.isclose(last_row, 0, atol=1e-12)
 
-                    if mask_bad.any():
-                        cols = last_row.index[mask_bad]
-                        bad_zero_nan.update(cols)
-                        bad_all.update(cols)
+                for start in range(0, len(seg) - win, stride):
+                    # ── (1) 0 / NaN در آخر پنجره ──────────────────────
+                    last = seg.iloc[start+win-1]
+                    bad  = last.isna() | np.isclose(last, 0.0, atol=1e-12)
 
-                    # ---------- ۲) تشخیص forward-looking ----------
-                    if start + win < len(segment):                 # رکورد اضافه در دیتافریم موجود است
-                        sub1 = segment.iloc[start : start + win]   # طول = win
-                        sub2 = segment.iloc[start : start + win + 1]
+                    for col in last.index:            # تست برای هر ستون
+                        zero_nan_tests[col] += 1
+                        if bad[col]:
+                            zero_nan_fail[col] += 1
 
-                        penult_old = sub1.iloc[-1]                 # همان ردیفی که در پنجرهٔ اول «آخر» بود
-                        penult_new = sub2.iloc[-2]                 # همان ردیف، یک قدم جلوتر
+                    # ── (2) forward-looking ───────────────────────────
+                    if start + win >= len(seg):
+                        continue                      # رکورد اضافه نداریم
 
-                        changed = (
-                            penult_old.notna()
-                            & penult_new.notna()
-                            & (~np.isclose(penult_old, penult_new,
-                                        rtol=1e-5,   # ← حساسیت نسبی
-                                        atol=1e-12)) # ← خطای مطلق
-                        )
-                        if changed.any():
-                            cols = penult_old.index[changed]
-                            bad_forward.update(cols)
-                            bad_all.update(cols)
+                    sub1 = seg.iloc[start:start+win]
+                    sub2 = seg.iloc[start:start+win+1]
 
-        # ───────── فیلتر ستون‌های مجاز (۰/۱ یا زمان) ─────────
-        bad_zero_nan_final = {c for c in bad_zero_nan if not self.allow_regex.search(c)}
-        bad_forward_final  = {c for c in bad_forward  if not self.allow_regex.search(c)}
-        bad_final          = bad_zero_nan_final | bad_forward_final
+                    pen_old = sub1.iloc[-1]
+                    pen_new = sub2.iloc[-2]
 
-        # ذخیره در دیکشنری کلاس
-        self.bad_cols_tf[tf].update(bad_final)
+                    changed = (
+                        pen_old.notna()
+                        & pen_new.notna()
+                        & (~np.isclose(pen_old, pen_new,
+                                    rtol=1e-6, atol=1e-12))
+                    )
 
-        # ───────── چاپ آمار برای کنسول ─────────
+                    for col in pen_old.index:
+                        forward_tests[col] += 1
+                        if changed[col]:
+                            forward_fail[col] += 1
+
+        # ─── تصمیم نهایی برای هر ستون ───────────────────────────
+        bad_cols: set[str] = set()
+
+        for col in zero_nan_tests:
+            # نسبتِ‌ خطا
+            r = zero_nan_fail[col] / zero_nan_tests[col]
+            if (r >= ratio_thr) or (zero_nan_fail[col] >= min_fail):
+                bad_cols.add(col)
+
+        for col in forward_tests:
+            r = forward_fail[col] / forward_tests[col]
+            if (r >= ratio_thr) or (forward_fail[col] >= min_fail):
+                bad_cols.add(col)
+
+        # ─── حذف ستون‌های مجاز (binary / تقویمی) ────────────────
+        bad_cols = {c for c in bad_cols if not self.allow_regex.search(c)}
+
+        # ─── به دیکشنری کلاس اضافه کن ───────────────────────────
+        self.bad_cols_tf[tf].update(bad_cols)
+
         if self.verbose:
-            print(
-                f"[DETECT-{tf}] found {len(bad_final)} unstable columns "
-                f"(0/NaN={len(bad_zero_nan_final)}, forward={len(bad_forward_final)})"
-            )
+            z_bad = len({c for c in bad_cols if c in zero_nan_fail})
+            f_bad = len({c for c in bad_cols if c in forward_fail})
+            print(f"[DETECT-{tf}] ↑{len(bad_cols)} cols  "
+                f"(0/NaN ≥{ratio_thr:.0%} or ≥{min_fail} →{z_bad}, "
+                f"fwd ≥{ratio_thr:.0%} or ≥{min_fail} →{f_bad})")
 
     def __init__(self, filepaths: dict[str, str] | None = None, main_timeframe="30T", verbose=True):
         defaults = {"30T": "XAUUSD_M30.csv", "1H": "XAUUSD_H1.csv", "15T": "XAUUSD_M15.csv", "5T": "XAUUSD_M5.csv"}
@@ -258,6 +277,11 @@ class PREPARE_DATA_FOR_TRAIN:
         df[f"{prefix}bars_from_local_min_20"] = df["close"].rolling(20, 1).apply(numba_last_local_min_idx, raw=True)
         df[f"{prefix}rsi_macd"] = df[f"{prefix}rsi_14"] * df[f"{prefix}macd"]
         # df[f"{prefix}ma20_ma50_ratio"] = df[f"{prefix}ma20"] / (df[f"{prefix}ma50"] + 1e-9)
+        # ---------- اطمینان از وجود ستون‌های خامِ پیشونددار ----------
+        for base_col in ("open", "high", "low", "close", "volume"):
+            pref_col = f"{prefix}{base_col}"
+            if pref_col not in df.columns:
+                df[pref_col] = df[base_col]
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True); df.ffill(inplace=True); df.dropna(how="all", inplace=True)
         
