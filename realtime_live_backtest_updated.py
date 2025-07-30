@@ -21,7 +21,8 @@ import numpy as np
 import pandas as pd
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score, f1_score
-
+from sklearn.calibration import CalibratedClassifierCV   
+from sklearn.pipeline import Pipeline
 # ────────── ماژول‌های پروژه (در همان فولدر) ──────────
 from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
 from model_pipeline_live import ModelPipelineLive          # ← نسخهٔ بدون SMOTE
@@ -34,16 +35,48 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s",
 # ════════════════════════════════════════════════════════════════════════
 #          Helpers
 # ════════════════════════════════════════════════════════════════════════
-def build_live_estimator(fitted_pipe: Pipeline) -> ModelPipelineLive:
-    """استخراج scaler + classifier از Pipeline آموزش‌دیده و قرار دادن در
-       ModelPipelineLive (بدون SMOTE)."""
-    scaler     = fitted_pipe.named_steps["scaler"]
-    classifier = fitted_pipe.named_steps["classifier"]      # Calibrated LR
-    live = ModelPipelineLive(calibrate=False)               # dummy
-    live.base_pipe.steps[0] = ("scaler", scaler)
-    live.base_pipe.steps[1] = ("clf",    classifier)
-    return live
+# ----------------------------------------------------------------------
+# build_live_estimator  (جایگزین نسخهٔ قبلی)
+# ----------------------------------------------------------------------
+def build_live_estimator(fitted_pipe: Pipeline,
+                         keep_calibration: bool = True
+                         ) -> ModelPipelineLive:
+    """
+    از دودکش آموزش‌دیده:
+      • StandardScaler و LogisticRegression را بیرون می‌کشد،
+      • یک ModelPipelineLive بدون SMOTE می‌سازد،
+      • Pipeline لایو را با اسکیلر و LRِ فیت‌شده باز-ایجاد می‌کند
+        تا ترتیب steps درست باشد،
+      • (اختیاری) CalibratedClassifierCV را هم منتقل می‌کند.
+    """
+    # 1) استخراج اجزا از دودکشِ آموزش‌دیده
+    scaler = fitted_pipe.named_steps["scaler"]
 
+    cls_step = fitted_pipe.named_steps["classifier"]
+    if isinstance(cls_step, CalibratedClassifierCV):
+        trained_lr = cls_step.estimator            # LR فیت‌شده
+        calibrator = cls_step                      # خودِ کالیبراتور
+    else:
+        trained_lr = cls_step                      # LR ساده
+        calibrator = None
+
+    # 2) ساخت اسکلت لایو
+    live = ModelPipelineLive(
+        hyperparams=trained_lr.get_params(),
+        calibrate=False                    # کالیبراسیون را جداگانه تزریق می‌کنیم
+    )
+
+    # 3) Pipeline تازه با ترتیب درست: scaler → clf
+    live.base_pipe = Pipeline([
+        ("scaler", scaler),
+        ("clf",    trained_lr),
+    ])
+
+    # 4) انتقال کالیبراتور (در صورت وجود و درخواست)
+    if keep_calibration and calibrator is not None:
+        live._calibrator = calibrator      # pylint: disable=protected-access
+
+    return live
 
 def save_snapshot(df_feat: pd.DataFrame,
                   ts: pd.Series,
