@@ -74,8 +74,8 @@ logging.getLogger("daal4py").setLevel(logging.WARNING)
 # ---------------------------------------------------------------------------
 @dataclass
 class GAConfig:
-    population_size: int = 4
-    n_generations: int = 2
+    population_size: int = 32
+    n_generations: int = 8
     cx_pb: float = 0.8
     mut_pb: float = 0.4
     early_stopping_threshold: float = 0.85
