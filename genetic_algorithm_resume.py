@@ -40,6 +40,7 @@ from ModelSaver import ModelSaver                 # type: ignore
 from threshold_finder import ThresholdFinder      # type: ignore
 from drift_checker import DriftChecker            # type: ignore
 from sklearn.exceptions import ConvergenceWarning
+import pickle, sys, signal
 import warnings; 
 warnings.filterwarnings("ignore",
                 category=ConvergenceWarning)
@@ -49,7 +50,7 @@ warnings.filterwarnings("ignore",
 SEED = int(os.environ.get("GA_GLOBAL_SEED", 2025))
 random.seed(SEED)
 np.random.seed(SEED)
-
+CHECKPOINT = "ga_checkpoint.pkl"
 # ---------------------------------------------------------------------------
 # راه‌اندازی لاگر
 # ---------------------------------------------------------------------------
@@ -69,13 +70,51 @@ logging.getLogger("sklearnex").setLevel(logging.WARNING)
 logging.getLogger("sklearn").setLevel(logging.WARNING)
 logging.getLogger("daal4py").setLevel(logging.WARNING)
 
+def _install_sig_handlers(cur_gen_fn, pop_fn, best_fn):
+
+    def _handler(_sig, _frm):
+        save_checkpoint(cur_gen_fn(), pop_fn(), best_fn())
+        LOGGER.warning("Interrupted – checkpoint written; exiting …")
+        sys.exit(0)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, _handler)
+
+
+def save_checkpoint(gen, population, best_overall):
+    """تمام اطلاعات لازم برای ادامهٔ بی‌نقص را ذخیره می‌کند."""
+    state = {
+        "gen": gen,                               # نسل فعلی
+        "population": population,                 # جمعیت با fitness
+        "best_overall": best_overall,             # بهترین امتیاز تا این لحظه
+        "rng_py": random.getstate(),              # وضعیت RNG پایتون
+        "rng_np": np.random.get_state(),          # وضعیت RNG NumPy
+    }
+    with open(CHECKPOINT, "wb") as f:
+        pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+    LOGGER.info("Checkpoint saved (gen=%d)", gen)
+
+
+def load_checkpoint() -> tuple[int, list, float] | None:
+    """اگر فایل وجود داشته باشد state را برمی‌گرداند."""
+    if not os.path.isfile(CHECKPOINT):
+        return None
+    with open(CHECKPOINT, "rb") as f:
+        state = pickle.load(f)
+    random.setstate(state["rng_py"])
+    np.random.set_state(state["rng_np"])
+    LOGGER.info("Checkpoint loaded (gen=%d)", state["gen"])
+    return state["gen"], state["population"], state["best_overall"]
+
+
+
 # ---------------------------------------------------------------------------
 # پیکربندی GA
 # ---------------------------------------------------------------------------
 @dataclass
 class GAConfig:
-    population_size: int = 32
-    n_generations: int = 8
+    population_size: int = 4
+    n_generations: int = 2
     cx_pb: float = 0.8
     mut_pb: float = 0.4
     early_stopping_threshold: float = 0.85
@@ -316,6 +355,16 @@ class GeneticAlgorithmRunner:
 
     # ----------------------- main -----------------------
     def main(self):
+        chk = load_checkpoint()
+        if chk is not None:
+            chk_gen, population, best_overall = chk
+            start_gen = chk_gen + 1
+            LOGGER.info("Resuming GA from generation %d …", start_gen)
+        else:
+            start_gen = 1
+            best_overall = 0.0
+            population = None 
+
         print("[main] Initialising PREPARE_DATA_FOR_TRAIN …")
         prep = PREPARE_DATA_FOR_TRAIN(main_timeframe="30T")
         raw  = prep.load_data()
@@ -340,6 +389,11 @@ class GeneticAlgorithmRunner:
         n_proc = min(mp.cpu_count(), 8)
         pool = mp.Pool(n_proc, initializer=pool_init, initargs=(data_tr, prep))
         print(f"[main] Multiprocessing pool with {n_proc} workers created")
+        # نصب هندلر قطع ناگهانی
+        current_gen = {"val": start_gen - 1}          # برای closure
+        _install_sig_handlers(lambda: current_gen["val"],
+                            lambda: population,
+                            lambda: best_overall)
 
         if "map" in TOOLBOX.__dict__:
             TOOLBOX.unregister("map")
@@ -347,16 +401,28 @@ class GeneticAlgorithmRunner:
         TOOLBOX.register("map", lambda f, it: list(pool.imap_unordered(f, it, chunksize=1)))
 
         TOOLBOX.register("init_individual", create_individual)
-        population = [TOOLBOX.init_individual() for _ in range(CFG.population_size)]
-        print("[main] Initial population generated")
+        if population is None:                       # اجرای تازه
+            TOOLBOX.register("init_individual", create_individual)
+            population = [TOOLBOX.init_individual() for _ in range(CFG.population_size)]
+            LOGGER.info("Initial population generated")
+            for ind, fit in zip(population, TOOLBOX.map(evaluate_cv, population)):
+                ind.fitness.values = fit
+            save_checkpoint(0, population, best_overall)      # ← پس از Gen-0
+            logging.info("Checkpoint Gen-0 saved")
+            print("Checkpoint Gen-0 saved")
+
 
         for ind, fit in zip(population, TOOLBOX.map(evaluate_cv, population)):
             ind.fitness.values = fit
-        print("[main] Initial fitnesses computed")
+        logging.info("[main] Initial fitnesses computed")
+        print.info("[main] Initial fitnesses computed")
 
         best_overall = 0.0
-        for gen in range(1, CFG.n_generations+1):
+        for gen in range(start_gen, CFG.n_generations + 1):
+            current_gen["val"] = gen
             print(f"[GA] Generation {gen}/{CFG.n_generations} …")
+            logging.info(f"[GA] Generation {gen}/{CFG.n_generations} …")
+           
             offspring = [copy.deepcopy(i) for i in TOOLBOX.select(population, len(population))]
 
             # crossover
@@ -372,7 +438,10 @@ class GeneticAlgorithmRunner:
             for ind, fit in zip(invalid, TOOLBOX.map(evaluate_cv, invalid)):
                 ind.fitness.values = fit
             population[:] = offspring; gc.collect()
-
+            
+            save_checkpoint(gen, population, best_overall)
+            logging.info(f"Checkpoint Gen-{gen} saved")
+            print(f"Checkpoint Gen-{gen} saved")
             best_gen = tools.selBest(population, 1)[0]
             best_overall = max(best_overall, best_gen.fitness.values[0])
             print(f"[GA] Gen best = {best_gen.fitness.values[0]:.4f} · overall = {best_overall:.4f}")
@@ -393,6 +462,10 @@ class GeneticAlgorithmRunner:
         self._eval(final_model, data_te, prep, best_ind, feats, label="Test")
         self._save(final_model, best_ind, feats)
         print("[main] Model & thresholds saved 🎉")
+        
+        if os.path.isfile(CHECKPOINT):
+            os.remove(CHECKPOINT)
+            LOGGER.info("Checkpoint file removed – run completed")
 
         pool.close(); pool.join()
         return best_ind, best_ind.fitness.values[0]
