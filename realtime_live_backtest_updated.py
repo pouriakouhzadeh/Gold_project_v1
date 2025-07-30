@@ -23,6 +23,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.calibration import CalibratedClassifierCV   
 from sklearn.pipeline import Pipeline
+
 # ────────── ماژول‌های پروژه (در همان فولدر) ──────────
 from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
 from model_pipeline_live import ModelPipelineLive          # ← نسخهٔ بدون SMOTE
@@ -38,43 +39,57 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s",
 # ----------------------------------------------------------------------
 # build_live_estimator  (جایگزین نسخهٔ قبلی)
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# build_live_estimator  ⟶  نسخهٔ بدون-SMOTE، ایمن و بدون خطای NotFitted
+# ----------------------------------------------------------------------
 def build_live_estimator(fitted_pipe: Pipeline,
-                         keep_calibration: bool = True
+                         keep_calibrator: bool = True
                          ) -> ModelPipelineLive:
     """
-    از دودکش آموزش‌دیده:
-      • StandardScaler و LogisticRegression را بیرون می‌کشد،
-      • یک ModelPipelineLive بدون SMOTE می‌سازد،
-      • Pipeline لایو را با اسکیلر و LRِ فیت‌شده باز-ایجاد می‌کند
-        تا ترتیب steps درست باشد،
-      • (اختیاری) CalibratedClassifierCV را هم منتقل می‌کند.
+    ورودی
+    -----
+    fitted_pipe : Pipeline
+        دودکشِ آموزش‌دیده (scaler → SMOTE → classifier).
+    keep_calibrator : bool
+        اگر True باشد و classifier از نوع CalibratedClassifierCV باشد،
+        همان کالیبراتورِ فیت-شده را به لایو منتقل می‌کنیم.
+
+    خروجی
+    -----
+    ModelPipelineLive
+        یک مدلِ لایو که ترتیب صحیح «اسکیلر ⇢ طبقه‌بند» را حفظ می‌کند
+        و در مرحلهٔ پیش‌بینی هیچ اثری از SMOTE ندارد.
     """
-    # 1) استخراج اجزا از دودکشِ آموزش‌دیده
+
+    # 1) اجزای لازم را از دودکش آموزش‌دیده بیرون بکش
     scaler = fitted_pipe.named_steps["scaler"]
+    cls_trained = fitted_pipe.named_steps["classifier"]     # LR یا Calibrated LR
 
-    cls_step = fitted_pipe.named_steps["classifier"]
-    if isinstance(cls_step, CalibratedClassifierCV):
-        trained_lr = cls_step.estimator            # LR فیت‌شده
-        calibrator = cls_step                      # خودِ کالیبراتور
+    # اگر classifier یک CalibratedClassifierCV باشد همان را نگه می‌داریم
+    if isinstance(cls_trained, CalibratedClassifierCV):
+        final_clf       = cls_trained          # مستقیماً به‌عنوان clf می‌رود
+        hyper_for_live  = cls_trained.estimator.get_params()
     else:
-        trained_lr = cls_step                      # LR ساده
-        calibrator = None
+        final_clf       = cls_trained          # LogisticRegression فیت-شده
+        hyper_for_live  = final_clf.get_params()
 
-    # 2) ساخت اسکلت لایو
+    # 2) یک ابجکت  ModelPipelineLive  می‌سازیم (بدون SMOTE)
     live = ModelPipelineLive(
-        hyperparams=trained_lr.get_params(),
-        calibrate=False                    # کالیبراسیون را جداگانه تزریق می‌کنیم
+        hyperparams=hyper_for_live,
+        calibrate=False        # کالیبره جداگانه منتقل می‌شود (در صورت نیاز)
     )
 
-    # 3) Pipeline تازه با ترتیب درست: scaler → clf
+    # 3) Pipeline لایو =  scaler  ➜  (calibrator یا LR)
+    #    دیگر نیازی نیست base_pipe قدیمی را لمس کنیم؛ مستقیم جایگزین می‌کنیم
     live.base_pipe = Pipeline([
         ("scaler", scaler),
-        ("clf",    trained_lr),
+        ("clf",    final_clf),
     ])
 
-    # 4) انتقال کالیبراتور (در صورت وجود و درخواست)
-    if keep_calibration and calibrator is not None:
-        live._calibrator = calibrator      # pylint: disable=protected-access
+    # 4) اگر classifier، یک CalibratedClassifierCV بود و کاربر می‌خواهد
+    #    همان کالیبراتور را حفظ کند، آن را تزریق کن
+    if keep_calibrator and isinstance(cls_trained, CalibratedClassifierCV):
+        live._calibrator = cls_trained        # pylint: disable=protected-access
 
     return live
 
