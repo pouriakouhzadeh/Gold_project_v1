@@ -151,54 +151,81 @@ def live_snapshot(prep: PREPARE_DATA_FOR_TRAIN,
                   out_csv: Path):
 
     LOG.info("▶ Running LIVE back-test …")
+
     time_col  = f"{prep.main_timeframe}_time"
     close_col = f"{prep.main_timeframe}_close"
 
+    # ── مطمئن شویم ستون زمان در فرمت datetime است
     merged[time_col] = pd.to_datetime(merged[time_col])
+
+    # ── برش بر اساس تاریخ خواسته شده (در صورت وجود)
     if start:
-        merged = merged[merged[time_col] >= pd.Timestamp(start)].reset_index(drop=True)
+        merged = merged[merged[time_col] >= pd.Timestamp(start)]
+
+    # ── بسیار مهم: اندیس را ریست می‌کنیم تا 0…N شود
+    merged = merged.reset_index(drop=True)
 
     snaps, y_true, y_pred = [], [], []
 
-    for idx in range(window, len(merged)-1):      # -1 ⇒ future label موجود
-        sub = merged.iloc[idx-window:idx+1].copy().reset_index(drop=True)
-        X_inc, _ = prep.ready_incremental(sub, window=window,
+    # تا ردیف ماقبل آخر می‌رویم چون باید برچسب کندل بعدی را بسازیم
+    for idx in range(window, len(merged) - 1):
+        sub = merged.iloc[idx - window : idx + 1].copy().reset_index(drop=True)
+
+        X_inc, _ = prep.ready_incremental(sub,
+                                          window=window,
                                           selected_features=all_cols)
         if X_inc.empty:
             continue
 
+        # ستون‌هایِ جاافتاده را ایجاد و مرتّب می‌کنیم
         for c in all_cols:
             if c not in X_inc.columns:
                 X_inc[c] = np.nan
         X_inc = X_inc[all_cols].astype("float32")
 
-        # ──────────────────────────────────────────────────────────────
-        # NEW ▸ جایگزینی NaN-ها با میانگین آموزش (scaler.mean_)
-        # ──────────────────────────────────────────────────────────────
+        # ── پر کردن NaNها با میانگینِ یاد گرفته شده در آموزش ──
         if X_inc.isna().any().any():
             scaler_means = live_est.base_pipe.named_steps["scaler"].mean_
             mean_dict = {col: scaler_means[i] for i, col in enumerate(all_cols)}
             X_inc = X_inc.fillna(mean_dict)
 
+        # پیش‌بینی احتمال و تصمیم دو-آستانه
         proba = live_est.predict_proba(X_inc)[:, 1]
         pred  = ModelPipelineLive.apply_thresholds(proba, neg_thr, pos_thr)[0]
 
-        ts    = merged.loc[idx, time_col]
-        snaps.append(pd.Series({**{time_col: ts.strftime("%Y-%m-%d %H:%M:%S")},
-                                 **{c: X_inc.iloc[0][c] for c in all_cols}}))
-        # real label
-        y_true.append(int((merged.loc[idx+1, close_col] - merged.loc[idx, close_col]) > 0))
+        ts = merged.loc[idx, time_col]
+        snaps.append(
+            pd.Series(
+                {**{time_col: ts.strftime("%Y-%m-%d %H:%M:%S")},
+                 **{c: X_inc.iloc[0][c] for c in all_cols}}
+            )
+        )
+
+        # ── برچسب واقعی با iloc (موقعیتی) ──
+        y_true.append(
+            int(
+                (merged.iloc[idx + 1][close_col] -
+                 merged.iloc[idx    ][close_col]) > 0
+            )
+        )
         y_pred.append(int(pred))
 
+    # ذخیره‌ی اسنپ‌شات
     snap_df = pd.DataFrame(snaps)
-    save_snapshot(snap_df, pd.to_datetime(snap_df[time_col]), time_col, rows, out_csv)
+    save_snapshot(
+        snap_df,
+        pd.to_datetime(snap_df[time_col]),
+        time_col,
+        rows,
+        out_csv
+    )
 
-    # متریک روى ردیف‌های تصمیم
+    # متریک‌های دقت روی ردیف‌های تصمیم‌گرفته
     mask = np.array(y_pred) != -1
     if mask.any():
         acc = accuracy_score(np.array(y_true)[mask], np.array(y_pred)[mask])
-        f1  = f1_score(np.array(y_true)[mask],  np.array(y_pred)[mask])
-        LOG.info("LIVE decided=%d  |  Acc=%.4f  F1=%.4f",
+        f1  = f1_score     (np.array(y_true)[mask], np.array(y_pred)[mask])
+        LOG.info("LIVE decided=%d  |  Acc=%.4f  |  F1=%.4f",
                  int(mask.sum()), acc, f1)
     else:
         LOG.warning("⚠ No decided rows in LIVE snapshot")
