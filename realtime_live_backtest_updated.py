@@ -172,6 +172,14 @@ def live_snapshot(prep: PREPARE_DATA_FOR_TRAIN,
                 X_inc[c] = np.nan
         X_inc = X_inc[all_cols].astype("float32")
 
+        # ──────────────────────────────────────────────────────────────
+        # NEW ▸ جایگزینی NaN-ها با میانگین آموزش (scaler.mean_)
+        # ──────────────────────────────────────────────────────────────
+        if X_inc.isna().any().any():
+            scaler_means = live_est.base_pipe.named_steps["scaler"].mean_
+            mean_dict = {col: scaler_means[i] for i, col in enumerate(all_cols)}
+            X_inc = X_inc.fillna(mean_dict)
+
         proba = live_est.predict_proba(X_inc)[:, 1]
         pred  = ModelPipelineLive.apply_thresholds(proba, neg_thr, pos_thr)[0]
 
