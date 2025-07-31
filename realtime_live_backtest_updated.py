@@ -3,131 +3,84 @@
 """
 test_chimney_vs_live_no_smote.py
 ────────────────────────────────
-• Snapshot دودکش (batch) ← chimney_snapshot.csv
-• Snapshot لایو (پنجره‌ای) ← live_snapshot.csv
-• مقایسه و گزارش:
-      - تعداد کل سلول‌های متفاوت
-      - بدترین |Δ| عددی
-      - ذخیرهٔ نام ستون‌هایی که اختلاف دارند → diff_columns.txt
+• snapshot دودکش (batch) ← chimney_snapshot.csv
+• snapshot لایو   (پنجره‌ای) ← live_snapshot.csv
+• گزارش کامل:
+      ─ دقّت و F1 هر دو اسنپ‌شات
+      ─ تعداد کل، تصمیم‌گرفته، درست، غلط، بدون پیش‌بینی (-1)
+      ─ تعداد برچسب‌های متفاوت بین دودکش و لایو
+      ─ تعداد و فهرست فیچرهای متفاوت
 """
 
 from __future__ import annotations
 import argparse, logging, sys, time
 from pathlib import Path
-from typing import Dict, List
+from typing import List, Dict
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score, f1_score
-from sklearn.calibration import CalibratedClassifierCV   
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.pipeline import Pipeline
 
-# ────────── ماژول‌های پروژه (در همان فولدر) ──────────
+# ────── ماژول‌های پروژه ──────
 from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
-from model_pipeline_live import ModelPipelineLive          # ← نسخهٔ بدون SMOTE
+from model_pipeline_live import ModelPipelineLive          # نسخهٔ بدون SMOTE
 
 LOG = logging.getLogger("tester")
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S",
-                    level=logging.INFO)
+                    datefmt="%Y-%m-%d %H:%M:%S", level=logging.INFO)
 
-# ════════════════════════════════════════════════════════════════════════
-#          Helpers
-# ════════════════════════════════════════════════════════════════════════
-# ----------------------------------------------------------------------
-# build_live_estimator  (جایگزین نسخهٔ قبلی)
-# ----------------------------------------------------------------------
-# ----------------------------------------------------------------------
-# build_live_estimator  ⟶  نسخهٔ بدون-SMOTE، ایمن و بدون خطای NotFitted
-# ----------------------------------------------------------------------
+# ════════════════════════════════════════════════════════════════
+#           build_live_estimator  (بدون SMOTE)
+# ════════════════════════════════════════════════════════════════
 def build_live_estimator(fitted_pipe: Pipeline,
-                         keep_calibrator: bool = True
-                         ) -> ModelPipelineLive:
-    """
-    ورودی
-    -----
-    fitted_pipe : Pipeline
-        دودکشِ آموزش‌دیده (scaler → SMOTE → classifier).
-    keep_calibrator : bool
-        اگر True باشد و classifier از نوع CalibratedClassifierCV باشد،
-        همان کالیبراتورِ فیت-شده را به لایو منتقل می‌کنیم.
+                         keep_calibrator: bool = True) -> ModelPipelineLive:
+    scaler      = fitted_pipe.named_steps["scaler"]
+    trained_clf = fitted_pipe.named_steps["classifier"]    # LR یا Calibrated LR
 
-    خروجی
-    -----
-    ModelPipelineLive
-        یک مدلِ لایو که ترتیب صحیح «اسکیلر ⇢ طبقه‌بند» را حفظ می‌کند
-        و در مرحلهٔ پیش‌بینی هیچ اثری از SMOTE ندارد.
-    """
-
-    # 1) اجزای لازم را از دودکش آموزش‌دیده بیرون بکش
-    scaler = fitted_pipe.named_steps["scaler"]
-    cls_trained = fitted_pipe.named_steps["classifier"]     # LR یا Calibrated LR
-
-    # اگر classifier یک CalibratedClassifierCV باشد همان را نگه می‌داریم
-    if isinstance(cls_trained, CalibratedClassifierCV):
-        final_clf       = cls_trained          # مستقیماً به‌عنوان clf می‌رود
-        hyper_for_live  = cls_trained.estimator.get_params()
+    if isinstance(trained_clf, CalibratedClassifierCV):
+        final_clf      = trained_clf
+        hp_for_live    = trained_clf.estimator.get_params()
     else:
-        final_clf       = cls_trained          # LogisticRegression فیت-شده
-        hyper_for_live  = final_clf.get_params()
+        final_clf      = trained_clf
+        hp_for_live    = final_clf.get_params()
 
-    # 2) یک ابجکت  ModelPipelineLive  می‌سازیم (بدون SMOTE)
-    live = ModelPipelineLive(
-        hyperparams=hyper_for_live,
-        calibrate=False        # کالیبره جداگانه منتقل می‌شود (در صورت نیاز)
-    )
+    live = ModelPipelineLive(hyperparams=hp_for_live, calibrate=False)
+    live.base_pipe = Pipeline([("scaler", scaler), ("clf", final_clf)])
 
-    # 3) Pipeline لایو =  scaler  ➜  (calibrator یا LR)
-    #    دیگر نیازی نیست base_pipe قدیمی را لمس کنیم؛ مستقیم جایگزین می‌کنیم
-    live.base_pipe = Pipeline([
-        ("scaler", scaler),
-        ("clf",    final_clf),
-    ])
-
-    # 4) اگر classifier، یک CalibratedClassifierCV بود و کاربر می‌خواهد
-    #    همان کالیبراتور را حفظ کند، آن را تزریق کن
-    if keep_calibrator and isinstance(cls_trained, CalibratedClassifierCV):
-        live._calibrator = cls_trained        # pylint: disable=protected-access
-
+    if keep_calibrator and isinstance(trained_clf, CalibratedClassifierCV):
+        live._calibrator = trained_clf        # pylint: disable=protected-access
     return live
 
-def save_snapshot(df_feat: pd.DataFrame,
-                  ts: pd.Series,
-                  time_col: str,
-                  rows_lim: int,
-                  out_csv: Path):
+# ════════════════════════════════════════════════════════════════
+#           Snapshot utilities
+# ════════════════════════════════════════════════════════════════
+def save_snapshot(df_feat: pd.DataFrame, ts: pd.Series,
+                  time_col: str, rows_lim: int, out_csv: Path):
     if rows_lim and len(df_feat) > rows_lim:
         df_feat, ts = (df.tail(rows_lim).reset_index(drop=True) for df in (df_feat, ts))
     snap = df_feat.assign(**{time_col: ts.dt.strftime("%Y-%m-%d %H:%M:%S")})
     snap.to_csv(out_csv, index=False)
-    LOG.info("📄 %s saved (%d rows, %d cols)", out_csv.name, *snap.shape)
+    LOG.info("📄 %s saved  (%d rows · %d cols)", out_csv.name, *snap.shape)
 
-
-# ════════════════════════════════════════════════════════════════════════
-#          Build chimney snapshot  (batch)
-# ════════════════════════════════════════════════════════════════════════
-def chimney_snapshot(prep: PREPARE_DATA_FOR_TRAIN,
-                     window: int,
-                     feats: List[str],
-                     all_cols: List[str],
-                     start: str | None,
-                     rows: int,
+# ----------------------------------------------------------------
+def chimney_snapshot(prep: PREPARE_DATA_FOR_TRAIN, merged: pd.DataFrame,
+                     pipe_fit: Pipeline, window: int, feats: List[str],
+                     all_cols: List[str], start: str | None, rows: int,
                      out_csv: Path):
     LOG.info("▶ Building CHIMNEY snapshot …")
-    merged = prep.load_data()
     X_raw, _, _, _ = prep.ready(merged, window=window,
                                 selected_features=feats, mode="train")
 
-    # اطمینان از تمام ستون‌ها و ترتیب
     for c in all_cols:
         if c not in X_raw.columns:
             X_raw[c] = np.nan
     X_raw = X_raw.reindex(columns=all_cols).astype("float32")
 
     time_col = f"{prep.main_timeframe}_time"
-    ts = merged[time_col].iloc[window:window+len(X_raw)].reset_index(drop=True)
+    ts = merged[time_col].iloc[window : window + len(X_raw)].reset_index(drop=True)
 
     if start:
         keep = ts >= pd.Timestamp(start)
@@ -135,184 +88,167 @@ def chimney_snapshot(prep: PREPARE_DATA_FOR_TRAIN,
 
     save_snapshot(X_raw, ts, time_col, rows, out_csv)
 
-
-# ════════════════════════════════════════════════════════════════════════
-#          Live / back-test snapshot  (no-SMOTE pipeline)
-# ════════════════════════════════════════════════════════════════════════
-def live_snapshot(prep: PREPARE_DATA_FOR_TRAIN,
-                  merged: pd.DataFrame,
-                  live_est,
-                  window: int,
-                  neg_thr: float,
-                  pos_thr: float,
-                  all_cols: List[str],
-                  start: str | None,
-                  rows: int,
-                  out_csv: Path):
-
+# ----------------------------------------------------------------
+def live_snapshot(prep: PREPARE_DATA_FOR_TRAIN, merged: pd.DataFrame,
+                  live_est: ModelPipelineLive, window: int,
+                  neg_thr: float, pos_thr: float, all_cols: List[str],
+                  start: str | None, rows: int, out_csv: Path):
     LOG.info("▶ Running LIVE back-test …")
-
-    time_col  = f"{prep.main_timeframe}_time"
-    close_col = f"{prep.main_timeframe}_close"
-
-    # ── مطمئن شویم ستون زمان در فرمت datetime است
+    time_col, close_col = f"{prep.main_timeframe}_time", f"{prep.main_timeframe}_close"
     merged[time_col] = pd.to_datetime(merged[time_col])
-
-    # ── برش بر اساس تاریخ خواسته شده (در صورت وجود)
     if start:
         merged = merged[merged[time_col] >= pd.Timestamp(start)]
-
-    # ── بسیار مهم: اندیس را ریست می‌کنیم تا 0…N شود
     merged = merged.reset_index(drop=True)
 
     snaps, y_true, y_pred = [], [], []
+    scaler_means = live_est.base_pipe.named_steps["scaler"].mean_
 
-    # تا ردیف ماقبل آخر می‌رویم چون باید برچسب کندل بعدی را بسازیم
-    for idx in range(window, len(merged) - 1):
+    for idx in range(window, len(merged) - 1):               # آخرین ردیف label ندارد
         sub = merged.iloc[idx - window : idx + 1].copy().reset_index(drop=True)
-
-        X_inc, _ = prep.ready_incremental(sub,
-                                          window=window,
+        X_inc, _ = prep.ready_incremental(sub, window=window,
                                           selected_features=all_cols)
         if X_inc.empty:
             continue
-
-        # ستون‌هایِ جاافتاده را ایجاد و مرتّب می‌کنیم
         for c in all_cols:
             if c not in X_inc.columns:
                 X_inc[c] = np.nan
         X_inc = X_inc[all_cols].astype("float32")
-
-        # ── پر کردن NaNها با میانگینِ یاد گرفته شده در آموزش ──
         if X_inc.isna().any().any():
-            scaler_means = live_est.base_pipe.named_steps["scaler"].mean_
-            mean_dict = {col: scaler_means[i] for i, col in enumerate(all_cols)}
-            X_inc = X_inc.fillna(mean_dict)
+            fill_means = {col: scaler_means[i] for i, col in enumerate(all_cols)}
+            X_inc = X_inc.fillna(fill_means)
 
-        # پیش‌بینی احتمال و تصمیم دو-آستانه
         proba = live_est.predict_proba(X_inc)[:, 1]
         pred  = ModelPipelineLive.apply_thresholds(proba, neg_thr, pos_thr)[0]
+        ts    = merged.loc[idx, time_col]
 
-        ts = merged.loc[idx, time_col]
-        snaps.append(
-            pd.Series(
-                {**{time_col: ts.strftime("%Y-%m-%d %H:%M:%S")},
-                 **{c: X_inc.iloc[0][c] for c in all_cols}}
-            )
-        )
-
-        # ── برچسب واقعی با iloc (موقعیتی) ──
-        y_true.append(
-            int(
-                (merged.iloc[idx + 1][close_col] -
-                 merged.iloc[idx    ][close_col]) > 0
-            )
-        )
+        snaps.append(pd.Series({**{time_col: ts.strftime("%Y-%m-%d %H:%M:%S")},
+                                 **{c: X_inc.iloc[0][c] for c in all_cols}}))
+        y_true.append(int((merged.iloc[idx + 1][close_col] -
+                           merged.iloc[idx][close_col]) > 0))
         y_pred.append(int(pred))
 
-    # ذخیره‌ی اسنپ‌شات
     snap_df = pd.DataFrame(snaps)
-    save_snapshot(
-        snap_df,
-        pd.to_datetime(snap_df[time_col]),
-        time_col,
-        rows,
-        out_csv
-    )
+    save_snapshot(snap_df, pd.to_datetime(snap_df[time_col]),
+                  time_col, rows, out_csv)
 
-    # متریک‌های دقت روی ردیف‌های تصمیم‌گرفته
-    mask = np.array(y_pred) != -1
-    if mask.any():
-        acc = accuracy_score(np.array(y_true)[mask], np.array(y_pred)[mask])
-        f1  = f1_score     (np.array(y_true)[mask], np.array(y_pred)[mask])
-        LOG.info("LIVE decided=%d  |  Acc=%.4f  |  F1=%.4f",
-                 int(mask.sum()), acc, f1)
-    else:
-        LOG.warning("⚠ No decided rows in LIVE snapshot")
+    return pd.Series(y_true), pd.Series(y_pred)   # جهت گزارش نهایی
 
+# ════════════════════════════════════════════════════════════════
+#        متریک‌هاى دودکش / لایو + تعداد لیبل متفاوت
+# ════════════════════════════════════════════════════════════════
+def compute_metrics(df_snap: pd.DataFrame, merged: pd.DataFrame,
+                    est, neg_thr: float, pos_thr: float,
+                    all_cols: List[str]) -> Dict[str, int | float]:
+    time_col, close_col = f"{prep.main_timeframe}_time", f"{prep.main_timeframe}_close"
 
-# ════════════════════════════════════════════════════════════════════════
-#          Snapshot diff & report
-# ════════════════════════════════════════════════════════════════════════
-def diff_snapshots(ref_csv: Path,
-                   live_csv: Path,
-                   diff_txt: Path,
-                   abs_tol: float = 1e-6,
-                   rel_tol: float = 1e-9) -> None:
-    LOG.info("▶ Comparing snapshots …")
-    df_ref  = pd.read_csv(ref_csv,  low_memory=False)
-    df_live = pd.read_csv(live_csv, low_memory=False)
+    # true-labels
+    time_map = dict(zip(merged[time_col], merged.index))
+    y_true, y_pred = [], []
 
-    # تشخیص ستون زمان (اولین ستونی که با _time تمام مى‌شود و در هر دو وجود دارد)
-    time_col = next((c for c in df_ref.columns if c.endswith("_time") and c in df_live.columns), None)
+    # scaler MEAN جهت پر کردن NaN
+    scaler = est.named_steps["scaler"] if isinstance(est, Pipeline) else est.base_pipe.named_steps["scaler"]
+    scaler_means = scaler.mean_
+
+    for _, row in df_snap.iterrows():
+        ts = pd.to_datetime(row[time_col])
+        pos = time_map.get(ts)
+        if pos is None or pos + 1 >= len(merged):
+            continue                        # label در دسترس نیست
+        label = int((merged.iloc[pos + 1][close_col] -
+                     merged.iloc[pos][close_col]) > 0)
+        X = row[all_cols].to_frame().T.astype("float32")
+        if X.isna().any().any():
+            fill_means = {col: scaler_means[i] for i, col in enumerate(all_cols)}
+            X = X.fillna(fill_means)
+
+        proba = (est.predict_proba(X)[:, 1] if isinstance(est, Pipeline)
+                 else est.predict_proba(X)[:, 1])
+        pred  = ModelPipelineLive.apply_thresholds(proba, neg_thr, pos_thr)[0]
+
+        y_true.append(label)
+        y_pred.append(int(pred))
+
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    decided_mask   = y_pred != -1
+    n_total        = len(y_pred)
+    n_decided      = int(decided_mask.sum())
+    n_unpredicted  = n_total - n_decided
+    n_correct      = int((y_pred[decided_mask] == y_true[decided_mask]).sum())
+    n_incorrect    = n_decided - n_correct
+    acc            = accuracy_score(y_true[decided_mask], y_pred[decided_mask]) if n_decided else 0.0
+    f1             = f1_score     (y_true[decided_mask], y_pred[decided_mask]) if n_decided else 0.0
+
+    return dict(total=n_total, decided=n_decided, unpred=n_unpredicted,
+                correct=n_correct, incorrect=n_incorrect,
+                acc=acc, f1=f1, y_pred=y_pred)
+
+# ════════════════════════════════════════════════════════════════
+#                    Diff feature snapshots
+# ════════════════════════════════════════════════════════════════
+def diff_snapshots(ref_csv: Path, live_csv: Path, diff_txt: Path,
+                   abs_tol: float = 1e-6, rel_tol: float = 1e-9) -> int:
+    df_ref, df_live = pd.read_csv(ref_csv), pd.read_csv(live_csv)
+    time_col = next((c for c in df_ref.columns if c.endswith("_time")
+                     and c in df_live.columns), None)
     if not time_col:
-        LOG.error("Could not find common *_time column"); return
+        LOG.error("no *_time column in common!"); return 0
 
     for df in (df_ref, df_live):
         df[time_col] = pd.to_datetime(df[time_col])
         df.dropna(subset=[time_col], inplace=True)
-        df.drop_duplicates(subset=[time_col], keep="last", inplace=True)
+    merged = df_ref.merge(df_live, on=time_col, suffixes=("_ref", "_live"))
+    diff_cols, total_diff, worst = [], 0, 0.0
 
-    merged = df_ref.merge(df_live, on=time_col, how="inner", suffixes=("_ref", "_live"))
-    if merged.empty:
-        LOG.error("No overlapping timestamps between snapshots!"); return
-
-    diff_cols, total_diff, worst_abs = [], 0, 0.0
-
-    common_cols = [c for c in df_ref.columns if c != time_col and c in df_live.columns]
-    for col in common_cols:
-        a = merged[f"{col}_ref"]
-        b = merged[f"{col}_live"]
-
+    for col in [c for c in df_ref.columns if c != time_col and c in df_live.columns]:
+        a, b = merged[f"{col}_ref"], merged[f"{col}_live"]
         if pd.api.types.is_numeric_dtype(a):
-            abs_diff = (a - b).abs()
+            abs_d = (a - b).abs()
             with np.errstate(divide="ignore", invalid="ignore"):
-                rel_diff = abs_diff / np.maximum(a.abs(), b.abs())
-            mis = (abs_diff > abs_tol) & (rel_diff > rel_tol)
+                rel_d = abs_d / np.maximum(a.abs(), b.abs())
+            mis = (abs_d > abs_tol) & (rel_d > rel_tol)
             if mis.any():
-                diff_cols.append(col)
-                total_diff += int(mis.sum())
-                worst_abs = max(worst_abs, float(abs_diff[mis].max()))
+                diff_cols.append(col); total_diff += int(mis.sum())
+                worst = max(worst, float(abs_d[mis].max()))
         else:
             mis = (a.fillna("__") != b.fillna("__"))
             if mis.any():
-                diff_cols.append(col)
-                total_diff += int(mis.sum())
+                diff_cols.append(col); total_diff += int(mis.sum())
 
-    # نوشتن ستون‌های متفاوت
     diff_txt.write_text("\n".join(diff_cols) + "\n", encoding="utf-8")
-    LOG.info("🔍 diff finished | diff_cells=%d | worst |Δ|=%.3g | columns listed → %s",
-             total_diff, worst_abs, diff_txt.name)
+    LOG.info("🔍 diff_cells=%d  | worst |Δ|=%.3g  | diff_columns=%d  → %s",
+             total_diff, worst, len(diff_cols), diff_txt.name)
+    return len(diff_cols)
 
-
-# ════════════════════════════════════════════════════════════════════════
-#          CLI & Main
-# ════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
+#                      CLI & main
+# ════════════════════════════════════════════════════════════════
 def cli():
-    p = argparse.ArgumentParser("Chimney vs Live tester (no-SMOTE) + diff")
+    p = argparse.ArgumentParser("Chimney vs Live tester (no-SMOTE)")
     p.add_argument("--model", default="best_model.pkl")
     p.add_argument("--data-dir", default=".")
-    p.add_argument("--start", help="e.g. '2025-01-01 00:00'")
+    p.add_argument("--start")
     p.add_argument("--rows", type=int, default=2000)
     p.add_argument("--chimney-snap", default="chimney_snapshot.csv")
     p.add_argument("--live-snap",    default="live_snapshot.csv")
     p.add_argument("--diff-columns", default="diff_columns.txt")
     return p.parse_args()
 
-
-def main():
+# ----------------------------------------------------------------
+if __name__ == "__main__":
     args = cli()
-    mdl_path = Path(args.model).resolve()
-    if not mdl_path.is_file():
-        LOG.error("Model %s not found", mdl_path); sys.exit(1)
+    mdl = Path(args.model).resolve()
+    if not mdl.is_file():
+        LOG.error("Model %s not found!", mdl); sys.exit(1)
 
-    payload   = joblib.load(mdl_path)
-    pipe_fit  : Pipeline = payload["pipeline"]
-    window    : int      = int(payload["window_size"])
-    neg_thr   : float    = float(payload["neg_thr"])
-    pos_thr   : float    = float(payload["pos_thr"])
-    feats     : List[str]= payload["feats"]
-    all_cols  : List[str]= payload["train_window_cols"]
+    payload  = joblib.load(mdl)
+    pipe_fit: Pipeline = payload["pipeline"]
+    window   = int(payload["window_size"])
+    neg_thr  = float(payload["neg_thr"])
+    pos_thr  = float(payload["pos_thr"])
+    feats    = payload["feats"]
+    all_cols = payload["train_window_cols"]
 
     live_est = build_live_estimator(pipe_fit)
 
@@ -328,23 +264,47 @@ def main():
         verbose=False,
     )
 
-    # ❶ دودکش
-    chimney_snapshot(prep, window, feats, all_cols,
+    merged_all = prep.load_data()
+
+    # ➊ chimney snapshot
+    chimney_snapshot(prep, merged_all, pipe_fit, window, feats, all_cols,
                      args.start, args.rows, Path(args.chimney_snap))
 
-    # ❷ لایو
-    merged_all = prep.load_data()
-    live_snapshot(prep, merged_all, live_est, window,
-                  neg_thr, pos_thr, all_cols,
-                  args.start, args.rows, Path(args.live_snap))
+    # ➋ live snapshot + true/pred vectors
+    y_true_live, y_pred_live = live_snapshot(
+        prep, merged_all, live_est, window,
+        neg_thr, pos_thr, all_cols,
+        args.start, args.rows, Path(args.live_snap)
+    )
 
-    # ❸ مقایسه
-    diff_snapshots(Path(args.chimney_snap),
-                   Path(args.live_snap),
-                   Path(args.diff_columns))
+    # ➌ diff features
+    n_feat_diff = diff_snapshots(Path(args.chimney_snap),
+                                 Path(args.live_snap),
+                                 Path(args.diff_columns))
 
+    # ➍ متریک‌ها و اختلاف برچسب‌ها
+    df_chim = pd.read_csv(args.chimney_snap)
+    df_live = pd.read_csv(args.live_snap)
+
+    met_ch = compute_metrics(df_chim, merged_all, pipe_fit,
+                             neg_thr, pos_thr, all_cols)
+    met_lv = compute_metrics(df_live, merged_all, live_est,
+                             neg_thr, pos_thr, all_cols)
+
+    #  تعداد لیبل متفاوت بین دودکش و لایو (در زمان‌های مشترک)
+    time_col = f"{prep.main_timeframe}_time"
+    common = df_chim.merge(df_live[[time_col]], on=time_col)
+    lab_ch = met_ch["y_pred"][:len(common)]   # هم‌طول با common
+    lab_lv = met_lv["y_pred"][:len(common)]
+    lbl_diff = int((lab_ch != lab_lv).sum())
+
+    # ───── گزارش نهایی ─────
+    LOG.info("════════════════  FINAL REPORT  ════════════════")
+    for tag, m in [("CHIMNEY", met_ch), ("LIVE", met_lv)]:
+        LOG.info("%s ➔ total=%d | decided=%d | correct=%d | wrong=%d | "
+                 "unpred=%d | Acc=%.4f | F1=%.4f",
+                 tag, m["total"], m["decided"], m["correct"],
+                 m["incorrect"], m["unpred"], m["acc"], m["f1"])
+    LOG.info("Label differences (Chimney ↔ Live) : %d", lbl_diff)
+    LOG.info("Feature columns with any diff     : %d", n_feat_diff)
     LOG.info("🎉 All done.")
-
-
-if __name__ == "__main__":
-    main()
