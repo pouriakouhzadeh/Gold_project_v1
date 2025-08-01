@@ -289,6 +289,14 @@ if __name__ == "__main__":
     )
 
     merged_all = prep.load_data()
+    # ──────────────────────────────────────────────────────────────
+    # تنها ۴۰۰۰ ردیف پایانی را نگه می‌داریم   (window را هم لحاظ کن)
+    # ──────────────────────────────────────────────────────────────
+    N_LAST = 4_000                           # ← این عدد را هر وقت خواستید عوض کنید
+    if len(merged_all) > N_LAST + window:    # window برای داشتن لیبل کندل بعدی
+        merged_all = merged_all.tail(N_LAST + window).reset_index(drop=True)
+        LOG.info("⚡ Back-test limited to last %d rows (+window)", N_LAST)
+    # ──────────────────────────────────────────────────────────────
 
     # ➊ دودکش
     chimney_snapshot(prep, merged_all, window, feats, all_cols,
