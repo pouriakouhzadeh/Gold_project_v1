@@ -152,38 +152,43 @@ def live_snapshot(prep: PREPARE_DATA_FOR_TRAIN,
 # ════════════════════════════════════════════════════════════════
 #            Metrics for each snapshot (with progress bar)
 # ════════════════════════════════════════════════════════════════
-def compute_metrics(df_snap: pd.DataFrame,
-                    merged: pd.DataFrame,
+# ──────────────────────────────────────────────────────────────
+def compute_metrics(df_snap: pd.DataFrame, merged: pd.DataFrame,
                     est, neg_thr: float, pos_thr: float,
                     all_cols: List[str]) -> Dict[str, int | float]:
+    time_col  = f"{prep.main_timeframe}_time"
+    close_col = f"{prep.main_timeframe}_close"
 
-    time_col, close_col = f"{prep.main_timeframe}_time", f"{prep.main_timeframe}_close"
-
+    # نگاشت زمان → ایندکس مرج‌شده (برای ساخت لیبل آینده)
     time_map = dict(zip(merged[time_col], merged.index))
+
     y_true, y_pred = [], []
 
-    scaler = (est.named_steps["scaler"] if isinstance(est, Pipeline)
+    # اسکیلر (برای میانگین ستون‌ها)
+    scaler = (est.named_steps["scaler"]
+              if isinstance(est, Pipeline)
               else est.base_pipe.named_steps["scaler"])
     scaler_means = scaler.mean_
 
-    loop = tqdm(df_snap.itertuples(index=False), total=len(df_snap),
-                desc="Compute metrics", unit="row", leave=False)
+    for _, row in df_snap.iterrows():
+        # ←‌ همین‌جا خطا بود
+        ts = pd.to_datetime(row[time_col])
 
-    for row in loop:
-        ts = pd.to_datetime(getattr(row, time_col))
         pos = time_map.get(ts)
         if pos is None or pos + 1 >= len(merged):
-            continue
+            continue                                      # label نداریم
+
         label = int((merged.iloc[pos + 1][close_col] -
-                     merged.iloc[pos][close_col]) > 0)
+                     merged.iloc[pos    ][close_col]) > 0)
 
-        X = pd.DataFrame([[getattr(row, c) for c in all_cols]], columns=all_cols).astype("float32")
-        if X.isna().any().any():
-            X = X.fillna({col: scaler_means[i] for i, col in enumerate(all_cols)})
+        X = row[all_cols].to_frame().T.astype("float32")
+        if X.isna().any().any():                         # پر کردن NaN
+            X = X.fillna({col: scaler_means[i]
+                          for i, col in enumerate(all_cols)})
 
-        proba = (est.predict_proba(X)[:, 1] if isinstance(est, Pipeline)
-                 else est.predict_proba(X)[:, 1])
-        pred = ModelPipelineLive.apply_thresholds(proba, neg_thr, pos_thr)[0]
+        proba = est.predict_proba(X)[:, 1] if isinstance(est, Pipeline) \
+                else est.predict_proba(X)[:, 1]
+        pred  = ModelPipelineLive.apply_thresholds(proba, neg_thr, pos_thr)[0]
 
         y_true.append(label)
         y_pred.append(int(pred))
@@ -191,18 +196,19 @@ def compute_metrics(df_snap: pd.DataFrame,
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
 
-    decided_mask  = y_pred != -1
+    decided = y_pred != -1
     n_total       = len(y_pred)
-    n_decided     = int(decided_mask.sum())
+    n_decided     = int(decided.sum())
     n_unpredicted = n_total - n_decided
-    n_correct     = int((y_pred[decided_mask] == y_true[decided_mask]).sum())
+    n_correct     = int((y_pred[decided] == y_true[decided]).sum())
     n_incorrect   = n_decided - n_correct
-    acc           = accuracy_score(y_true[decided_mask], y_pred[decided_mask]) if n_decided else 0.0
-    f1            = f1_score     (y_true[decided_mask], y_pred[decided_mask]) if n_decided else 0.0
+    acc = accuracy_score(y_true[decided], y_pred[decided]) if n_decided else 0.0
+    f1  = f1_score     (y_true[decided], y_pred[decided]) if n_decided else 0.0
 
     return dict(total=n_total, decided=n_decided, unpred=n_unpredicted,
                 correct=n_correct, incorrect=n_incorrect,
                 acc=acc, f1=f1, y_pred=y_pred)
+# ──────────────────────────────────────────────────────────────
 
 # ════════════════════════════════════════════════════════════════
 #                        Diff features
