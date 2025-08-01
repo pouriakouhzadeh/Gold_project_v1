@@ -291,12 +291,17 @@ if __name__ == "__main__":
     met_lv = compute_metrics(df_live, merged_all, live_est,
                              neg_thr, pos_thr, all_cols)
 
-    #  تعداد لیبل متفاوت بین دودکش و لایو (در زمان‌های مشترک)
     time_col = f"{prep.main_timeframe}_time"
-    common = df_chim.merge(df_live[[time_col]], on=time_col)
-    lab_ch = met_ch["y_pred"][:len(common)]   # هم‌طول با common
-    lab_lv = met_lv["y_pred"][:len(common)]
-    lbl_diff = int((lab_ch != lab_lv).sum())
+
+    # تعداد پیش‌بینی‌ها ممکن است اندکی متفاوت شود؛
+    # ابتدا طول مشترک را می‌گیریم سپس اختلاف را می‌شماریم
+    min_len = min(len(met_ch["y_pred"]), len(met_lv["y_pred"]))
+    lab_ch  = met_ch["y_pred"][:min_len]
+    lab_lv  = met_lv["y_pred"][:min_len]
+
+    # اختلافِ طول را هم به‌عنوان برچسبِ متفاوت حساب می‌کنیم
+    lbl_diff = int((lab_ch != lab_lv).sum()) + abs(len(met_ch["y_pred"]) - len(met_lv["y_pred"]))
+
 
     # ───── گزارش نهایی ─────
     LOG.info("════════════════  FINAL REPORT  ════════════════")
