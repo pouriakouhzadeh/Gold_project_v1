@@ -3,34 +3,37 @@
 """
 test_chimney_vs_live_no_smote.py
 ────────────────────────────────
-• snapshot دودکش (batch) ← chimney_snapshot.csv
-• snapshot لایو   (پنجره‌ای) ← live_snapshot.csv
+• snapshot دودکش ← chimney_snapshot.csv      (batch / بدون SMOTE)
+• snapshot لایو   ← live_snapshot.csv         (پنجره‌ای / بدون SMOTE)
 • گزارش کامل:
-      ─ دقّت و F1 هر دو اسنپ‌شات
+      ─ دقّت و F1 برای هر دو اسنپ‌شات
       ─ تعداد کل، تصمیم‌گرفته، درست، غلط، بدون پیش‌بینی (-1)
       ─ تعداد برچسب‌های متفاوت بین دودکش و لایو
       ─ تعداد و فهرست فیچرهای متفاوت
+      ─ نوارهای پیشرفت حین اجرا
 """
 
 from __future__ import annotations
-import argparse, logging, sys, time
+import argparse, logging, sys
 from pathlib import Path
 from typing import List, Dict
 
 import joblib
 import numpy as np
 import pandas as pd
+from tqdm import tqdm                          # ← NEW
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.pipeline import Pipeline
 
-# ────── ماژول‌های پروژه ──────
 from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
 from model_pipeline_live import ModelPipelineLive          # نسخهٔ بدون SMOTE
 
+# ────────────── تنظیم لاگر ──────────────
 LOG = logging.getLogger("tester")
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S", level=logging.INFO)
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                    level=logging.INFO)
 
 # ════════════════════════════════════════════════════════════════
 #           build_live_estimator  (بدون SMOTE)
@@ -41,11 +44,11 @@ def build_live_estimator(fitted_pipe: Pipeline,
     trained_clf = fitted_pipe.named_steps["classifier"]    # LR یا Calibrated LR
 
     if isinstance(trained_clf, CalibratedClassifierCV):
-        final_clf      = trained_clf
-        hp_for_live    = trained_clf.estimator.get_params()
+        final_clf   = trained_clf
+        hp_for_live = trained_clf.estimator.get_params()
     else:
-        final_clf      = trained_clf
-        hp_for_live    = final_clf.get_params()
+        final_clf   = trained_clf
+        hp_for_live = final_clf.get_params()
 
     live = ModelPipelineLive(hyperparams=hp_for_live, calibrate=False)
     live.base_pipe = Pipeline([("scaler", scaler), ("clf", final_clf)])
@@ -55,25 +58,27 @@ def build_live_estimator(fitted_pipe: Pipeline,
     return live
 
 # ════════════════════════════════════════════════════════════════
-#           Snapshot utilities
+#                    Snapshot utilities
 # ════════════════════════════════════════════════════════════════
 def save_snapshot(df_feat: pd.DataFrame, ts: pd.Series,
                   time_col: str, rows_lim: int, out_csv: Path):
     if rows_lim and len(df_feat) > rows_lim:
-        df_feat, ts = (df.tail(rows_lim).reset_index(drop=True) for df in (df_feat, ts))
+        df_feat, ts = (df.tail(rows_lim).reset_index(drop=True)
+                       for df in (df_feat, ts))
     snap = df_feat.assign(**{time_col: ts.dt.strftime("%Y-%m-%d %H:%M:%S")})
     snap.to_csv(out_csv, index=False)
     LOG.info("📄 %s saved  (%d rows · %d cols)", out_csv.name, *snap.shape)
 
 # ----------------------------------------------------------------
-def chimney_snapshot(prep: PREPARE_DATA_FOR_TRAIN, merged: pd.DataFrame,
-                     pipe_fit: Pipeline, window: int, feats: List[str],
-                     all_cols: List[str], start: str | None, rows: int,
-                     out_csv: Path):
+def chimney_snapshot(prep: PREPARE_DATA_FOR_TRAIN,
+                     merged: pd.DataFrame,
+                     window: int, feats: List[str], all_cols: List[str],
+                     start: str | None, rows: int, out_csv: Path):
     LOG.info("▶ Building CHIMNEY snapshot …")
     X_raw, _, _, _ = prep.ready(merged, window=window,
                                 selected_features=feats, mode="train")
 
+    # تضمین همهٔ ستون‌ها
     for c in all_cols:
         if c not in X_raw.columns:
             X_raw[c] = np.nan
@@ -86,15 +91,22 @@ def chimney_snapshot(prep: PREPARE_DATA_FOR_TRAIN, merged: pd.DataFrame,
         keep = ts >= pd.Timestamp(start)
         X_raw, ts = X_raw[keep], ts[keep]
 
-    save_snapshot(X_raw, ts, time_col, rows, out_csv)
+    # ── progress bar — فقط زیبایی؛ در عمل کپی ساده است
+    for _ in tqdm(range(1), desc="Saving chimney snapshot", leave=False):
+        save_snapshot(X_raw, ts, time_col, rows, out_csv)
 
 # ----------------------------------------------------------------
-def live_snapshot(prep: PREPARE_DATA_FOR_TRAIN, merged: pd.DataFrame,
-                  live_est: ModelPipelineLive, window: int,
-                  neg_thr: float, pos_thr: float, all_cols: List[str],
+def live_snapshot(prep: PREPARE_DATA_FOR_TRAIN,
+                  merged: pd.DataFrame,
+                  live_est: ModelPipelineLive,
+                  window: int,
+                  neg_thr: float, pos_thr: float,
+                  all_cols: List[str],
                   start: str | None, rows: int, out_csv: Path):
+
     LOG.info("▶ Running LIVE back-test …")
     time_col, close_col = f"{prep.main_timeframe}_time", f"{prep.main_timeframe}_close"
+
     merged[time_col] = pd.to_datetime(merged[time_col])
     if start:
         merged = merged[merged[time_col] >= pd.Timestamp(start)]
@@ -103,7 +115,11 @@ def live_snapshot(prep: PREPARE_DATA_FOR_TRAIN, merged: pd.DataFrame,
     snaps, y_true, y_pred = [], [], []
     scaler_means = live_est.base_pipe.named_steps["scaler"].mean_
 
-    for idx in range(window, len(merged) - 1):               # آخرین ردیف label ندارد
+    loop = tqdm(range(window, len(merged) - 1),
+                desc="LIVE back-test",
+                unit="row", leave=False)
+
+    for idx in loop:                                  # ← progress bar
         sub = merged.iloc[idx - window : idx + 1].copy().reset_index(drop=True)
         X_inc, _ = prep.ready_incremental(sub, window=window,
                                           selected_features=all_cols)
@@ -131,39 +147,43 @@ def live_snapshot(prep: PREPARE_DATA_FOR_TRAIN, merged: pd.DataFrame,
     save_snapshot(snap_df, pd.to_datetime(snap_df[time_col]),
                   time_col, rows, out_csv)
 
-    return pd.Series(y_true), pd.Series(y_pred)   # جهت گزارش نهایی
+    return pd.Series(y_true), pd.Series(y_pred)
 
 # ════════════════════════════════════════════════════════════════
-#        متریک‌هاى دودکش / لایو + تعداد لیبل متفاوت
+#            Metrics for each snapshot (with progress bar)
 # ════════════════════════════════════════════════════════════════
-def compute_metrics(df_snap: pd.DataFrame, merged: pd.DataFrame,
+def compute_metrics(df_snap: pd.DataFrame,
+                    merged: pd.DataFrame,
                     est, neg_thr: float, pos_thr: float,
                     all_cols: List[str]) -> Dict[str, int | float]:
+
     time_col, close_col = f"{prep.main_timeframe}_time", f"{prep.main_timeframe}_close"
 
-    # true-labels
     time_map = dict(zip(merged[time_col], merged.index))
     y_true, y_pred = [], []
 
-    # scaler MEAN جهت پر کردن NaN
-    scaler = est.named_steps["scaler"] if isinstance(est, Pipeline) else est.base_pipe.named_steps["scaler"]
+    scaler = (est.named_steps["scaler"] if isinstance(est, Pipeline)
+              else est.base_pipe.named_steps["scaler"])
     scaler_means = scaler.mean_
 
-    for _, row in df_snap.iterrows():
-        ts = pd.to_datetime(row[time_col])
+    loop = tqdm(df_snap.itertuples(index=False), total=len(df_snap),
+                desc="Compute metrics", unit="row", leave=False)
+
+    for row in loop:
+        ts = pd.to_datetime(getattr(row, time_col))
         pos = time_map.get(ts)
         if pos is None or pos + 1 >= len(merged):
-            continue                        # label در دسترس نیست
+            continue
         label = int((merged.iloc[pos + 1][close_col] -
                      merged.iloc[pos][close_col]) > 0)
-        X = row[all_cols].to_frame().T.astype("float32")
+
+        X = pd.DataFrame([[getattr(row, c) for c in all_cols]], columns=all_cols).astype("float32")
         if X.isna().any().any():
-            fill_means = {col: scaler_means[i] for i, col in enumerate(all_cols)}
-            X = X.fillna(fill_means)
+            X = X.fillna({col: scaler_means[i] for i, col in enumerate(all_cols)})
 
         proba = (est.predict_proba(X)[:, 1] if isinstance(est, Pipeline)
                  else est.predict_proba(X)[:, 1])
-        pred  = ModelPipelineLive.apply_thresholds(proba, neg_thr, pos_thr)[0]
+        pred = ModelPipelineLive.apply_thresholds(proba, neg_thr, pos_thr)[0]
 
         y_true.append(label)
         y_pred.append(int(pred))
@@ -171,21 +191,21 @@ def compute_metrics(df_snap: pd.DataFrame, merged: pd.DataFrame,
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
 
-    decided_mask   = y_pred != -1
-    n_total        = len(y_pred)
-    n_decided      = int(decided_mask.sum())
-    n_unpredicted  = n_total - n_decided
-    n_correct      = int((y_pred[decided_mask] == y_true[decided_mask]).sum())
-    n_incorrect    = n_decided - n_correct
-    acc            = accuracy_score(y_true[decided_mask], y_pred[decided_mask]) if n_decided else 0.0
-    f1             = f1_score     (y_true[decided_mask], y_pred[decided_mask]) if n_decided else 0.0
+    decided_mask  = y_pred != -1
+    n_total       = len(y_pred)
+    n_decided     = int(decided_mask.sum())
+    n_unpredicted = n_total - n_decided
+    n_correct     = int((y_pred[decided_mask] == y_true[decided_mask]).sum())
+    n_incorrect   = n_decided - n_correct
+    acc           = accuracy_score(y_true[decided_mask], y_pred[decided_mask]) if n_decided else 0.0
+    f1            = f1_score     (y_true[decided_mask], y_pred[decided_mask]) if n_decided else 0.0
 
     return dict(total=n_total, decided=n_decided, unpred=n_unpredicted,
                 correct=n_correct, incorrect=n_incorrect,
                 acc=acc, f1=f1, y_pred=y_pred)
 
 # ════════════════════════════════════════════════════════════════
-#                    Diff feature snapshots
+#                        Diff features
 # ════════════════════════════════════════════════════════════════
 def diff_snapshots(ref_csv: Path, live_csv: Path, diff_txt: Path,
                    abs_tol: float = 1e-6, rel_tol: float = 1e-9) -> int:
@@ -198,6 +218,7 @@ def diff_snapshots(ref_csv: Path, live_csv: Path, diff_txt: Path,
     for df in (df_ref, df_live):
         df[time_col] = pd.to_datetime(df[time_col])
         df.dropna(subset=[time_col], inplace=True)
+
     merged = df_ref.merge(df_live, on=time_col, suffixes=("_ref", "_live"))
     diff_cols, total_diff, worst = [], 0, 0.0
 
@@ -217,15 +238,15 @@ def diff_snapshots(ref_csv: Path, live_csv: Path, diff_txt: Path,
                 diff_cols.append(col); total_diff += int(mis.sum())
 
     diff_txt.write_text("\n".join(diff_cols) + "\n", encoding="utf-8")
-    LOG.info("🔍 diff_cells=%d  | worst |Δ|=%.3g  | diff_columns=%d  → %s",
+    LOG.info("🔍 diff_cells=%d | worst |Δ|=%.3g | diff_columns=%d → %s",
              total_diff, worst, len(diff_cols), diff_txt.name)
     return len(diff_cols)
 
 # ════════════════════════════════════════════════════════════════
-#                      CLI & main
+#                          CLI
 # ════════════════════════════════════════════════════════════════
 def cli():
-    p = argparse.ArgumentParser("Chimney vs Live tester (no-SMOTE)")
+    p = argparse.ArgumentParser("Chimney vs Live tester (no-SMOTE) + progress")
     p.add_argument("--model", default="best_model.pkl")
     p.add_argument("--data-dir", default=".")
     p.add_argument("--start")
@@ -235,20 +256,23 @@ def cli():
     p.add_argument("--diff-columns", default="diff_columns.txt")
     return p.parse_args()
 
-# ----------------------------------------------------------------
+# ════════════════════════════════════════════════════════════════
+#                            MAIN
+# ════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     args = cli()
-    mdl = Path(args.model).resolve()
-    if not mdl.is_file():
-        LOG.error("Model %s not found!", mdl); sys.exit(1)
 
-    payload  = joblib.load(mdl)
-    pipe_fit: Pipeline = payload["pipeline"]
-    window   = int(payload["window_size"])
-    neg_thr  = float(payload["neg_thr"])
-    pos_thr  = float(payload["pos_thr"])
-    feats    = payload["feats"]
-    all_cols = payload["train_window_cols"]
+    mdl_path = Path(args.model).resolve()
+    if not mdl_path.is_file():
+        LOG.error("Model %s not found!", mdl_path); sys.exit(1)
+
+    payload   = joblib.load(mdl_path)
+    pipe_fit  : Pipeline = payload["pipeline"]
+    window    = int(payload["window_size"])
+    neg_thr   = float(payload["neg_thr"])
+    pos_thr   = float(payload["pos_thr"])
+    feats     = payload["feats"]
+    all_cols  = payload["train_window_cols"]
 
     live_est = build_live_estimator(pipe_fit)
 
@@ -266,23 +290,23 @@ if __name__ == "__main__":
 
     merged_all = prep.load_data()
 
-    # ➊ chimney snapshot
-    chimney_snapshot(prep, merged_all, pipe_fit, window, feats, all_cols,
+    # ➊ دودکش
+    chimney_snapshot(prep, merged_all, window, feats, all_cols,
                      args.start, args.rows, Path(args.chimney_snap))
 
-    # ➋ live snapshot + true/pred vectors
+    # ➋ لایو
     y_true_live, y_pred_live = live_snapshot(
         prep, merged_all, live_est, window,
         neg_thr, pos_thr, all_cols,
         args.start, args.rows, Path(args.live_snap)
     )
 
-    # ➌ diff features
+    # ➌ diff
     n_feat_diff = diff_snapshots(Path(args.chimney_snap),
                                  Path(args.live_snap),
                                  Path(args.diff_columns))
 
-    # ➍ متریک‌ها و اختلاف برچسب‌ها
+    # ➍ متریک‌ها
     df_chim = pd.read_csv(args.chimney_snap)
     df_live = pd.read_csv(args.live_snap)
 
@@ -291,25 +315,20 @@ if __name__ == "__main__":
     met_lv = compute_metrics(df_live, merged_all, live_est,
                              neg_thr, pos_thr, all_cols)
 
-    time_col = f"{prep.main_timeframe}_time"
-
-    # تعداد پیش‌بینی‌ها ممکن است اندکی متفاوت شود؛
-    # ابتدا طول مشترک را می‌گیریم سپس اختلاف را می‌شماریم
+    # برچسب‌های متفاوت
     min_len = min(len(met_ch["y_pred"]), len(met_lv["y_pred"]))
     lab_ch  = met_ch["y_pred"][:min_len]
     lab_lv  = met_lv["y_pred"][:min_len]
-
-    # اختلافِ طول را هم به‌عنوان برچسبِ متفاوت حساب می‌کنیم
     lbl_diff = int((lab_ch != lab_lv).sum()) + abs(len(met_ch["y_pred"]) - len(met_lv["y_pred"]))
 
-
-    # ───── گزارش نهایی ─────
-    LOG.info("════════════════  FINAL REPORT  ════════════════")
+    # ─────────── گزارش نهایی ───────────
+    LOG.info("══════════════════  FINAL REPORT  ══════════════════")
     for tag, m in [("CHIMNEY", met_ch), ("LIVE", met_lv)]:
         LOG.info("%s ➔ total=%d | decided=%d | correct=%d | wrong=%d | "
                  "unpred=%d | Acc=%.4f | F1=%.4f",
                  tag, m["total"], m["decided"], m["correct"],
                  m["incorrect"], m["unpred"], m["acc"], m["f1"])
+
     LOG.info("Label differences (Chimney ↔ Live) : %d", lbl_diff)
-    LOG.info("Feature columns with any diff     : %d", n_feat_diff)
+    LOG.info("Feature columns with any diff      : %d", n_feat_diff)
     LOG.info("🎉 All done.")
