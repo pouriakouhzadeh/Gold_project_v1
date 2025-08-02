@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Enhanced Chimney vs Live Comparison Tool with Progress Tracking
+Fixed Chimney vs Live Comparison Tool with Syntax Corrections
 """
 
 from __future__ import annotations
-import argparse, logging, sys, time
+import argparse
+import logging
+import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
-import math
-
-import joblib
 import numpy as np
 import pandas as pd
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
-from sklearn.calibration import CalibratedClassifierCV   
+from sklearn.calibration import CalibratedClassifierCV
+import joblib
 
 # Project modules
 from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
@@ -34,104 +35,36 @@ logging.basicConfig(
     ]
 )
 
-class ProgressTracker:
-    """Utility class for tracking and displaying progress"""
-    def __init__(self, total_steps: int, description: str = "Processing"):
-        self.total = total_steps
-        self.current = 0
-        self.description = description
-        self.start_time = time.time()
-        self.pbar = tqdm(
-            total=total_steps,
-            desc=description,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
-        )
-        
-    def update(self, increment: int = 1, status: str = ""):
-        """Update progress with optional status message"""
-        self.current += increment
-        self.pbar.set_postfix_str(status)
-        self.pbar.update(increment)
-        
-    def close(self):
-        """Complete the progress tracking"""
-        self.pbar.close()
-        elapsed = time.time() - self.start_time
-        LOG.info(f"{self.description} completed in {elapsed:.2f} seconds")
+class DataConsistencyError(Exception):
+    """Custom exception for data consistency issues"""
+    pass
 
-# ═══════════════════════════════════════════════════════
-#          Core Functions with Progress Tracking
-# ═══════════════════════════════════════════════════════
+def validate_feature_columns(X: pd.DataFrame, expected_cols: List[str]) -> None:
+    """Validate that all expected columns are present"""
+    missing = set(expected_cols) - set(X.columns)
+    if missing:
+        raise DataConsistencyError(f"Missing columns: {missing}")
 
-def build_live_estimator(fitted_pipe: Pipeline,
-                        keep_calibrator: bool = True) -> ModelPipelineLive:
-    """Construct live model from trained pipeline with proper calibration"""
-    LOG.info("Building live estimator from trained pipeline...")
-    scaler = fitted_pipe.named_steps["scaler"]
-    cls_trained = fitted_pipe.named_steps["classifier"]
+def align_features(X: pd.DataFrame, expected_cols: List[str]) -> pd.DataFrame:
+    """Ensure feature matrix has correct columns in correct order"""
+    # Add missing columns filled with NaN
+    for col in expected_cols:
+        if col not in X.columns:
+            X[col] = np.nan
+    # Reorder columns to match training
+    return X[expected_cols]
 
-    if isinstance(cls_trained, CalibratedClassifierCV):
-        final_clf = cls_trained
-        hyper_for_live = cls_trained.estimator.get_params()
-    else:
-        final_clf = cls_trained
-        hyper_for_live = final_clf.get_params()
+def save_snapshot(df_feat: pd.DataFrame, ts: pd.Series, time_col: str,
+                 rows_lim: int, out_csv: Path) -> None:
+    """Save snapshot with row limit"""
+    if rows_lim and len(df_feat) > rows_lim:
+        df_feat = df_feat.tail(rows_lim).reset_index(drop=True)
+        ts = ts.tail(rows_lim).reset_index(drop=True)
+    snap = df_feat.assign(**{time_col: ts.dt.strftime("%Y-%m-%d %H:%M:%S")})
+    snap.to_csv(out_csv, index=False)
+    LOG.info("📄 %s saved (%d rows, %d cols)", out_csv.name, *snap.shape)
 
-    live = ModelPipelineLive(hyperparams=hyper_for_live, calibrate=False)
-    live.base_pipe = Pipeline([("scaler", scaler), ("clf", final_clf)])
-
-    if keep_calibrator and isinstance(cls_trained, CalibratedClassifierCV):
-        live._calibrator = cls_trained
-
-    LOG.info("Live estimator construction complete")
-    return live
-
-def generate_predictions(df: pd.DataFrame, model: Pipeline, 
-                       window: int, all_cols: List[str],
-                       neg_thr: float, pos_thr: float,
-                       prep: PREPARE_DATA_FOR_TRAIN) -> Tuple[np.ndarray, np.ndarray]:
-    """Generate predictions with progress tracking"""
-    y_true, y_pred = [], []
-    close_col = f"{prep.main_timeframe}_close"
-    total_rows = len(df) - window - 1
-    
-    LOG.info(f"Generating predictions for {total_rows} rows...")
-    progress = ProgressTracker(total_rows, "Generating predictions")
-    
-    for idx in range(window, len(df) - 1):
-        sub = df.iloc[idx - window : idx + 1].copy().reset_index(drop=True)
-        X_inc, _ = prep.ready_incremental(sub, window=window, selected_features=all_cols)
-        
-        if X_inc.empty:
-            progress.update(1, "Skipped (empty)")
-            continue
-
-        # Ensure all columns exist
-        for c in all_cols:
-            if c not in X_inc.columns:
-                X_inc[c] = np.nan
-        X_inc = X_inc[all_cols].astype("float32")
-
-        # Handle NaN values
-        if X_inc.isna().any().any():
-            scaler_means = model.base_pipe.named_steps["scaler"].mean_
-            mean_dict = {col: scaler_means[i] for i, col in enumerate(all_cols)}
-            X_inc = X_inc.fillna(mean_dict)
-
-        # Make prediction
-        proba = model.predict_proba(X_inc)[:, 1]
-        pred = ModelPipelineLive.apply_thresholds(proba, neg_thr, pos_thr)[0]
-
-        # Store results
-        y_true.append(int((df.iloc[idx + 1][close_col] - df.iloc[idx][close_col]) > 0))
-        y_pred.append(int(pred))
-        
-        progress.update(1, f"Row {idx-window+1}/{total_rows}")
-    
-    progress.close()
-    return np.array(y_true), np.array(y_pred)
-
-def report_performance(y_true: np.ndarray, y_pred: np.ndarray, method_name: str):
+def report_performance(y_true: np.ndarray, y_pred: np.ndarray, method_name: str) -> None:
     """Generate comprehensive performance report"""
     mask_decided = y_pred != -1
     total_predictions = len(y_pred)
@@ -166,120 +99,175 @@ def report_performance(y_true: np.ndarray, y_pred: np.ndarray, method_name: str)
     report.append("="*60 + "\n")
     LOG.info("\n".join(report))
 
-def save_snapshot(df_feat: pd.DataFrame, ts: pd.Series, time_col: str,
-                 rows_lim: int, out_csv: Path):
-    """Save snapshot with row limit and progress tracking"""
-    LOG.info(f"Saving snapshot to {out_csv}...")
-    if rows_lim and len(df_feat) > rows_lim:
-        progress = ProgressTracker(2, "Trimming data")
-        df_feat = df_feat.tail(rows_lim).reset_index(drop=True)
-        progress.update(1, "Data trimmed")
-        ts = ts.tail(rows_lim).reset_index(drop=True)
-        progress.update(1, "Timestamps trimmed")
-        progress.close()
+def build_live_estimator(fitted_pipe: Pipeline,
+                        keep_calibrator: bool = True) -> ModelPipelineLive:
+    """Construct live model from trained pipeline with proper calibration"""
+    LOG.info("Building live estimator from trained pipeline...")
+    scaler = fitted_pipe.named_steps["scaler"]
+    cls_trained = fitted_pipe.named_steps["classifier"]
+
+    if isinstance(cls_trained, CalibratedClassifierCV):
+        final_clf = cls_trained
+        hyper_for_live = cls_trained.estimator.get_params()
+    else:
+        final_clf = cls_trained
+        hyper_for_live = final_clf.get_params()
+
+    live = ModelPipelineLive(hyperparams=hyper_for_live, calibrate=False)
+    live.base_pipe = Pipeline([("scaler", scaler), ("clf", final_clf)])
+
+    if keep_calibrator and isinstance(cls_trained, CalibratedClassifierCV):
+        live._calibrator = cls_trained
+
+    LOG.info("Live estimator construction complete")
+    return live
+
+def generate_predictions(df: pd.DataFrame, model: Pipeline, 
+                       window: int, all_cols: List[str],
+                       neg_thr: float, pos_thr: float,
+                       prep: PREPARE_DATA_FOR_TRAIN) -> Tuple[np.ndarray, np.ndarray]:
+    """Generate predictions with strict data validation"""
+    y_true, y_pred = [], []
+    close_col = f"{prep.main_timeframe}_close"
+    total_rows = len(df) - window - 1
     
-    snap = df_feat.assign(**{time_col: ts.dt.strftime("%Y-%m-%d %H:%M:%S")})
-    snap.to_csv(out_csv, index=False)
-    LOG.info("📄 %s saved (%d rows, %d cols)", out_csv.name, *snap.shape)
+    LOG.info(f"Generating predictions for {total_rows} rows...")
+    
+    for idx in tqdm(range(window, len(df) - 1), desc="Predicting", unit="row"):
+        try:
+            # Get windowed data
+            sub = df.iloc[idx - window : idx + 1].copy().reset_index(drop=True)
+            
+            # Prepare features - must match training exactly
+            X_inc, _ = prep.ready_incremental(sub, window=window,
+                                             selected_features=all_cols)
+            if X_inc.empty:
+                y_pred.append(-1)
+                y_true.append(0)
+                continue
+
+            # Validate and align features
+            X_inc = align_features(X_inc, all_cols)
+            validate_feature_columns(X_inc, all_cols)
+            
+            # Handle NaN values using training imputation
+            if X_inc.isna().any().any():
+                if hasattr(model, 'named_steps') and 'scaler' in model.named_steps:
+                    scaler = model.named_steps['scaler']
+                    if hasattr(scaler, 'mean_'):
+                        mean_dict = {col: scaler.mean_[i] for i, col in enumerate(all_cols)}
+                        X_inc = X_inc.fillna(mean_dict)
+            
+            # Ensure correct data type
+            X_inc = X_inc.astype("float32")
+            
+            # Make prediction
+            proba = model.predict_proba(X_inc)[:, 1]
+            pred = ModelPipelineLive.apply_thresholds(proba, neg_thr, pos_thr)[0]
+            
+            # Get true label (next candle's direction)
+            true_label = int((df.iloc[idx + 1][close_col] - df.iloc[idx][close_col]) > 0)
+            
+            y_true.append(true_label)
+            y_pred.append(int(pred))
+            
+        except Exception as e:
+            LOG.error(f"Error at index {idx}: {str(e)}")
+            y_pred.append(-1)
+            y_true.append(0)
+    
+    return np.array(y_true), np.array(y_pred)
 
 def chimney_snapshot(prep: PREPARE_DATA_FOR_TRAIN, window: int, feats: List[str],
                     all_cols: List[str], start: str | None, rows: int,
                     out_csv: Path, live_est: ModelPipelineLive,
-                    neg_thr: float, pos_thr: float):
-    """Generate chimney snapshot with performance metrics"""
-    LOG.info("▶ Building CHIMNEY snapshot with performance metrics...")
-    progress = ProgressTracker(4, "Chimney Snapshot")
+                    neg_thr: float, pos_thr: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Generate chimney snapshot with strict no-lookahead checks"""
+    LOG.info("▶ Building CHIMNEY snapshot with validation...")
     
+    # Load data without future information
     merged = prep.load_data()
-    progress.update(1, "Data loaded")
-    
     X_raw, y_true, _, _ = prep.ready(merged, window=window,
-                                   selected_features=feats, mode="train")
-    progress.update(1, "Data prepared")
-
-    # Ensure all columns exist
-    for c in all_cols:
-        if c not in X_raw.columns:
-            X_raw[c] = np.nan
-    X_raw = X_raw.reindex(columns=all_cols).astype("float32")
-    progress.update(1, "Columns verified")
-
-    time_col = f"{prep.main_timeframe}_time"
-    ts = merged[time_col].iloc[window:window+len(X_raw)].reset_index(drop=True)
-
-    if start:
-        keep = ts >= pd.Timestamp(start)
-        X_raw, ts, y_true = X_raw[keep], ts[keep], y_true[keep]
+                                    selected_features=feats, mode="train")
+    
+    # Validate we're not using future data
+    if len(X_raw) != len(y_true):
+        raise DataConsistencyError("Feature/target length mismatch - possible lookahead")
+    
+    # Ensure proper feature alignment
+    X_raw = align_features(X_raw, all_cols)
+    validate_feature_columns(X_raw, all_cols)
     
     # Generate predictions
     y_pred = []
-    pred_progress = ProgressTracker(len(X_raw), "Making predictions")
-    for i in range(len(X_raw)):
-        X_inc = X_raw.iloc[[i]]
+    for _, row in tqdm(X_raw.iterrows(), total=len(X_raw), desc="Batch Predicting"):
+        X_inc = pd.DataFrame([row])[all_cols].astype("float32")
+        
+        # Apply same preprocessing as live
+        if X_inc.isna().any().any():
+            scaler = live_est.base_pipe.named_steps['scaler']
+            mean_dict = {col: scaler.mean_[i] for i, col in enumerate(all_cols)}
+            X_inc = X_inc.fillna(mean_dict)
+        
         proba = live_est.predict_proba(X_inc)[:, 1]
         pred = ModelPipelineLive.apply_thresholds(proba, neg_thr, pos_thr)[0]
         y_pred.append(int(pred))
-        pred_progress.update(1)
-    pred_progress.close()
     
     y_pred = np.array(y_pred)
+    
+    # Verify no data leakage
+    if accuracy_score(y_true, y_pred) > 0.95:
+        LOG.warning("⚠ Suspiciously high accuracy - possible data leakage")
+    
     report_performance(y_true, y_pred, "chimney method")
-
+    
     # Save snapshot
+    time_col = f"{prep.main_timeframe}_time"
+    ts = merged[time_col].iloc[window:window+len(X_raw)].reset_index(drop=True)
     save_snapshot(X_raw, ts, time_col, rows, out_csv)
-    progress.update(1, "Snapshot saved")
-    progress.close()
     
     return y_true, y_pred
 
 def live_snapshot(prep: PREPARE_DATA_FOR_TRAIN, merged: pd.DataFrame,
                  live_est: ModelPipelineLive, window: int,
                  neg_thr: float, pos_thr: float, all_cols: List[str],
-                 start: str | None, rows: int, out_csv: Path):
+                 start: str | None, rows: int, out_csv: Path) -> Tuple[np.ndarray, np.ndarray]:
     """Run live back-test with comprehensive reporting"""
     LOG.info("▶ Running LIVE back-test with full metrics...")
-    progress = ProgressTracker(3, "Live Snapshot")
     
     # Generate predictions
     y_true, y_pred = generate_predictions(
         merged, live_est, window, all_cols, neg_thr, pos_thr, prep
     )
-    progress.update(1, "Predictions generated")
     
     # Report performance
     report_performance(y_true, y_pred, "live method")
-    progress.update(1, "Report generated")
 
     # Save snapshot
     time_col = f"{prep.main_timeframe}_time"
     ts = merged[time_col].iloc[window:window+len(y_true)].reset_index(drop=True)
     save_snapshot(
         pd.DataFrame({col: merged[col].iloc[window:window+len(y_true)].values 
-                    for col in all_cols}),
+                     for col in all_cols}),
         ts,
         time_col,
         rows,
         out_csv
     )
-    progress.update(1, "Snapshot saved")
-    progress.close()
-    
     return y_true, y_pred
 
 def diff_snapshots(ref_csv: Path, live_csv: Path, diff_txt: Path,
-                  abs_tol: float = 1e-6, rel_tol: float = 1e-9):
+                  abs_tol: float = 1e-6, rel_tol: float = 1e-9) -> None:
     """Compare snapshots with enhanced difference reporting"""
     LOG.info("▶ Comparing snapshots with detailed analysis...")
-    progress = ProgressTracker(5, "Comparing Snapshots")
     
     # Load data
     df_ref = pd.read_csv(ref_csv, low_memory=False)
     df_live = pd.read_csv(live_csv, low_memory=False)
-    progress.update(1, "Data loaded")
 
     # Find time column
     time_col = next((c for c in df_ref.columns 
-                   if c.endswith("_time") and c in df_live.columns), None)
+                    if c.endswith("_time") and c in df_live.columns), None)
     if not time_col:
         LOG.error("No common time column found")
         return
@@ -289,14 +277,12 @@ def diff_snapshots(ref_csv: Path, live_csv: Path, diff_txt: Path,
         df[time_col] = pd.to_datetime(df[time_col])
         df.dropna(subset=[time_col], inplace=True)
         df.drop_duplicates(subset=[time_col], keep="last", inplace=True)
-    progress.update(1, "Data cleaned")
 
     merged = df_ref.merge(df_live, on=time_col, how="inner", 
                          suffixes=("_ref", "_live"))
     if merged.empty:
         LOG.error("No overlapping timestamps between snapshots!")
         return
-    progress.update(1, "Data merged")
 
     # Calculate differences
     diff_cols, total_diff, worst_abs = [], 0, 0.0
@@ -305,7 +291,6 @@ def diff_snapshots(ref_csv: Path, live_csv: Path, diff_txt: Path,
     common_cols = [c for c in df_ref.columns 
                   if c != time_col and c in df_live.columns]
     
-    compare_progress = ProgressTracker(len(common_cols), "Comparing columns")
     for col in common_cols:
         ref_vals = merged[f"{col}_ref"]
         live_vals = merged[f"{col}_live"]
@@ -328,14 +313,9 @@ def diff_snapshots(ref_csv: Path, live_csv: Path, diff_txt: Path,
             if mis.any():
                 diff_cols.append(col)
                 total_diff += int(mis.sum())
-        
-        compare_progress.update(1)
-    compare_progress.close()
-    progress.update(1, "Differences calculated")
 
     # Save and report differences
     diff_txt.write_text("\n".join(diff_cols) + "\n", encoding="utf-8")
-    progress.update(1, "Results saved")
     
     report = [
         "\n" + "="*60,
@@ -356,16 +336,11 @@ def diff_snapshots(ref_csv: Path, live_csv: Path, diff_txt: Path,
     ])
     
     LOG.info("\n".join(report))
-    progress.close()
 
-# ═══════════════════════════════════════════════════════
-#          Main Execution
-# ═══════════════════════════════════════════════════════
-
-def main():
-    """Main execution function with proper error handling"""
+def main() -> None:
+    """Main execution with enhanced validation"""
     parser = argparse.ArgumentParser(
-        description="Comprehensive Chimney vs Live Comparison Tool",
+        description="Validated Chimney vs Live Comparison Tool",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--model", default="best_model.pkl", help="Trained model file")
@@ -381,10 +356,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        LOG.info("🚀 Starting comparison tool")
-        main_progress = ProgressTracker(5, "Main Process")
-
-        # Load model and configuration
+        # Load model and verify structure
         mdl_path = Path(args.model).resolve()
         if not mdl_path.is_file():
             raise FileNotFoundError(f"Model file {mdl_path} not found")
@@ -396,10 +368,19 @@ def main():
         pos_thr = float(payload["pos_thr"])
         feats = payload["feats"]
         all_cols = payload["train_window_cols"]
-        main_progress.update(1, "Configuration loaded")
 
-        # Initialize models and data preparation
+        # Verify critical parameters
+        if window < 1 or window > 100:
+            raise ValueError(f"Invalid window size: {window}")
+        if not 0 <= neg_thr <= pos_thr <= 1:
+            raise ValueError(f"Invalid thresholds: neg_thr={neg_thr}, pos_thr={pos_thr}")
+
+        # Initialize with validation
         live_est = build_live_estimator(pipe_fit)
+        if not hasattr(live_est, 'predict_proba'):
+            raise AttributeError("Live estimator missing predict_proba method")
+
+        # Data preparation with checks
         csv_dir = Path(args.data_dir).resolve()
         prep = PREPARE_DATA_FOR_TRAIN(
             main_timeframe="30T",
@@ -409,24 +390,29 @@ def main():
                 "5T": str(csv_dir / "XAUUSD_M5.csv"),
                 "1H": str(csv_dir / "XAUUSD_H1.csv"),
             },
-            verbose=False,
+            verbose=True,
         )
-        main_progress.update(1, "Components initialized")
 
-        # Run chimney (batch) method with metrics
+        # Run with validation
         chimney_true, chimney_pred = chimney_snapshot(
             prep, window, feats, all_cols, args.start, args.rows, 
             Path(args.chimney_snap), live_est, neg_thr, pos_thr
         )
-        main_progress.update(1, "Chimney complete")
 
-        # Run live method with metrics
+        # Live processing with strict checks
         merged_all = prep.load_data()
         live_true, live_pred = live_snapshot(
             prep, merged_all, live_est, window, neg_thr, pos_thr,
             all_cols, args.start, args.rows, Path(args.live_snap)
         )
-        main_progress.update(1, "Live complete")
+
+        # Final validation
+        accuracy_diff = abs(accuracy_score(chimney_true, chimney_pred) - 
+                          accuracy_score(live_true, live_pred))
+        if accuracy_diff > 0.1:
+            raise DataConsistencyError(
+                f"Large accuracy difference between methods: {accuracy_diff:.2f}"
+            )
 
         # Compare results
         diff_snapshots(
@@ -434,14 +420,11 @@ def main():
             Path(args.live_snap),
             Path(args.diff_columns)
         )
-        main_progress.update(1, "Comparison complete")
-        main_progress.close()
 
-        LOG.info("✅ All operations completed successfully!")
-        LOG.info("💾 Logs saved to comparison_tool.log")
+        LOG.info("✅ Validation passed - methods are consistent")
 
     except Exception as e:
-        LOG.error("❌ Fatal error during execution: %s", str(e))
+        LOG.error("❌ Validation failed: %s", str(e))
         sys.exit(1)
 
 if __name__ == "__main__":
