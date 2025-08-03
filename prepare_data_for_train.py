@@ -93,6 +93,61 @@ class PREPARE_DATA_FOR_TRAIN:
         # --------- NEW ---------
     bad_cols_tf: dict[str, set[str]] = defaultdict(set)   # {"30T": {"colA", ...}, "1H": {...}}
     allow_regex = re.compile(r"(?:is_weekend|day_of_week|hour)$", re.I)
+        # ---------- NEW: helpers to unify batch & live -----------------
+    def _compute_diff(self, data: pd.DataFrame,
+                      feat_cols: list[str],
+                      strict_cols: bool) -> pd.DataFrame:
+        """
+        واحد مرکزی diff/shift + پاک‌سازی؛ همه جا فقط این را صدا می‌زنیم.
+        """
+        df = data[feat_cols].shift(1).diff()
+        _timedelta_to_seconds(df)           # تبدیل timedelta به ثانیه
+
+        if not strict_cols and self.bad_cols_tf:
+            bad_union = set().union(*self.bad_cols_tf.values())
+            df.drop(columns=[c for c in bad_union if c in df.columns],
+                    inplace=True, errors="ignore")
+
+        is_bin = (df.nunique() <= 2).to_dict()
+        zero_like = [c for c in df.columns
+                     if df[c].abs().max() < 1e-12 and not is_bin.get(c, False)]
+        df.drop(columns=zero_like, inplace=True, errors="ignore")
+
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df.ffill(inplace=True)
+        df.dropna(how="all", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    def _apply_window(self, X_f: pd.DataFrame, y: pd.Series,
+                      feats: list[str], window: int,
+                      selected_features: list[str]|None,
+                      has_tminus: bool):
+        """
+        تولید ستون‌های _tminus فقط یک‌جا، برای batch و live.
+        """
+        if window <= 1:
+            return X_f, y, feats
+
+        if len(X_f) < window:
+            logging.warning("Not enough rows for window=%d", window)
+            return pd.DataFrame(), pd.Series(dtype=int), feats
+
+        stacked = np.concatenate(
+            [X_f.shift(i).iloc[window-1:].values for i in range(window)],
+            axis=1
+        )
+        X_f = pd.DataFrame(
+            stacked,
+            columns=[f"{c}_tminus{i}" for i in range(window) for c in feats]
+        )
+        y = y.iloc[window-1:].reset_index(drop=True)
+
+        if has_tminus and selected_features:
+            X_f = X_f[[c for c in selected_features if c in X_f.columns]]
+
+        return X_f, y, feats
+    # ---------- END NEW ---------------------------------------------------
 
     def _detect_bad_cols_tf(
         self,
@@ -390,93 +445,17 @@ class PREPARE_DATA_FOR_TRAIN:
             data, y = data.iloc[:-1], y.iloc[:-1]
         else:
             y.iloc[:] = 0  # dummy for predict
-
-        # ---------------- Diff Features ----------------
+            
+            
+            
         time_cols = [
-            c
-            for c in data.columns
+            c for c in data.columns
             if any(tok in c for tok in ["hour", "day_of_week", "is_weekend"])
         ]
         feat_cols = [c for c in data.columns if c not in time_cols + [close_col]]
-        
-        # ------------------------------------------------------------
-        # --- NEW ▸ drop RAW columns that are constant-zero در کل دیتاست ---
-        # ------------------------------------------------------------
-        if not strict_cols:
-            # هر ستونی که در کل data مقدارش تقریباً صفر است و باینری واقعی نیست
-            is_binary_raw = (data[feat_cols].nunique() <= 2).to_dict()
-            zero_raw_cols = [
-                c for c in feat_cols
-                if pd.api.types.is_numeric_dtype(data[c])          # فقط ستون‌های عددی
-                and data[c].abs().max() < 1e-12
-                and not is_binary_raw.get(c, False)
-            ]
-            if zero_raw_cols:
-                if self.verbose:
-                    print(f"[FILTER] drop {len(zero_raw_cols)} constant-zero RAW cols")
-                # هم از دیتافریم و هم از فهرست فیچرها حذف می‌کنیم
-                data      = data.drop(columns=zero_raw_cols, errors="ignore")
-                feat_cols = [c for c in feat_cols if c not in zero_raw_cols]
 
-        # ------------------------------------------------------------
-        # NEW ▸ ffill روی صفرهای پُرکنندهٔ 1H_* (غیرباینری) 
-        # ------------------------------------------------------------
-        h1_cols = [
-            c for c in feat_cols
-            if c.startswith("1H_") and not self.allow_regex.search(c)
-        ]
-        if h1_cols:
-            # صفرهای «جای خالی» را به NaN تبدیل کن، سپس ffill
-            data[h1_cols] = data[h1_cols].mask(data[h1_cols] == 0).ffill()
-        # ------------------------------------------------------------
-
-        df_diff = data[feat_cols].shift(1).diff()
-        _timedelta_to_seconds(df_diff)
-        # --- 1) drop globally detected bad columns ---
-        if self.bad_cols_tf:
-            bad_union = set().union(*self.bad_cols_tf.values())
-            df_diff.drop(
-                columns=[c for c in bad_union if c in df_diff.columns],
-                inplace=True,
-                errors="ignore",
-            )
-
-        # --- 2) drop columns whose *last* value ≈ 0 (ولی ستون باینری نیست) ---
-        last_row_abs = df_diff.tail(1).abs().T
-        numeric_col  = last_row_abs.select_dtypes(include=[np.number]).columns[0]
-        is_binary    = (df_diff.nunique() <= 2).to_dict()
-        bad_last_zero = last_row_abs[last_row_abs[numeric_col] < 1e-12].index
-        first_col    = last_row_abs.columns[0]                     # ← ستونِ واقعی
-        is_binary    = (df_diff.nunique() <= 2).to_dict()          # ستون‌های 0/1
-        bad_last_zero = last_row_abs[last_row_abs[first_col] < 1e-12].index
-        cols_lastzero_drop = [
-            c for c in bad_last_zero if not is_binary.get(c, False)
-        ]
-        
-        if (not strict_cols) and cols_lastzero_drop:
-            if self.verbose:
-                print(f"[FILTER] drop {len(cols_lastzero_drop)} cols with trailing 0")
-            df_diff.drop(columns=cols_lastzero_drop, inplace=True, errors="ignore")
-            
-        # --- 3) drop columns that are constant-zero across ENTIRE df_diff ---
-        if not strict_cols:
-            # ستون‌هایی که حداکثر قدرمطلق‌شان تقریباً صفر است
-            zero_like_cols = [
-                c for c in df_diff.columns
-                if df_diff[c].abs().max() < 1e-12
-            ]
-            # استثنا: ستون‌های باینری (۰/۱) واقعی
-            zero_like_cols = [
-                c for c in zero_like_cols
-                if not is_binary.get(c, False)
-            ]
-            if zero_like_cols:
-                if self.verbose:
-                    print(f"[FILTER] drop {len(zero_like_cols)} constant-zero cols")
-                df_diff.drop(columns=zero_like_cols,
-                             inplace=True,
-                             errors="ignore")
-    
+        # ---------------- Diff Features (unified) ----------------
+        df_diff = self._compute_diff(data, feat_cols, strict_cols)
 
         # --------- Clean NA / Inf ----------
         df_diff.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -514,29 +493,10 @@ class PREPARE_DATA_FOR_TRAIN:
         X_f = df_diff[feats].copy()
 
         # ---------------- Windowing ----------------
-        if window > 1:
-            if len(X_f) < window:
-                logging.warning("Not enough rows for window=%d", window)
-                return (
-                    pd.DataFrame(),
-                    pd.Series(dtype=int),
-                    feats,
-                    pd.Series(dtype=float),
-                )
-
-            stacked = np.concatenate(
-                [X_f.shift(i).iloc[window - 1 :].values for i in range(window)],
-                axis=1,
-            )
-            X_f = pd.DataFrame(
-                stacked,
-                columns=[f"{c}_tminus{i}" for i in range(window) for c in feats],
-            )
-            y = y.iloc[window - 1 :].reset_index(drop=True)
-            # --- اگر ورودیِ selected_features ستونی با _tminus داشت، اینجا فیلتر کن
-            if has_tminus:
-                wanted = [c for c in selected_features if c in X_f.columns]
-                X_f = X_f[wanted].copy()
+        # ---------------- Windowing (unified) ----------------
+        X_f, y, feats = self._apply_window(
+            X_f, y, feats, window, selected_features, has_tminus
+        )
 
         # ---------------- Final Clean ----------------
         X_f.replace([np.inf, -np.inf], np.nan, inplace=True)
