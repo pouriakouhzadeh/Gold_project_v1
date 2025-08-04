@@ -108,10 +108,13 @@ class PREPARE_DATA_FOR_TRAIN:
             df.drop(columns=[c for c in bad_union if c in df.columns],
                     inplace=True, errors="ignore")
 
+        # ستون‌های تقریباً صفر (غیرباینری)
         is_bin = (df.nunique() <= 2).to_dict()
         zero_like = [c for c in df.columns
-                     if df[c].abs().max() < 1e-12 and not is_bin.get(c, False)]
-        df.drop(columns=zero_like, inplace=True, errors="ignore")
+                    if df[c].abs().max() < 1e-12 and not is_bin.get(c, False)]
+        if not strict_cols:                       # ← فقط وقتی strict نیست حذف کن
+            df.drop(columns=zero_like, inplace=True, errors="ignore")
+
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df.ffill(inplace=True)
