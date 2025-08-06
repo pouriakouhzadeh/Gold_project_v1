@@ -131,9 +131,11 @@ if __name__ == "__main__":
     print(f"  • Correct     {correct}")
     print(f"  • Wrong       {wrong}")
 
-    # اختلاف لیبل دودکش و لایو
-    label_mismatch = (yb.tail(len(gt_live)).values != gt_live).sum()
-    print(f"\nLabel mismatch between batch-y and live-y : {label_mismatch}")
+    # ---------- اختلاف برچسب دودکش و لایو ----------
+    tail_len = min(len(gt_live), len(yb))
+    mismatch  = (yb.tail(tail_len).values != gt_live[:tail_len]).sum()
+    print(f"\nLabel mismatch between batch-y and live-y : {mismatch}")
+
 
     # فیچرهای متفاوت
     if diff_cols:

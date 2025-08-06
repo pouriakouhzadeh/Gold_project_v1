@@ -405,7 +405,8 @@ class GeneticAlgorithmRunner:
             TOOLBOX.register("init_individual", create_individual)
             population = [TOOLBOX.init_individual() for _ in range(CFG.population_size)]
             LOGGER.info("Initial population generated")
-            for ind, fit in zip(population, TOOLBOX.map(evaluate_cv, population)):
+            invalid = [ind for ind in population if not ind.fitness.valid]
+            for ind, fit in zip(invalid, TOOLBOX.map(evaluate_cv, invalid)):
                 ind.fitness.values = fit
             save_checkpoint(0, population, best_overall)      # ← پس از Gen-0
             logging.info("Checkpoint Gen-0 saved")
@@ -415,9 +416,11 @@ class GeneticAlgorithmRunner:
         for ind, fit in zip(population, TOOLBOX.map(evaluate_cv, population)):
             ind.fitness.values = fit
         logging.info("[main] Initial fitnesses computed")
-        print.info("[main] Initial fitnesses computed")
+        LOGGER.info("[main] Initial fitnesses computed")
 
-        best_overall = 0.0
+        save_checkpoint(gen - 1, population, best_overall)   # چک‌پوینت اضطراری
+        LOGGER.info("Checkpoint auto-saved before starting gen %d", gen)
+
         for gen in range(start_gen, CFG.n_generations + 1):
             current_gen["val"] = gen
             print(f"[GA] Generation {gen}/{CFG.n_generations} …")
