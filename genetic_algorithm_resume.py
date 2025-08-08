@@ -356,6 +356,7 @@ class GeneticAlgorithmRunner:
 
     # ----------------------- main -----------------------
     def main(self):
+        logging.info("Starting genetic algorithm with check-point....")
         chk = load_checkpoint()
         if chk is not None:
             chk_gen, population, best_overall = chk
