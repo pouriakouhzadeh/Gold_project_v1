@@ -415,8 +415,6 @@ class GeneticAlgorithmRunner:
             for ind, fit in zip(invalid, TOOLBOX.map(evaluate_cv, invalid)):
                 ind.fitness.values = fit
             save_checkpoint(0, population, best_overall)      # ← پس از Gen-0
-            LOGGER.info("Checkpoint Gen-0 saved")
-            LOGGER.info("Checkpoint Gen-0 saved")
 
 
         for ind, fit in zip(population, TOOLBOX.map(evaluate_cv, population)):
@@ -449,8 +447,7 @@ class GeneticAlgorithmRunner:
             population[:] = offspring; gc.collect()
             
             save_checkpoint(gen, population, best_overall)
-            LOGGER.info(f"Checkpoint Gen-{gen} saved")
-            LOGGER.info(f"Checkpoint Gen-{gen} saved")
+
             best_gen = tools.selBest(population, 1)[0]
             best_overall = max(best_overall, best_gen.fitness.values[0])
             LOGGER.info(f"[GA] Gen best = {best_gen.fitness.values[0]:.4f} · overall = {best_overall:.4f}")
