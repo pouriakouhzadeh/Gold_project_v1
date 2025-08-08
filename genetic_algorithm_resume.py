@@ -115,6 +115,7 @@ def load_checkpoint() -> tuple[int, list, float] | None:
 class GAConfig:
     population_size: int = 4
     n_generations: int = 2
+    logging.info(f"population_size = {population_size} && generations = {n_generations}")
     cx_pb: float = 0.8
     mut_pb: float = 0.4
     early_stopping_threshold: float = 0.85
@@ -223,7 +224,7 @@ def pool_init(data_train: pd.DataFrame,
     global DATA_TRAIN_SHARED, PREP_SHARED
     DATA_TRAIN_SHARED = data_train
     PREP_SHARED       = prep
-    print("[Pool] Initialised shared globals in worker process")
+    logging.info("[Pool] Initialised shared globals in worker process")
 
 
 # ---------------------------------------------------------------------------
@@ -365,16 +366,16 @@ class GeneticAlgorithmRunner:
             best_overall = 0.0
             population = None 
 
-        print("[main] Initialising PREPARE_DATA_FOR_TRAIN …")
+        logging.info("[main] Initialising PREPARE_DATA_FOR_TRAIN …")
         prep = PREPARE_DATA_FOR_TRAIN(main_timeframe="30T")
         raw  = prep.load_data()
-        print("[main] Raw data loaded → rows =", len(raw), ", shape =", raw.shape)
+        logging.info("[main] Raw data loaded → rows =", len(raw), ", shape =", raw.shape)
         # -------------------- save tain raw with def ready for test-------------
         X_tail, _, _, _ = prep.ready(raw.tail(2001),
                                     selected_features=self.final_cols,
                                     mode="predict")
         X_tail.to_csv("raw_tail2000_clean.csv", index=False)
-        print(f"[main] Saved cleaned tail to raw_tail2000_clean.csv, Number of cols = {X_tail.shape[1]}")
+        logging.info(f"[main] Saved cleaned tail to raw_tail2000_clean.csv, Number of cols = {X_tail.shape[1]}")
         # ------ sort & split ------
         time_col = f"{prep.main_timeframe}_time"
         raw[time_col] = pd.to_datetime(raw[time_col]); raw.sort_values(time_col, inplace=True)
@@ -383,12 +384,12 @@ class GeneticAlgorithmRunner:
         data_tr  = raw.iloc[:train_end].copy()
         data_thr = raw.iloc[train_end:thresh_end].copy()
         data_te  = raw.iloc[thresh_end:].copy()
-        print(f"[main] Split → train={len(data_tr)}, thresh={len(data_thr)}, test={len(data_te)}")
+        logging.info(f"[main] Split → train={len(data_tr)}, thresh={len(data_thr)}, test={len(data_te)}")
 
         # ------ pool ------
         n_proc = min(mp.cpu_count(), 8)
         pool = mp.Pool(n_proc, initializer=pool_init, initargs=(data_tr, prep))
-        print(f"[main] Multiprocessing pool with {n_proc} workers created")
+        logging.info(f"[main] Multiprocessing pool with {n_proc} workers created")
         # نصب هندلر قطع ناگهانی
         current_gen = {"val": start_gen - 1}          # برای closure
         _install_sig_handlers(lambda: current_gen["val"],
@@ -410,7 +411,7 @@ class GeneticAlgorithmRunner:
                 ind.fitness.values = fit
             save_checkpoint(0, population, best_overall)      # ← پس از Gen-0
             logging.info("Checkpoint Gen-0 saved")
-            print("Checkpoint Gen-0 saved")
+            logging.info("Checkpoint Gen-0 saved")
 
 
         for ind, fit in zip(population, TOOLBOX.map(evaluate_cv, population)):
@@ -423,7 +424,7 @@ class GeneticAlgorithmRunner:
 
         for gen in range(start_gen, CFG.n_generations + 1):
             current_gen["val"] = gen
-            print(f"[GA] Generation {gen}/{CFG.n_generations} …")
+            logging.info(f"[GA] Generation {gen}/{CFG.n_generations} …")
             logging.info(f"[GA] Generation {gen}/{CFG.n_generations} …")
            
             offspring = [copy.deepcopy(i) for i in TOOLBOX.select(population, len(population))]
@@ -444,27 +445,27 @@ class GeneticAlgorithmRunner:
             
             save_checkpoint(gen, population, best_overall)
             logging.info(f"Checkpoint Gen-{gen} saved")
-            print(f"Checkpoint Gen-{gen} saved")
+            logging.info(f"Checkpoint Gen-{gen} saved")
             best_gen = tools.selBest(population, 1)[0]
             best_overall = max(best_overall, best_gen.fitness.values[0])
-            print(f"[GA] Gen best = {best_gen.fitness.values[0]:.4f} · overall = {best_overall:.4f}")
+            logging.info(f"[GA] Gen best = {best_gen.fitness.values[0]:.4f} · overall = {best_overall:.4f}")
             if best_gen.fitness.values[0] >= CFG.early_stopping_threshold:
-                print("[GA] Early stopping reached!"); break
+                logging.info("[GA] Early stopping reached!"); break
 
         best_ind = tools.selBest(population, 1)[0]
-        print("[GA] Finished optimisation → best_score =", best_ind.fitness.values[0])
+        logging.info("[GA] Finished optimisation → best_score =", best_ind.fitness.values[0])
 
         # ------ final model ------
         final_model, feats = self._build_final_model(best_ind, data_tr, prep)
         if final_model is None:
-            print("[ERROR] Final model could not be built!")
+            logging.info("[ERROR] Final model could not be built!")
             pool.close(); pool.join(); return best_ind, best_ind.fitness.values[0]
-        print("[main] Final model trained")
+        logging.info("[main] Final model trained")
 
         self._run_thresholds(final_model, data_thr, prep, best_ind, feats)
         self._eval(final_model, data_te, prep, best_ind, feats, label="Test")
         self._save(final_model, best_ind, feats)
-        print("[main] Model & thresholds saved 🎉")
+        logging.info("[main] Model & thresholds saved")
         
         if os.path.isfile(CHECKPOINT):
             os.remove(CHECKPOINT)
@@ -499,7 +500,7 @@ class GeneticAlgorithmRunner:
         ).fit(X, y)
         
         self.final_cols = list(X.columns)
-        print("[helper] Final model built with", len(self.final_cols), "features")
+        logging.info("[helper] Final model built with", len(self.final_cols), "features")
 
         scaler = model.pipeline.named_steps.get("scaler")
         X_proc = scaler.transform(X) if scaler is not None else X.values
@@ -512,7 +513,7 @@ class GeneticAlgorithmRunner:
 
     def _run_thresholds(self, model, data_thr, prep, ind, feats):
         if data_thr.empty:
-            print("[threshold] No threshold data … skipped"); return
+            logging.info("[threshold] No threshold data … skipped"); return
         window = ind[8]
         
         X_thr, y_thr, _, _ = prep.ready(
@@ -524,13 +525,13 @@ class GeneticAlgorithmRunner:
 
         X_thr = X_thr[self.final_cols]
         if X_thr.empty:                       # ← جلوگیری از خطا
-            print("[threshold] X_thr empty – skipped")
+            logging.info("[threshold] X_thr empty – skipped")
             return
         y_prob = model.predict_proba(X_thr)[:, 1]
 
         tf = ThresholdFinder(steps=200, min_predictions_ratio=2/3)
         self.neg_thr, self.pos_thr, best_acc, *_ = tf.find_best_thresholds(y_prob, y_thr.values)
-        print(f"[threshold] neg={self.neg_thr:.3f} · pos={self.pos_thr:.3f} · acc={best_acc:.4f}")
+        logging.info(f"[threshold] neg={self.neg_thr:.3f} · pos={self.pos_thr:.3f} · acc={best_acc:.4f}")
 
     def _eval(self, model, data_part, prep, ind, feats, label="Test"):
         """
@@ -540,7 +541,7 @@ class GeneticAlgorithmRunner:
         • تعداد درست، غلط و بدون پیش‌بینی (∅)
         """
         if data_part.empty:
-            print(f"[{label}] Empty dataset")
+            logging.info(f"[{label}] Empty dataset")
             return
 
         window = ind[8]                       # ژنِ اندازهٔ پنجره
@@ -553,7 +554,7 @@ class GeneticAlgorithmRunner:
         )
         X = X[self.final_cols]                # ستون‌های نهایی مدل
         if X.empty:                           # ← جلوگیری از خطا
-            print(f"[{label}] X empty – skipped")
+            logging.info(f"[{label}] X empty – skipped")
             return
         
         # ── پیش‌بینی با دو آستانه ─────────────────────────────
@@ -607,7 +608,7 @@ class GeneticAlgorithmRunner:
         correct_n   = int(((y_pred == y) & (y_pred != -1)).sum())
         incorrect_n = pred_n - correct_n
 
-        print(
+        logging.info(
             f"[{label}] size={total} · conf={conf:.2f} · "
             f"Score={score:.4f} (Sharpe-DD) · BalAcc={bal_acc:.4f} · "
             f"Correct ={correct_n} Incorrect ={incorrect_n} Unpredict ={unpred_n}"
@@ -628,7 +629,7 @@ class GeneticAlgorithmRunner:
             window_size=window, neg_thr=self.neg_thr, pos_thr=self.pos_thr,
             feats=feats, feat_mask=None, train_window_cols=self.final_cols,
         )
-        print("[save] All artefacts persisted to disk successfull")
+        logging.info("[save] All artefacts persisted to disk successfull")
 
 # ---------------------------------------------------------------------------
 # اجرای مستقیم
@@ -636,4 +637,4 @@ class GeneticAlgorithmRunner:
 if __name__ == "__main__":
     runner = GeneticAlgorithmRunner()
     best_ind, best_score = runner.main()
-    print("[MAIN] GA done → best_score =", best_score)
+    logging.info("[MAIN] GA done → best_score =", best_score)
