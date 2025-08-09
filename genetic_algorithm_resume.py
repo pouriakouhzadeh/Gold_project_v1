@@ -361,121 +361,143 @@ class GeneticAlgorithmRunner:
     # ----------------------- main -----------------------
     def main(self):
         LOGGER.info("Starting genetic algorithm with check-point....")
-        chk = load_checkpoint()
-        if chk is not None:
-            chk_gen, population, best_overall = chk
-            start_gen = chk_gen + 1
-            LOGGER.info("Resuming GA from generation %d …", start_gen)
-        else:
-            start_gen = 1
-            best_overall = 0.0
-            population = None 
+        success = False
+        pool = None
+        try:
+            chk = load_checkpoint()
+            LOGGER.info("Checkpoint path: %s", os.path.abspath(CHECKPOINT))
 
-        LOGGER.info("[main] Initialising PREPARE_DATA_FOR_TRAIN …")
-        prep = PREPARE_DATA_FOR_TRAIN(main_timeframe="30T")
-        raw  = prep.load_data()
-        LOGGER.info("[main] Raw data loaded → rows = %d, shape = %s", len(raw), raw.shape)
-        # -------------------- save tain raw with def ready for test-------------
-        X_tail, _, _, _ = prep.ready(raw.tail(2001),
-                                    selected_features=self.final_cols,
-                                    mode="predict")
-        X_tail.to_csv("raw_tail2000_clean.csv", index=False)
-        LOGGER.info(f"[main] Saved cleaned tail to raw_tail2000_clean.csv, Number of cols = {X_tail.shape[1]}")
-        # ------ sort & split ------
-        time_col = f"{prep.main_timeframe}_time"
-        raw[time_col] = pd.to_datetime(raw[time_col]); raw.sort_values(time_col, inplace=True)
-        total = len(raw)
-        train_end, thresh_end = int(total*0.85), int(total*0.90)
-        data_tr  = raw.iloc[:train_end].copy()
-        data_thr = raw.iloc[train_end:thresh_end].copy()
-        data_te  = raw.iloc[thresh_end:].copy()
-        LOGGER.info(f"[main] Split → train={len(data_tr)}, thresh={len(data_thr)}, test={len(data_te)}")
+            if chk is not None:
+                chk_gen, population, best_overall = chk
+                start_gen = chk_gen + 1
+                LOGGER.info("Resuming GA from generation %d …", start_gen)
+            else:
+                start_gen = 1
+                best_overall = 0.0
+                population = None
 
-        # ------ pool ------
-        n_proc = min(mp.cpu_count(), 8)
-        pool = mp.Pool(n_proc, initializer=pool_init, initargs=(data_tr, prep))
-        LOGGER.info(f"[main] Multiprocessing pool with {n_proc} workers created")
-        # نصب هندلر قطع ناگهانی
-        current_gen = {"val": start_gen - 1}          # برای closure
-        _install_sig_handlers(lambda: current_gen["val"],
-                            lambda: population,
-                            lambda: best_overall)
+            LOGGER.info("Resume? %s · loaded_gen=%s · start_gen=%s",
+                        "yes" if chk else "no",
+                        (chk[0] if chk else None),
+                        start_gen)
 
-        if "map" in TOOLBOX.__dict__:
-            TOOLBOX.unregister("map")
-        # ch = min(max(4, CFG.population_size // (2*mp.cpu_count())), 16)
-        TOOLBOX.register("map", lambda f, it: list(pool.imap_unordered(f, it, chunksize=1)))
+            LOGGER.info("[main] Initialising PREPARE_DATA_FOR_TRAIN …")
+            prep = PREPARE_DATA_FOR_TRAIN(main_timeframe="30T")
+            raw  = prep.load_data()
+            LOGGER.info("[main] Raw data loaded → rows = %d, shape = %s", len(raw), raw.shape)
+            # -------------------- save tain raw with def ready for test-------------
+            X_tail, _, _, _ = prep.ready(raw.tail(2001),
+                                        selected_features=self.final_cols,
+                                        mode="predict")
+            X_tail.to_csv("raw_tail2000_clean.csv", index=False)
+            LOGGER.info(f"[main] Saved cleaned tail to raw_tail2000_clean.csv, Number of cols = {X_tail.shape[1]}")
+            # ------ sort & split ------
+            time_col = f"{prep.main_timeframe}_time"
+            raw[time_col] = pd.to_datetime(raw[time_col]); raw.sort_values(time_col, inplace=True)
+            total = len(raw)
+            train_end, thresh_end = int(total*0.85), int(total*0.90)
+            data_tr  = raw.iloc[:train_end].copy()
+            data_thr = raw.iloc[train_end:thresh_end].copy()
+            data_te  = raw.iloc[thresh_end:].copy()
+            LOGGER.info(f"[main] Split → train={len(data_tr)}, thresh={len(data_thr)}, test={len(data_te)}")
 
-        TOOLBOX.register("init_individual", create_individual)
-        if population is None:                       # اجرای تازه
+            # ------ pool ------
+    # ------ pool ------
+            n_proc = min(mp.cpu_count(), 8)
+            pool = mp.Pool(n_proc, initializer=pool_init, initargs=(data_tr, prep))
+            LOGGER.info(f"[main] Multiprocessing pool with {n_proc} workers created")
+
+            # map روی pool
+            if "map" in TOOLBOX.__dict__:
+                TOOLBOX.unregister("map")
+            TOOLBOX.register("map", lambda f, it: list(pool.imap_unordered(f, it, chunksize=1)))
+
+            # مقدار نسل فعلی برای هندلرها
+            # اگر از چک‌پوینت آمده‌ایم، روی همان gen بنشان؛ وگرنه 0
+            current_gen = {"val": (chk[0] if chk is not None else 0)}
+
+            # ساخت/ارزیابی جمعیت فقط وقتی population=None است
             TOOLBOX.register("init_individual", create_individual)
-            population = [TOOLBOX.init_individual() for _ in range(CFG.population_size)]
-            LOGGER.info("Initial population generated")
-            invalid = [ind for ind in population if not ind.fitness.valid]
-            for ind, fit in zip(invalid, TOOLBOX.map(evaluate_cv, invalid)):
-                ind.fitness.values = fit
-            save_checkpoint(0, population, best_overall)      # ← پس از Gen-0
+            if population is None:
+                population = [TOOLBOX.init_individual() for _ in range(CFG.population_size)]
+                LOGGER.info("Initial population generated")
+                invalid = [ind for ind in population if not ind.fitness.valid]
+                for ind, fit in zip(invalid, TOOLBOX.map(evaluate_cv, invalid)):
+                    ind.fitness.values = fit
+                # در شروع تازه، هنوز نسلی طی نشده → gen=0 ذخیره می‌شود
+                save_checkpoint(0, population, best_overall)
+                current_gen["val"] = 0  # هم‌راستا با چک‌پوینت تازه ثبت‌شده
 
+            # اجرای رزوم: همین‌جا population آماده است و نیاز به ارزیابی دوباره‌ی کامل نیست
+            LOGGER.info("[main] Initial fitnesses computed")
 
-        for ind, fit in zip(population, TOOLBOX.map(evaluate_cv, population)):
-            ind.fitness.values = fit
-        LOGGER.info("[main] Initial fitnesses computed")
-        LOGGER.info("[main] Initial fitnesses computed")
+            # حالا که population و current_gen مشخص‌اند، هندلر را نصب کن
+            _install_sig_handlers(lambda: current_gen["val"],
+                                lambda: population,
+                                lambda: best_overall)
 
-        save_checkpoint(gen - 1, population, best_overall)   # چک‌پوینت اضطراری
-        LOGGER.info("Checkpoint auto-saved before starting gen %d", gen)
-
-        for gen in range(start_gen, CFG.n_generations + 1):
-            current_gen["val"] = gen
-            LOGGER.info(f"[GA] Generation {gen}/{CFG.n_generations} …")
-            LOGGER.info(f"[GA] Generation {gen}/{CFG.n_generations} …")
-           
-            offspring = [copy.deepcopy(i) for i in TOOLBOX.select(population, len(population))]
-
-            # crossover
-            for i1, i2 in zip(offspring[::2], offspring[1::2]):
-                if random.random() < CFG.cx_pb:
-                    TOOLBOX.mate(i1, i2); del i1.fitness.values, i2.fitness.values
-            # mutation
-            for mut in offspring:
-                if random.random() < CFG.mut_pb:
-                    TOOLBOX.mutate(mut); del mut.fitness.values
-            # evaluation
-            invalid = [i for i in offspring if not i.fitness.valid]
-            for ind, fit in zip(invalid, TOOLBOX.map(evaluate_cv, invalid)):
-                ind.fitness.values = fit
-            population[:] = offspring; gc.collect()
+            for gen in range(start_gen, CFG.n_generations + 1):
+                current_gen["val"] = gen
+                LOGGER.info(f"[GA] Generation {gen}/{CFG.n_generations} …")
             
-            save_checkpoint(gen, population, best_overall)
+                offspring = [copy.deepcopy(i) for i in TOOLBOX.select(population, len(population))]
 
-            best_gen = tools.selBest(population, 1)[0]
-            best_overall = max(best_overall, best_gen.fitness.values[0])
-            LOGGER.info(f"[GA] Gen best = {best_gen.fitness.values[0]:.4f} · overall = {best_overall:.4f}")
-            if best_gen.fitness.values[0] >= CFG.early_stopping_threshold:
-                LOGGER.info("[GA] Early stopping reached!"); break
+                # crossover
+                for i1, i2 in zip(offspring[::2], offspring[1::2]):
+                    if random.random() < CFG.cx_pb:
+                        TOOLBOX.mate(i1, i2); del i1.fitness.values, i2.fitness.values
+                # mutation
+                for mut in offspring:
+                    if random.random() < CFG.mut_pb:
+                        TOOLBOX.mutate(mut); del mut.fitness.values
+                # evaluation
+                invalid = [i for i in offspring if not i.fitness.valid]
+                for ind, fit in zip(invalid, TOOLBOX.map(evaluate_cv, invalid)):
+                    ind.fitness.values = fit
+                population[:] = offspring; gc.collect()
+                
+                save_checkpoint(gen, population, best_overall)
 
-        best_ind = tools.selBest(population, 1)[0]
-        LOGGER.info("[GA] Finished optimisation → best_score = %.4f", best_ind.fitness.values[0])
+                best_gen = tools.selBest(population, 1)[0]
+                best_overall = max(best_overall, best_gen.fitness.values[0])
+                LOGGER.info(f"[GA] Gen best = {best_gen.fitness.values[0]:.4f} · overall = {best_overall:.4f}")
+                if best_gen.fitness.values[0] >= CFG.early_stopping_threshold:
+                    LOGGER.info("[GA] Early stopping reached!"); break
 
-        # ------ final model ------
-        final_model, feats = self._build_final_model(best_ind, data_tr, prep)
-        if final_model is None:
-            LOGGER.info("[ERROR] Final model could not be built!")
-            pool.close(); pool.join(); return best_ind, best_ind.fitness.values[0]
-        LOGGER.info("[main] Final model trained")
+            best_ind = tools.selBest(population, 1)[0]
+            LOGGER.info("[GA] Finished optimisation → best_score = %.4f", best_ind.fitness.values[0])
 
-        self._run_thresholds(final_model, data_thr, prep, best_ind, feats)
-        self._eval(final_model, data_te, prep, best_ind, feats, label="Test")
-        self._save(final_model, best_ind, feats)
-        LOGGER.info("[main] Model & thresholds saved")
+            # ------ final model ------
+            final_model, feats = self._build_final_model(best_ind, data_tr, prep)
+            if final_model is None:
+                LOGGER.info("[ERROR] Final model could not be built!")
+                pool.close(); pool.join(); return best_ind, best_ind.fitness.values[0]
+            LOGGER.info("[main] Final model trained")
+
+            self._run_thresholds(final_model, data_thr, prep, best_ind, feats)
+            self._eval(final_model, data_te, prep, best_ind, feats, label="Test")
+            self._save(final_model, best_ind, feats)
+            LOGGER.info("[main] Model & thresholds saved")
+            
+            pool.close(); pool.join()
+            success = True
+            return best_ind, best_ind.fitness.values[0]
         
-        if os.path.isfile(CHECKPOINT):
-            os.remove(CHECKPOINT)
-            LOGGER.info("Checkpoint file removed – run completed")
-
-        pool.close(); pool.join()
-        return best_ind, best_ind.fitness.values[0]
-
+        finally:
+            # بستن pool اگر ساخته شده
+            if pool is not None:
+                try:
+                    pool.close(); pool.join()
+                except Exception as e:
+                    LOGGER.warning("Pool cleanup failed: %s", e)
+            # اگر اجرا موفق بود، چک‌پوینت را حذف کن
+            if success and os.path.isfile(CHECKPOINT):
+                try:
+                    os.remove(CHECKPOINT)
+                    LOGGER.info("Checkpoint file removed – run completed")
+                except Exception as e:
+                    LOGGER.warning("Failed to remove checkpoint: %s", e)
+                    
     # ---------------- helpers ----------------
     def _build_final_model(self, ind, data_tr, prep):
         (C, max_iter, tol, penalty, solver,
