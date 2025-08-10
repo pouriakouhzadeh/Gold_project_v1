@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# compare_batch_vs_live.py (v2)
+# compare_batch_vs_live.py (v2 — stepwise recompute, robust)
 # ----------------------------------------------------------
 # مقایسۀ دقیق batch ↔ live با استفاده از همان pipelineِ آموزش‌دیده
-# (بدون بازسازی مدل؛ کالیبراتور حفظ می‌شود)
+# لایو به‌صورت گام‌به‌گام و با بازتولید فیچرها از tail_buf ساخته می‌شود
+# و به‌صورت امن طول‌ها را به واقعیتِ داده sync می‌کند.
 # ----------------------------------------------------------
 
 from __future__ import annotations
@@ -34,25 +35,32 @@ def build_batch(
 ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     """
     خروجی:
-      Xb, yb: آخر n_test ردیف، هم‌ستون با feat_list
-      tail_buf: بافر آخر (n_test + window) ردیف برای شبیه‌سازی incremental
+      Xb, yb: آخر n_test ردیف، هم‌ستون با feat_list (ممکن است کمتر از n_test شود)
+      tail_buf: بافر آخر (n_test + window) ردیف برای شبیه‌سازی stepwise
     """
     merged = raw_data if raw_data is not None else prep.load_data()
     tail_buf = merged.tail(n_test + window).copy()
+
     Xb_full, yb_full, _, _ = prep.ready(
         tail_buf, window=window, selected_features=feat_list, mode="train"
     )
-    # آخر n_test ردیف، ریست اندیس، حفظ ترتیب ستون‌ها
-    Xb = Xb_full.tail(n_test).copy().reset_index(drop=True)
-    yb = yb_full.tail(n_test).copy().reset_index(drop=True)
-    # اطمینان از ترتیب ستون‌ها
+
+    # ممکن است به‌دلیل lookback داخلی اندیکاتورها، خروجی کامل‌تر نشود
+    take = min(n_test, len(Xb_full), len(yb_full))
+    if take <= 0:
+        raise RuntimeError("خروجی batch خالی است؛ داده یا پارامترها را بررسی کن.")
+
+    Xb = Xb_full.tail(take).copy().reset_index(drop=True)
+    yb = yb_full.tail(take).copy().reset_index(drop=True)
+
+    # ترتیب ستون‌ها و dtype
     Xb = Xb[feat_list].astype("float32")
     return Xb, yb, tail_buf.reset_index(drop=True)
 
 # ----------------------------------------------------------
-# ---------- شبیه‌سازی لایو رکورد-به-رکورد -----------------
+# ---------- شبیه‌سازی لایو با بازتولید گام‌به‌گام ----------
 # ----------------------------------------------------------
-def simulate_live(
+def simulate_live_stepwise(
     prep: PREPARE_DATA_FOR_TRAIN,
     tail_buf: pd.DataFrame,
     feat_cols: List[str],
@@ -60,79 +68,75 @@ def simulate_live(
     inference_pipe: Pipeline,
     neg_thr: float,
     pos_thr: float,
-    n_test: int,
     X_batch: pd.DataFrame,
-) -> Tuple[np.ndarray, np.ndarray, List[int], set]:
+) -> Tuple[np.ndarray, set]:
     """
+    به‌جای ready_incremental، هر بار تا اندیس i از tail_buf را به ready می‌دهیم
+    و آخرین ردیف فیچر را به‌عنوان «رکورد لایو» برمی‌داریم.
     خروجی:
-      preds_live: پیش‌بینی‌های لایو به طول n_test (در صورت امکان)
-      gt_live: GT محاسبه‌شده به طول برابر
-      decided_idx: ایندکس‌های تصمیم‌دار (≠ -1) در بازۀ 0..n_test-1
-      diff_cols: مجموعه‌ی نام ستون‌هایی که در هر نقطه اختلاف عددی داشتند
+      preds_live: برچسب‌های لایو به طول len(X_batch)
+      diff_cols  : نام ستون‌هایی که حتی یک اختلاف کوچک با batch داشتند
     """
-    preds, gt = [], []
+    total = len(X_batch)
+    if total == 0:
+        return np.asarray([], dtype=int), set()
+
+    # tail_buf طولش = window + n_test بود. اگر X_batch کوتاه‌تر شد، base را مطابق آن تنظیم می‌کنیم
+    # base = تعداد ردیف‌هایی که قبل از اولین نمونهٔ batch در tail_buf می‌آید (عملاً warm-up)
+    # حداقل warm-up باید window باشد؛ اگر tail_buf کوتاه‌تر است، total را پایین می‌آوریم.
+    if len(tail_buf) < window + total:
+        # حداکثر تعداد قابل‌پیش‌بینی با این tail_buf
+        possible = max(0, len(tail_buf) - window)
+        if possible <= 0:
+            return np.asarray([], dtype=int), set()
+        total = min(total, possible)
+        X_batch = X_batch.tail(total).reset_index(drop=True)
+
+    base = len(tail_buf) - total
+    base = max(base, window)  # تضمین حداقل warm-up
+
+    preds_live: List[int] = []
     diff_cols: set = set()
 
-    # ما می‌خواهیم خروجی دقیقاً برای n_test ردیف «آخر» (همان batch) باشد.
-    # پس، تا وقتی که به اندازه‌ی n_test «نمونهٔ محاسبه‌شده» نداریم، جلو می‌رویم.
-    produced = 0
-    # از ابتدای tail_buf حرکت می‌کنیم تا warm-up خودش پر شود
-    for i in range(len(tail_buf)):
-        row = tail_buf.iloc[[i]]
-        X_inc, _ = prep.ready_incremental(
-            row, window=window, selected_features=feat_cols
+    for k in range(total):
+        end = base + k + 1  # از ابتدای tail_buf تا این اندیس را داریم
+        cur_slice = tail_buf.iloc[:end]
+
+        X_cur, _, _, _ = prep.ready(
+            cur_slice, window=window, selected_features=feat_cols, mode="train"
         )
-        if X_inc.empty:
-            continue  # هنوز warm-up تکمیل نشده
+        if X_cur.empty:
+            # warm-up کامل نشده؛ منطقی‌ترین رفتار: عدم تصمیم
+            preds_live.append(-1)
+            continue
 
-        # وقتی به نقطه‌ای رسیدیم که آماده است، این رکورد متناظر با
-        # X_batch.iloc[produced] باید باشد (تا سقف n_test)
-        if produced < len(X_batch):
-            # اجباری کردن ترتیب و dtype
-            X_inc = X_inc[feat_cols].astype("float32")
-            # کنترل اختلافِ فیچر
-            v_live = X_inc.iloc[0].values
-            v_batch = X_batch.iloc[produced].values
-            diff_mask = ~np.isclose(v_live, v_batch, atol=1e-10, equal_nan=True)
-            if diff_mask.any():
-                # جمع آوری نام ستون‌های متفاوت
-                for c in X_batch.columns[diff_mask]:
-                    diff_cols.add(c)
+        # آخرین ردیف فیچر، معادل رکورد «لایو» در این لحظه
+        x_inc = X_cur.iloc[[-1]][feat_cols].astype("float32")  # 1×d
 
-            # پیش‌بینی
-            proba = inference_pipe.predict_proba(X_inc)[:, 1]
-            lab = -1
-            if proba[0] <= neg_thr:
-                lab = 0
-            elif proba[0] >= pos_thr:
-                lab = 1
-            preds.append(lab)
+        # کنترل اختلافِ فیچر با batch (همان ردیف k)
+        v_live  = x_inc.iloc[0].values
+        v_batch = X_batch.iloc[k].values
+        diff_mask = ~np.isclose(v_live, v_batch, atol=1e-10, equal_nan=True)
+        if diff_mask.any():
+            for c in X_batch.columns[diff_mask]:
+                diff_cols.add(c)
 
-            # GT: مانند batch، برچسب واقعی کندل بعدی (diff قیمت)
-            # برای آخرین ردیف tail_buf ممکن است GT نداشته باشیم
-            if i + 1 < len(tail_buf):
-                nxt = float(tail_buf[f"{prep.main_timeframe}_close"].iloc[i + 1])
-                cur = float(tail_buf[f"{prep.main_timeframe}_close"].iloc[i])
-                gt.append(int(nxt - cur > 0))
+        # پیش‌بینی با همان pipeline ذخیره‌شده (کالیبراسیون حفظ می‌شود)
+        proba = float(inference_pipe.predict_proba(x_inc)[:, 1][0])
+        if proba <= neg_thr:
+            preds_live.append(0)
+        elif proba >= pos_thr:
+            preds_live.append(1)
+        else:
+            preds_live.append(-1)
 
-            produced += 1
-
-        if produced >= n_test:
-            break
-
-    # هم‌طول‌سازی
-    L = min(len(preds), len(gt), n_test)
-    preds = np.asarray(preds[:L], dtype=int)
-    gt    = np.asarray(gt[:L], dtype=int)
-
-    decided_idx = np.where(preds != -1)[0].tolist()
-    return preds, gt, decided_idx, diff_cols
+    return np.asarray(preds_live, dtype=int), diff_cols
 
 # ----------------------------------------------------------
 # ---------------------   CLI   ----------------------------
 # ----------------------------------------------------------
 def cli():
-    p = argparse.ArgumentParser("Compare batch vs live outputs (v2)")
+    p = argparse.ArgumentParser("Compare batch vs live outputs (v2 stepwise robust)")
     p.add_argument("--model", default="best_model.pkl", help="Path to best_model.pkl")
     p.add_argument("--n-test", type=int, default=4_000, help="Rows to compare (tail)")
     p.add_argument("--data-dir", default=".", help="Folder of CSV price files")
@@ -167,7 +171,6 @@ if __name__ == "__main__":
         verbose=False,
     )
 
-    # برای جلوگیری از دوباره‌کاری و اختلاف ایندکس‌ها، یک بار raw را می‌خوانیم
     raw_full = prep.load_data()
 
     # ---------- دودکش ----------
@@ -179,31 +182,33 @@ if __name__ == "__main__":
     decided_batch = (yb_hat != -1)
     acc_batch = (yb_hat[decided_batch] == yb[decided_batch].values).mean() if decided_batch.any() else float("nan")
 
-    # ---------- لایو (با همان pipe_fit) ----------
-    preds_live, gt_live, decided_idx, diff_cols = simulate_live(
+    # ---------- لایو (گام‌به‌گامِ امن) ----------
+    preds_live, diff_cols = simulate_live_stepwise(
         prep, tail_buf, feat_cols, window,
-        inference_pipe=pipe_fit,   # ← هیچ بازسازی‌ای در کار نیست
+        inference_pipe=pipe_fit,   # ← همون pipeline
         neg_thr=neg_thr, pos_thr=pos_thr,
-        n_test=args.n_test,
         X_batch=Xb,
     )
 
-    # هم‌ترازسازی
-    L = min(len(preds_live), len(gt_live), len(yb_hat))
+    # هم‌طول‌سازی کامل با batch
+    L = min(len(preds_live), len(yb_hat))
     preds_live = preds_live[:L]
-    gt_live    = gt_live[:L]
-    yb_hat     = yb_hat[:L]  # برای مقایسه‌ی label mismatch
+    yb_hat = yb_hat[:L]
+    yb_cut = yb.values[:L]
 
     decided_live_mask = (preds_live != -1)
-    acc_live = (preds_live[decided_live_mask] == gt_live[decided_live_mask]).mean() if decided_live_mask.any() else float("nan")
+    acc_live = (preds_live[decided_live_mask] == yb_cut[decided_live_mask]).mean() if decided_live_mask.any() else float("nan")
 
     # ---------- گزارش ----------
-    print("\n========== ACCURACY REPORT (last {:,} rows) ==========".format(args.n_test))
+    if L < args.n_test:
+        LOG.info("ℹ️ تعداد ردیف‌های قابل‌مقایسه کمتر از n_test شد: L=%d (n_test=%d). احتمالاً به‌خاطر warm-up طولانی برخی اندیکاتورها.", L, args.n_test)
+
+    print("\n========== ACCURACY REPORT (last {:,} rows requested; compared {:,}) ==========".format(args.n_test, L))
     print(f"Batch accuracy (decided rows) : {acc_batch:.4f}")
     print(f"Live  accuracy (decided rows) : {acc_live:.4f}")
     print(f"Predicted rows (live)         : {decided_live_mask.sum()} / {L}")
-    print(f"  • Correct                   : {(preds_live[decided_live_mask]==gt_live[decided_live_mask]).sum()}")
-    print(f"  • Wrong                     : {(preds_live[decided_live_mask]!=gt_live[decided_live_mask]).sum()}")
+    print(f"  • Correct                   : {(preds_live[decided_live_mask]==yb_cut[decided_live_mask]).sum()}")
+    print(f"  • Wrong                     : {(preds_live[decided_live_mask]!=yb_cut[decided_live_mask]).sum()}")
     print(f"  • Unpredicted (-1)          : {L - decided_live_mask.sum()}")
 
     # ---------- اختلاف برچسب batch ↔ live ----------
@@ -217,8 +222,3 @@ if __name__ == "__main__":
             print("  -", c)
     else:
         print("\n✅  هیچ اختلاف مقداری بین فیچرهای batch و live یافت نشد.")
-
-    # نکته: اگر باز هم Predicted rows = 0 شد، یعنی احتمال‌های لایو بین neg_thr و pos_thr مانده‌اند.
-    # با توجه به استفاده‌ی همین pipe_fit، این فقط زمانی رخ می‌دهد که
-    #  ➜ آستانه‌ها با این مدل/این بازه همخوان نباشند، یا
-    #  ➜ y/GT بر اساس تعریف متفاوتی ساخته شده باشد.
