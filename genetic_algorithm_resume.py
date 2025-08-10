@@ -118,8 +118,8 @@ def load_checkpoint() -> tuple[int, list, float] | None:
 # ---------------------------------------------------------------------------
 @dataclass
 class GAConfig:
-    population_size: int = 4
-    n_generations: int = 2
+    population_size: int = 32
+    n_generations: int = 8
     cx_pb: float = 0.8
     mut_pb: float = 0.4
     early_stopping_threshold: float = 0.85
@@ -327,7 +327,8 @@ def evaluate_cv(ind):
         hyper = {
             "C":C, "max_iter":max_iter, "tol":tol, "penalty":penalty,
             "solver":solver, "fit_intercept":fit_intercept,
-            "class_weight":class_weight, "multi_class":multi_class
+            "class_weight":class_weight
+            # ← multi_class عمداً حذف شد
         }
 
         tscv = TimeSeriesSplit(n_splits=3)
@@ -515,7 +516,8 @@ class GeneticAlgorithmRunner:
         hyper = {
             "C":C, "max_iter":max_iter, "tol":tol, "penalty":penalty,
             "solver":solver, "fit_intercept":fit_intercept,
-            "class_weight":class_weight, "multi_class":multi_class
+            "class_weight":class_weight
+            # ← multi_class عمداً حذف شد
         }
         model = ModelPipeline(
             hyper,
