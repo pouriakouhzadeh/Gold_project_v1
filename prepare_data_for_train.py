@@ -243,20 +243,29 @@ class PREPARE_DATA_FOR_TRAIN:
                 f"(0/NaN ≥{ratio_thr:.0%} or ≥{min_fail} →{z_bad}, "
                 f"fwd ≥{ratio_thr:.0%} or ≥{min_fail} →{f_bad})")
 
-    def __init__(self, filepaths: dict[str, str] | None = None, main_timeframe="30T", verbose=True):
+    def __init__(self, filepaths: dict[str, str] | None = None, main_timeframe="30T", verbose=True, fast_mode: bool = False):
         defaults = {"30T": "XAUUSD_M30.csv", "1H": "XAUUSD_H1.csv", "15T": "XAUUSD_M15.csv", "5T": "XAUUSD_M5.csv"}
         self.filepaths = filepaths or defaults
         self.main_timeframe = main_timeframe
         self.verbose = verbose
+        self.fast_mode = fast_mode                         # ← NEW
         self.train_columns_after_window: List[str] = []
-        self.drift_finder = DriftBasedStartDateSuggester(self.filepaths)
-        self.shared_start_date = self.drift_finder.find_shared_start_date()
+
+        # فقط در حالت معمول (Train) drift-scan شود؛ در fast_mode خاموش
+        if not self.fast_mode:
+            self.drift_finder = DriftBasedStartDateSuggester(self.filepaths)
+            self.shared_start_date = self.drift_finder.find_shared_start_date()
+        else:
+            self.drift_finder = None
+            self.shared_start_date = None
 
         if verbose:
             print("[PREP] Initialised for", main_timeframe)
         logging.info("[INIT] main_timeframe=%s", self.main_timeframe)
 
-        print(f"📅 Shared drift-aware training start date: {self.shared_start_date}")
+        # فقط وقتی drift-scan انجام شده باشد، آن را چاپ کن
+        if (not self.fast_mode) and (self.shared_start_date is not None):
+            print(f"📅 Shared drift-aware training start date: {self.shared_start_date}")
 
 
     # ================= 1) LOAD & FEATURE ENGINEER =================
@@ -344,7 +353,8 @@ class PREPARE_DATA_FOR_TRAIN:
         df.replace([np.inf, -np.inf], np.nan, inplace=True); df.ffill(inplace=True); df.dropna(how="all", inplace=True)
         
         # ---- NEW: detect bad cols for this timeframe BEFORE resample ----
-        self._detect_bad_cols_tf(df, tf)
+        if not getattr(self, "fast_mode", False):
+            self._detect_bad_cols_tf(df, tf)
 
         # ---------------- SAFE RESAMPLE ----------------
         # print("Safe resample start ...")
