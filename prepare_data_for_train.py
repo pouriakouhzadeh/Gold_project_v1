@@ -252,12 +252,12 @@ class PREPARE_DATA_FOR_TRAIN:
         self.train_columns_after_window: List[str] = []
 
         # فقط در حالت معمول (Train) drift-scan شود؛ در fast_mode خاموش
-        if not self.fast_mode:
+        self.shared_start_date = None
+        if not fast_mode:
             self.drift_finder = DriftBasedStartDateSuggester(self.filepaths)
             self.shared_start_date = self.drift_finder.find_shared_start_date()
-        else:
-            self.drift_finder = None
-            self.shared_start_date = None
+            if verbose:
+                print(f"📅 Shared drift-aware training start date: {self.shared_start_date}")
 
         if verbose:
             print("[PREP] Initialised for", main_timeframe)
@@ -282,7 +282,8 @@ class PREPARE_DATA_FOR_TRAIN:
             df = df[df["time"] >= self.shared_start_date]
             print(f"[{tf}] ⏳ Trimmed data from {self.shared_start_date.date()}")
         df.set_index("time", inplace=True)
-        print(f"len df {tf} = {len(df)}")
+        if self.verbose:
+            print(f"len df {tf} = {len(df)}")
         prefix = f"{tf}_"
 
         # ---------------- SIMPLE ROLLING ----------------
