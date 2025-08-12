@@ -454,9 +454,11 @@ class PREPARE_DATA_FOR_TRAIN:
             raise ValueError(f"{close_col} missing")
 
         # ---------------- Target ----------------
+        # AFTER (بالای تابع همان است)
         y = ((data[close_col].shift(-1) - data[close_col]) > 0).astype(int)
         if mode == "train":
-            data, y = data.iloc[:-1], y.iloc[:-1]
+            # این حذف در ادامه و بعد از پنجره‌بندی نهایی انجام می‌شود
+            pass
         else:
             y.iloc[:] = 0  # dummy for predict
             
@@ -513,12 +515,27 @@ class PREPARE_DATA_FOR_TRAIN:
         )
 
         # ---------------- Final Clean ----------------
+        # AFTER (در انتهای تابع ready)
+
+        # پاک‌سازی پایه
         X_f.replace([np.inf, -np.inf], np.nan, inplace=True)
         X_f = X_f.fillna(X_f.median())
 
+        # --- ترازبندی نهایی برای آموزش ---
+        # همواره در TRAIN، آخرین ردیف را حذف می‌کنیم تا مدل هیچ‌وقت «ردیف آخر» را نبیند.
         if mode == "train":
+            # اطمینان از هم‌طولی
+            L = min(len(X_f), len(y))
+            X_f = X_f.iloc[:L]
+            y   = y.iloc[:L]
+
+            if L > 0:
+                X_f = X_f.iloc[:-1].reset_index(drop=True)
+                y   = y.iloc[:-1].reset_index(drop=True)
+
             self.train_columns_after_window = X_f.columns.tolist()
 
+        # price_raw برای معیارهای مالی/گزارش
         price_raw = data[close_col].iloc[: len(df_diff)].reset_index(drop=True)
         if window > 1:
             price_raw = price_raw.iloc[window - 1 :].reset_index(drop=True)

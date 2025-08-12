@@ -118,8 +118,8 @@ def load_checkpoint() -> tuple[int, list, float] | None:
 # ---------------------------------------------------------------------------
 @dataclass
 class GAConfig:
-    population_size: int = 32
-    n_generations: int = 8
+    population_size: int = 8
+    n_generations: int = 3
     cx_pb: float = 0.8
     mut_pb: float = 0.4
     early_stopping_threshold: float = 0.85
