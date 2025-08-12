@@ -480,6 +480,13 @@ class PREPARE_DATA_FOR_TRAIN:
         df_diff.reset_index(drop=True, inplace=True)
         y = y.iloc[: len(df_diff)].reset_index(drop=True)
         
+        # ⚠️ در حالت PREDICT، همیشه «آخرین سطرِ ناپایدار» را حذف کن
+        # تا آخرین رکوردِ باقی‌مانده برابر با t-1 (پایدار) باشد.
+        if mode == "predict":
+            if len(df_diff) >= 1:
+                df_diff = df_diff.iloc[:-1].reset_index(drop=True)
+                # y در predict مصرف نمی‌شود، ولی برای هم‌ترازی نگه می‌داریم
+                y = y.iloc[: len(df_diff)].reset_index(drop=True)
 
         # ---------------- Feature Selection ----------------
 # ---------------- Feature Selection (+tminus support) ----------------
