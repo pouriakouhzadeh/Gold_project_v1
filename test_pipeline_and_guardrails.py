@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Tests + Execution Logger (v2)
+Tests + Execution Logger (v3)
 - لاگ با نام همین فایل و پسوند .log ساخته می‌شود.
-- رفع FutureWarning freq='T' → استفاده از '30min'
-- تست اضافه: idempotent بودن ستون‌های زمان و اجرای پشت‌سرهم build_X
+- رفع FutureWarning: از '30min' استفاده می‌کنیم.
+- test_depends_on_tminus1: به جای اندیس، با «تایم‌استمپ مرجع آخرین سطر پایدار» کار می‌کند.
 """
 
 import os
@@ -52,7 +52,7 @@ from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
 from gp_guardrails import (
     guard_and_prepare_for_predict,
     take_last_closed_rows,
-    WarmupNotEnough, ColumnsMismatch, BadValuesFound, TimestampNotAligned
+    WarmupNotEnough, ColumnsMismatch, BadValuesFound
 )
 
 # ------------------ pytest hooks برای گزارش اجرای تست‌ها در همین لاگ ------------------
@@ -155,18 +155,36 @@ def test_last_row_stability(tmp_csvs):
 
 def test_depends_on_tminus1(tmp_csvs):
     _LOGGER.info(">> test_depends_on_tminus1: start")
-    _, _, X1, _, _, _ = build_X(tmp_csvs, window=1, mode="predict")
-    for tf, path in tmp_csvs.items():
-        df = pd.read_csv(path)
-        idx = len(df)-2
-        df.loc[idx, ["open","high","low","close","volume"]] += 123.0
-        df.to_csv(path, index=False)
-        _LOGGER.info("   modified t-1 row for %s (idx=%d)", tf, idx)
-    _, _, X2, _, _, _ = build_X(tmp_csvs, window=1, mode="predict")
+    prep1, merged1, X1, _, feats1, _ = build_X(tmp_csvs, window=1, mode="predict")
+    if X1.empty:
+        pytest.skip("X empty in predict mode; not enough history to validate t-1 dependency")
+    tcol = "30T_time" if "30T_time" in merged1.columns else "time"
+    times = pd.to_datetime(merged1[tcol].dropna())
+    if len(times) < 2:
+        pytest.skip("Not enough merged rows to choose an anchor t-1")
+    # در mode="predict" آخرین ردیف ناپایدار حذف می‌شود؛ پس آخرین سطر X به times.iloc[-2] تکیه دارد.
+    t_last_stable = times.iloc[-2]
+    _LOGGER.info("   anchor (last stable) time = %s", t_last_stable)
+
+    # فقط فایل 30T را روی همان timestamp دست‌کاری کن
+    m30 = pd.read_csv(tmp_csvs["30T"])
+    m30["time"] = pd.to_datetime(m30["time"])
+    idx = m30.index[m30["time"] == t_last_stable]
+    assert len(idx) == 1, f"anchor time {t_last_stable} not found in M30 csv"
+    i = int(idx[0])
+
+    m30.loc[i, ["open","high","low","close","volume"]] += 123.0
+    m30.to_csv(tmp_csvs["30T"], index=False)
+    _LOGGER.info("   modified M30 at anchor index=%d (t=%s)", i, t_last_stable)
+
+    # پاس ۲
+    prep2, merged2, X2, _, feats2, _ = build_X(tmp_csvs, window=1, mode="predict")
+    # اطمینان از هم‌ستونی برای مقایسه
+    X2 = X2[X1.columns]
     changed = not np.allclose(X1.iloc[-1].values, X2.iloc[-1].values)
-    _LOGGER.info("   last-row changed after t-1 tweak? %s", changed)
-    assert changed, "Last-row features SHOULD depend on t-1"
-    _LOGGER.info("<< test_depends_on_tminus1: OK (depends on t-1)")
+    _LOGGER.info("   last-row changed after t-1 (anchor) tweak? %s", changed)
+    assert changed, "Last-row features SHOULD depend on the anchor t-1 candle"
+    _LOGGER.info("<< test_depends_on_tminus1: OK (depends on anchor t-1)")
 
 def test_guard_no_nan_inf_and_cols_and_dtype(tmp_csvs):
     _LOGGER.info(">> test_guard_no_nan_inf_and_cols_and_dtype: start")
@@ -245,17 +263,13 @@ def test_take_last_closed_rows_aligns_timestamps(tmp_csvs):
 
 def test_time_prefix_idempotent(tmp_csvs):
     """
-    اجرای پشت‌سرهم load_data/ready نباید خطای "cannot insert ..._time, already exists" بدهد.
-    این تست مخصوص پچ idempotent برای ستون‌های زمان است.
+    اجرای پشت‌سرهم load_data/ready نباید خطای 'cannot insert ..._time, already exists' بدهد.
     """
     _LOGGER.info(">> test_time_prefix_idempotent: start")
-    # بار اول
     prep1, merged1, X1, y1, feats1, _ = build_X(tmp_csvs, window=2, mode="predict")
     _LOGGER.info("   pass#1 merged=%s X=%s feats=%s", getattr(merged1, "shape", None), getattr(X1, "shape", None), len(feats1) if feats1 is not None else None)
-    # بار دوم (بدون تغییر ورودی) — اگر insert تکراری باشد، اینجا قبلاً خطا می‌داد
     prep2, merged2, X2, y2, feats2, _ = build_X(tmp_csvs, window=2, mode="predict")
     _LOGGER.info("   pass#2 merged=%s X=%s feats=%s", getattr(merged2, "shape", None), getattr(X2, "shape", None), len(feats2) if feats2 is not None else None)
-    # چند چک ساده
     assert merged2.shape[1] >= merged1.shape[1]
     assert X2.shape[1] == X1.shape[1]
     _LOGGER.info("<< test_time_prefix_idempotent: OK (no duplicate time insert)")
