@@ -1,30 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-live_like_sim.py  — Realistic live-backtest simulator (predict-mode, stable-last-row)
+live_like_sim.py — Realistic live-backtest simulator (predict-mode, stable-last-row + guardrails)
 
-چی کار می‌کند؟
-- برای هر t از آخر n_test کندل 30 دقیقه، چهار CSV زنده تا «کندل بسته‌شده‌ی t» می‌نویسد.
-- PREPARE_DATA_FOR_TRAIN دقیقاً همین CSVها را می‌خواند، با mode="predict" فیچر می‌سازد.
-- پیش‌بینی روی آخرین ردیف X انجام می‌شود؛ برچسب حقیقی = جهت کندل (t→t+1) از M30 کامل.
-- آستانه‌ها اعمال می‌شود؛ آمار لحظه‌ای لاگ + کنسول؛ CSVهای موقت همان لحظه حذف می‌شوند.
+چه می‌کند؟
+- برای هر t از آخر n_test کندل 30 دقیقه، چهار CSV «زنده» تا آخرین کندلِ بسته‌شده و مشترک بین همه‌ی تایم‌فریم‌ها می‌نویسد.
+- PREPARE_DATA_FOR_TRAIN همان CSVها را با mode="predict" می‌خواند و فیچر می‌سازد (بدون نگاه به آینده، سطر آخر پایدار).
+- پیش‌بینی روی آخرین ردیف X انجام می‌شود؛ GT = جهت کندل بعدی نسبت به همان last_time در M30 کامل.
+- آستانه‌ها اعمال می‌شود؛ آمار لحظه‌ای در لاگ چاپ می‌شود؛ CSVهای موقت در صورت عدم نیاز حذف می‌گردند.
 
-پیش‌نیاز هم‌ترازی:
-- در آموزش، X_t باید فقط از اطلاعات تا t-1 ساخته شود و y_t = 1{close_{t+1} > close_t}.
-- ستون‌های ورودی inference باید دقیقاً با payload["train_window_cols"] یکسان باشند.
+گاردریل‌ها:
+- هم‌ترازی تایم‌استمپ‌ها بین TFها (take_last_closed_rows)
+- warm-up کافی، نبود NaN/Inf، تطابق و ترتیب دقیق ستون‌ها با train_window_cols، و dtype=float32 (guard_and_prepare_for_predict)
 """
 
 from __future__ import annotations
 import argparse, os, shutil, logging, sys, time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import joblib
 from sklearn.pipeline import Pipeline
 
+
+
+from gp_guardrails import (
+    guard_and_prepare_for_predict,
+    take_last_closed_rows,
+    latest_common_timestamp,
+    WarmupNotEnough, ColumnsMismatch, BadValuesFound, TimestampNotAligned
+)
 
 # ===== CLI ==================================================================
 def parse_args():
@@ -36,16 +44,14 @@ def parse_args():
     p.add_argument("--symbol", default="XAUUSD", help="Symbol prefix for CSV filenames")
     p.add_argument("--log-file", default="live_like_sim.log", help="Log file path")
 
-    # tail context sizes (تنظیم بر حسب اندیکاتورها)
+    # tail context sizes (تنظیم بر حسب اندیکاتورها / warm-up)
     p.add_argument("--ctx-5t", type=int, default=3000, help="5M context (tail rows)")
     p.add_argument("--ctx-15t", type=int, default=1200, help="15M context (tail rows)")
     p.add_argument("--ctx-30t", type=int, default=500,  help="30M context (tail rows)")
     p.add_argument("--ctx-1h", type=int, default=300,  help="1H context (tail rows)")
 
-    # اگر خواستید CSVها را برای بررسی نگه دارید
     p.add_argument("--keep-csv", action="store_true", help="Do not delete per-iteration live CSVs")
     return p.parse_args()
-
 
 # ===== Logging ===============================================================
 def setup_logger(log_path: str):
@@ -61,11 +67,9 @@ def setup_logger(log_path: str):
     log.addHandler(fh); log.addHandler(ch)
     return log
 
-
 # ===== File name maps ========================================================
 BASE_FILENAMES = {"5T":"{sym}_M5.csv","15T":"{sym}_M15.csv","30T":"{sym}_M30.csv","1H":"{sym}_H1.csv"}
 LIVE_FILENAMES = {"5T":"{sym}_M5_live.csv","15T":"{sym}_M15_live.csv","30T":"{sym}_M30_live.csv","1H":"{sym}_H1_live.csv"}
-
 
 # ===== IO helpers ============================================================
 def load_base_csvs(base_dir: Path, symbol: str) -> Dict[str, pd.DataFrame]:
@@ -85,11 +89,9 @@ def load_base_csvs(base_dir: Path, symbol: str) -> Dict[str, pd.DataFrame]:
         dfs[tf] = df
     return dfs
 
-
 def build_live_paths(tmp_dir: Path, symbol: str) -> Dict[str, str]:
     tmp_dir.mkdir(parents=True, exist_ok=True)
     return {tf: str(tmp_dir / patt.format(sym=symbol)) for tf, patt in LIVE_FILENAMES.items()}
-
 
 def write_live_csvs_until(
     dfs_full: Dict[str, pd.DataFrame],
@@ -97,9 +99,7 @@ def write_live_csvs_until(
     live_paths: Dict[str, str],
     ctx_map: Dict[str, int],
 ) -> None:
-    """
-    برای هر TF، رکوردهای time<=t_until را گرفته و فقط tail=context می‌نویسد (حداقل 2 ردیف).
-    """
+    """برای هر TF، رکوردهای time<=t_until را گرفته و فقط tail=context می‌نویسد (حداقل 2 ردیف)."""
     for tf, out_path in live_paths.items():
         df = dfs_full[tf]
         df_cut = df[df["time"] <= t_until]
@@ -110,6 +110,19 @@ def write_live_csvs_until(
         df_cut["time"] = df_cut["time"].dt.strftime("%Y-%m-%d %H:%M")
         df_cut.to_csv(out_path, index=False)
 
+def read_live_csvs(live_paths: Dict[str, str]) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
+    for tf, p in live_paths.items():
+        df = pd.read_csv(p)
+        df["time"] = pd.to_datetime(df["time"])
+        out[tf] = df
+    return out
+
+def rewrite_from_frames(frames: Dict[str, pd.DataFrame], live_paths: Dict[str, str]) -> None:
+    for tf, df in frames.items():
+        df2 = df.copy()
+        df2["time"] = pd.to_datetime(df2["time"]).dt.strftime("%Y-%m-%d %H:%M")
+        df2.to_csv(live_paths[tf], index=False)
 
 def delete_live_csvs(tmp_dir: Path):
     if not tmp_dir.is_dir():
@@ -120,12 +133,8 @@ def delete_live_csvs(tmp_dir: Path):
         except Exception:
             pass
 
-
 def compute_gt_next(m30_df: pd.DataFrame, t_ref: pd.Timestamp) -> Optional[int]:
-    """
-    GT = جهت کندل بعدی در M30 کامل، نسبت به زمان مرجع t_ref.
-    اگر t_ref آخرین کندل باشد، None برمی‌گرداند.
-    """
+    """GT = جهت کندل بعدی در M30 کامل نسبت به t_ref. اگر t_ref آخرین کندل باشد → None."""
     idx = m30_df.index[m30_df["time"] == t_ref]
     if len(idx) == 0:
         return None
@@ -136,20 +145,16 @@ def compute_gt_next(m30_df: pd.DataFrame, t_ref: pd.Timestamp) -> Optional[int]:
     c1 = float(m30_df.loc[i + 1, "close"])
     return 1 if (c1 - c0) > 0 else 0
 
-
 # ===== PREPARE wrapper (robust to different signatures) ======================
 def build_prep(filepaths: Dict[str, str]):
-    """
-    بعضی نسخه‌های PREPARE_DATA_FOR_TRAIN آرگومان fast_mode ندارند.
-    این سازنده را طوری نوشته‌ام که هر دو حالت را پشتیبانی کند.
-    """
+    """برخی نسخه‌های PREPARE_DATA_FOR_TRAIN آرگومان fast_mode ندارند؛ هر دو را پشتیبانی می‌کنیم."""
     from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
     try:
         return PREPARE_DATA_FOR_TRAIN(
             main_timeframe="30T",
             filepaths=filepaths,
             verbose=False,
-            fast_mode=True,       # اگر نبود، except → بدون fast_mode
+            fast_mode=True,
         )
     except TypeError:
         return PREPARE_DATA_FOR_TRAIN(
@@ -157,7 +162,6 @@ def build_prep(filepaths: Dict[str, str]):
             filepaths=filepaths,
             verbose=False,
         )
-
 
 # ===== MAIN =================================================================
 def main():
@@ -208,18 +212,34 @@ def main():
 
     try:
         for k, t_cur in enumerate(anchor_times, start=1):
-            t_csv0 = time.perf_counter()
+            # 1) ساخت CSVهای «زنده» تا t_cur
+            t0 = time.perf_counter()
             write_live_csvs_until(dfs_full, t_cur, live_paths, ctx_map)
-            t_csv = time.perf_counter() - t_csv0
 
-            # لود و فیچر—ساخت با mode="predict" (آخرین ردیف، پایدار و بدون نگاه به آینده)
+            # 2) هم‌ترازی تایم‌استمپ‌ها: trim همه‌ی TFها تا آخرین تایم مشترک (کندل‌های بسته‌شده)
+            try:
+                live_frames = read_live_csvs(live_paths)
+                live_frames_aligned = take_last_closed_rows(live_frames)
+                rewrite_from_frames(live_frames_aligned, live_paths)
+                ts_common = latest_common_timestamp(live_frames_aligned)
+            except (TimestampNotAligned, Exception) as e:
+                total_pred += 1; undecided += 1
+                dt = pd.to_datetime(t_cur).strftime("%Y-%m-%d %H:%M")
+                log.warning("[%-4d] %s  → timestamp alignment failed: %s  → skip (undecided).",
+                            k, dt, str(e))
+                if not args.keep_csv: delete_live_csvs(tmp_dir)
+                continue
+
+            t_csv = time.perf_counter() - t0
+
+            # 3) لود و ادغام و ساخت فیچر (mode='predict': آخرین سطر پایدار)
             t_load0 = time.perf_counter()
             merged = prep.load_data()
             t_load = time.perf_counter() - t_load0
 
-            # اگر ادغام، کندل آخر را نتواند بسازد، ممکن است last_time < t_cur شود؛ GT را روی last_time می‌گیریم
             tcol = "30T_time" if "30T_time" in merged.columns else "time"
             if merged.empty or merged[tcol].isna().all():
+                # warm-up یا عدم ادغام موفق
                 total_pred += 1; undecided += 1
                 acc = (wins / decided) if decided else 0.0
                 log.info("[%-4d] %s  → merged empty. cum: wins=%d loses=%d undecided=%d decided=%d acc=%.4f  [csv %.3fs | load %.3fs]",
@@ -230,47 +250,51 @@ def main():
 
             last_time = pd.to_datetime(merged[tcol].dropna().iloc[-1])
 
-            # ساخت X با mode="predict": y دامی است ولی X آخرین ردیف، همان ردیف پایدارِ t=last_time
-            X, _, _, _ = prep.ready(
-                merged, window=window, selected_features=feat_cols, mode="predict"
-            )
+            # 4) ساخت X (انتخاب عین ستون‌های آموزش) + گاردریل‌ها
+            X, _, _, _ = prep.ready(merged, window=window, selected_features=feat_cols, mode="predict")
+
+            # حداقل تاریخچه‌ی لازم (بر اساس ctx های تعریف‌شده)
+            min_required_history = {"5T": args.ctx_5t, "15T": args.ctx_15t, "30T": args.ctx_30t, "1H": args.ctx_1h}
+            ctx_lengths = {}
+            try:
+                # طول تاریخچه‌های فعلی را از همان live_frames_aligned (بعد از trim) می‌گیریم
+                ctx_lengths = {tf: len(df) for tf, df in live_frames_aligned.items()}
+                # اعمال گاردریل‌ها (warm-up/NaN-Inf/columns-order/dtype)
+                X = guard_and_prepare_for_predict(
+                    X=X,
+                    train_window_cols=feat_cols,
+                    min_required_history=min_required_history,
+                    ctx_history_lengths=ctx_lengths,
+                    where="X_last"
+                )
+            except (WarmupNotEnough, ColumnsMismatch, BadValuesFound) as e:
+                total_pred += 1; undecided += 1
+                acc = (wins / decided) if decided else 0.0
+                log.warning("[%-4d] %s  → guard failed: %s  → skip (undecided). cum acc=%.4f  [csv %.3fs | load %.3fs]",
+                            k, last_time.strftime("%Y-%m-%d %H:%M"), str(e), acc, t_csv, t_load)
+                if not args.keep_csv: delete_live_csvs(tmp_dir)
+                continue
 
             if X.empty:
                 total_pred += 1; undecided += 1
                 acc = (wins / decided) if decided else 0.0
-                log.info("[%-4d] %s  → X empty (warm-up). cum: wins=%d loses=%d undecided=%d decided=%d acc=%.4f  [csv %.3fs | load %.3fs]",
+                log.info("[%-4d] %s  → X empty after prepare (warm-up). cum: wins=%d loses=%d undecided=%d decided=%d acc=%.4f  [csv %.3fs | load %.3fs]",
                          k, last_time.strftime("%Y-%m-%d %H:%M"),
                          wins, loses, undecided, decided, acc, t_csv, t_load)
                 if not args.keep_csv: delete_live_csvs(tmp_dir)
                 continue
 
-            # اطمینان از یکسانی ستون‌ها
-            missing = [c for c in feat_cols if c not in X.columns]
-            if missing:
+            # 5) پیش‌بینی روی آخرین ردیف (پایدار و align شده با last_time)
+            x_last = X.iloc[[-1]][feat_cols].astype("float32")
+            try:
+                proba = float(pipe_fit.predict_proba(x_last)[:, 1][0])
+            except Exception as e:
                 total_pred += 1; undecided += 1
-                log.warning("[%-4d] %s  → missing %d feature columns; skip. ex: %s",
-                            k, last_time.strftime("%Y-%m-%d %H:%M"),
-                            len(missing), ", ".join(missing[:6]))
+                log.warning("[%-4d] %s  → predict_proba failed: %s → skip.",
+                            k, last_time.strftime("%Y-%m-%d %H:%M"), str(e))
                 if not args.keep_csv: delete_live_csvs(tmp_dir)
                 continue
 
-            # آخرین ردیف پایدار
-            x_last = X.iloc[[-1]][feat_cols]
-            x_last = x_last.replace([np.inf, -np.inf], np.nan)
-            if x_last.isna().any().any():
-                med = X[feat_cols].replace([np.inf, -np.inf], np.nan).median(numeric_only=True)
-                x_last = x_last.fillna(med).fillna(0.0)
-            vals = x_last.values
-            if not np.all(np.isfinite(vals)):
-                total_pred += 1; undecided += 1
-                log.warning("[%-4d] %s  → still non-finite after fill; skip.",
-                            k, last_time.strftime("%Y-%m-%d %H:%M"))
-                if not args.keep_csv: delete_live_csvs(tmp_dir)
-                continue
-            x_last = x_last.astype("float32")
-
-            # پیش‌بینی
-            proba = float(pipe_fit.predict_proba(x_last)[:, 1][0])
             if proba <= neg_thr: pred = 0
             elif proba >= pos_thr: pred = 1
             else: pred = -1
@@ -278,6 +302,7 @@ def main():
             # GT دقیقاً نسبت به last_time (هم‌راستا با X آخر)
             gt = compute_gt_next(dfs_full["30T"], last_time)
 
+            # 6) آمار
             total_pred += 1
             if pred == -1 or gt is None:
                 undecided += 1; status = "∅"
@@ -289,12 +314,12 @@ def main():
             acc = (wins / decided) if decided else 0.0
             misalign_note = "" if last_time == pd.to_datetime(t_cur) else " (note: merged last_time ≠ anchor)"
             log.info(
-                "[%-4d] %s  proba=%.4f  pred=%s  gt=%s  → %-5s | cum: wins=%d loses=%d undecided=%d decided=%d acc=%.4f%s  [csv %.3fs | load %.3fs]",
+                "[%-4d] %s  proba=%.4f  pred=%s  gt=%s  → %-5s | cum: wins=%d loses=%d undecided=%d decided=%d acc=%.4f%s  [csv %.3fs | load %.3fs | ctx %s]",
                 k, last_time.strftime("%Y-%m-%d %H:%M"),
                 proba, { -1:"-1", 0:"0", 1:"1" }[pred],
                 "-" if gt is None else str(gt),
                 status, wins, loses, undecided, decided, acc, misalign_note,
-                t_csv, t_load
+                t_csv, t_load, str({k2: ctx_lengths.get(k2, 0) for k2 in ["5T","15T","30T","1H"]})
             )
 
             if not args.keep_csv:
@@ -313,7 +338,6 @@ def main():
                     shutil.rmtree(tmp_dir)
             except Exception:
                 pass
-
 
 if __name__ == "__main__":
     main()
