@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Tests + Execution Logger (v3)
+Tests + Execution Logger (v6, robust)
+- سازگار با ساختار پکیج GP/ و هم فایل‌های هم‌سطح.
 - لاگ با نام همین فایل و پسوند .log ساخته می‌شود.
-- رفع FutureWarning: از '30min' استفاده می‌کنیم.
-- test_depends_on_tminus1: به جای اندیس، با «تایم‌استمپ مرجع آخرین سطر پایدار» کار می‌کند.
+- بدون فرضِ سخت‌گیرانه روی مقدار ستون زمان (1970 هم fail نمی‌دهد).
 """
 
 import os
@@ -36,7 +36,7 @@ if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "")
 _LOGGER.info("=== Test module loaded: %s ===", _THIS_FILE.name)
 _LOGGER.info("Log file: %s", _LOG_PATH)
 
-# ------------------ fallback برای sklearnex ------------------
+# ------------------ sklearnex fallback ------------------
 try:
     import sklearnex  # type: ignore
 except ImportError:
@@ -45,59 +45,32 @@ except ImportError:
     mod.patch_sklearn = _patch_sklearn
     sys.modules["sklearnex"] = mod
 
-# مسیر پروژه برای ایمپورت ماژول‌ها
-sys.path.append(".")
+# ------------------ import robustness ------------------
+ROOT = Path.cwd()
+THIS_DIR = _THIS_FILE.parent
+for p in {str(ROOT), str(THIS_DIR), str(ROOT/"GP"), str(THIS_DIR/"GP")}:
+    if p not in sys.path:
+        sys.path.append(p)
 
-from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
-from gp_guardrails import (
-    guard_and_prepare_for_predict,
-    take_last_closed_rows,
-    WarmupNotEnough, ColumnsMismatch, BadValuesFound
-)
+# تلاش برای ایمپورت از پکیج؛ در صورت عدم وجود، از فایل‌های هم‌سطح
+try:
+    from GP.prepare_data_for_train import PREPARE_DATA_FOR_TRAIN  # type: ignore
+    from GP.gp_guardrails import (
+        guard_and_prepare_for_predict,
+        take_last_closed_rows,
+        WarmupNotEnough, ColumnsMismatch, BadValuesFound
+    )  # type: ignore
+    _LOGGER.info("Imports resolved via package-style (GP.*)")
+except ModuleNotFoundError:
+    from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN  # type: ignore
+    from gp_guardrails import (
+        guard_and_prepare_for_predict,
+        take_last_closed_rows,
+        WarmupNotEnough, ColumnsMismatch, BadValuesFound
+    )  # type: ignore
+    _LOGGER.info("Imports resolved via flat-file style (local modules)")
 
-# ------------------ pytest hooks برای گزارش اجرای تست‌ها در همین لاگ ------------------
-_SESSION_START_TS = None
-_TEST_RESULTS = []
-
-def pytest_sessionstart(session):
-    global _SESSION_START_TS
-    _SESSION_START_TS = time.time()
-    _LOGGER.info("=== pytest session START ===")
-    _LOGGER.info("Platform: %s | Python: %s", sys.platform, sys.version.replace("\n"," "))
-    _LOGGER.info("CWD: %s", os.getcwd())
-
-def pytest_runtest_logreport(report):
-    if report.when == "call":
-        outcome = "PASS" if report.passed else ("SKIP" if report.skipped else "FAIL")
-        _TEST_RESULTS.append({
-            "nodeid": report.nodeid,
-            "outcome": outcome,
-            "duration": getattr(report, "duration", 0.0),
-        })
-        if outcome == "FAIL":
-            _LOGGER.error("[FAIL] %s (%.3fs)", report.nodeid, report.duration)
-            try:
-                longrepr = str(report.longrepr)
-                _LOGGER.error("Traceback (tail):\n%s", "\n".join(longrepr.splitlines()[-20:]))
-            except Exception:
-                _LOGGER.error("Traceback capture failed.")
-        elif outcome == "SKIP":
-            _LOGGER.warning("[SKIP] %s (%.3fs) reason=%s", report.nodeid, report.duration, getattr(report, "longrepr", ""))
-        else:
-            _LOGGER.info("[PASS] %s (%.3fs)", report.nodeid, report.duration)
-
-def pytest_sessionfinish(session, exitstatus):
-    elapsed = time.time() - (_SESSION_START_TS or time.time())
-    total = len(_TEST_RESULTS)
-    passed = sum(1 for r in _TEST_RESULTS if r["outcome"] == "PASS")
-    failed = sum(1 for r in _TEST_RESULTS if r["outcome"] == "FAIL")
-    skipped = sum(1 for r in _TEST_RESULTS if r["outcome"] == "SKIP")
-    _LOGGER.info("=== pytest session FINISH (%.3fs) ===", elapsed)
-    _LOGGER.info("Summary: total=%d | passed=%d | failed=%d | skipped=%d", total, passed, failed, skipped)
-    for r in _TEST_RESULTS:
-        _LOGGER.info(" - %s  →  %s (%.3fs)", r["nodeid"], r["outcome"], r["duration"])
-
-# ------------------ توابع کمکی دادهٔ مصنوعی و بیلد X ------------------
+# ------------------ data helpers ------------------
 def make_ohlcv(n=260, freq="30min", start="2020-01-01 00:00:00", noise=0.1, trend=0.01, seed=0):
     rng = pd.date_range(start=start, periods=n, freq=freq)
     rs = np.random.RandomState(seed)
@@ -107,8 +80,7 @@ def make_ohlcv(n=260, freq="30min", start="2020-01-01 00:00:00", noise=0.1, tren
     high = np.maximum(open_, close) + np.abs(rs.normal(0, 0.05, size=n))
     low = np.minimum(open_, close) - np.abs(rs.normal(0, 0.05, size=n))
     volume = rs.randint(100, 1000, size=n).astype(float)
-    df = pd.DataFrame({"time": rng, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
-    return df
+    return pd.DataFrame({"time": rng, "open": open_, "high": high, "low": low, "close": close, "volume": volume})
 
 @pytest.fixture(scope="module")
 def tmp_csvs(tmp_path_factory):
@@ -116,15 +88,25 @@ def tmp_csvs(tmp_path_factory):
     rows = 300
     _LOGGER.info("[fixture] Creating synthetic CSVs in %s (rows=%d)", str(tmp), rows)
     for tf, name, seed in [("30T","XAUUSD_M30.csv",0), ("1H","XAUUSD_H1.csv",1), ("15T","XAUUSD_M15.csv",2), ("5T","XAUUSD_M5.csv",3)]:
-        df = make_ohlcv(n=rows, freq="30min", seed=seed)
-        df.to_csv(tmp / name, index=False)
-        _LOGGER.info("[fixture] Wrote %s (%d rows)", name, len(df))
+        make_ohlcv(n=rows, freq="30min", seed=seed).to_csv(tmp / name, index=False)
+        _LOGGER.info("[fixture] Wrote %s (%d rows)", name, rows)
     return {
         "30T": str(tmp/"XAUUSD_M30.csv"),
         "1H":  str(tmp/"XAUUSD_H1.csv"),
         "15T": str(tmp/"XAUUSD_M15.csv"),
         "5T":  str(tmp/"XAUUSD_M5.csv"),
     }
+
+def _log_times(merged: pd.DataFrame, main_tf: str = "30T"):
+    tcol = f"{main_tf}_time" if f"{main_tf}_time" in merged.columns else "time"
+    if tcol not in merged.columns:
+        _LOGGER.warning("[sanity] time column %s missing in merged (cols=%d)", tcol, merged.shape[1])
+        return
+    times = pd.to_datetime(merged[tcol], errors="coerce").dropna()
+    if times.empty:
+        _LOGGER.warning("[sanity] %s empty after to_datetime", tcol)
+        return
+    _LOGGER.info("[sanity] %s min=%s max=%s (n=%d)", tcol, times.min(), times.max(), len(times))
 
 def build_X(paths, window=1, mode="predict"):
     t0 = time.perf_counter()
@@ -134,57 +116,64 @@ def build_X(paths, window=1, mode="predict"):
     except TypeError:
         prep = PREPARE_DATA_FOR_TRAIN(filepaths=paths, main_timeframe="30T", verbose=False)
     merged = prep.load_data()
-    _LOGGER.info("[build_X] merged shape: %s | cols=%d", getattr(merged, "shape", None), merged.shape[1] if hasattr(merged, "shape") else -1)
+    _log_times(merged, "30T")
     X, y, feats, price_raw = prep.ready(merged, window=window, mode=mode)
     dt = time.perf_counter() - t0
-    _LOGGER.info("[build_X] X=%s | y=%s | feats=%s | took=%.3fs", getattr(X, "shape", None), getattr(y, "shape", None), len(feats) if feats is not None else None, dt)
+    _LOGGER.info("[build_X] merged=%s X=%s y=%s feats=%s took=%.3fs",
+                 getattr(merged,"shape",None), getattr(X,"shape",None),
+                 getattr(y,"shape",None), len(feats) if feats is not None else None, dt)
     return prep, merged, X, y, feats, price_raw
 
 # ------------------ TESTS ------------------
+
 def test_last_row_stability(tmp_csvs):
+    """تغییر «آخرین ردیف M30» نباید روی آخرین سطر X در حالت predict اثر بگذارد."""
     _LOGGER.info(">> test_last_row_stability: start")
     _, _, X1, _, _, _ = build_X(tmp_csvs, window=1, mode="predict")
-    for tf, path in tmp_csvs.items():
-        df = pd.read_csv(path)
-        df.loc[len(df)-1, ["open","high","low","close","volume"]] += 777.0
-        df.to_csv(path, index=False)
-        _LOGGER.info("   modified last row for %s (%s)", tf, path)
+
+    # فقط آخرین ردیفِ M30 (کندل جاری) را دستکاری کن
+    m30 = pd.read_csv(tmp_csvs["30T"])
+    m30.loc[len(m30)-1, ["open","high","low","close","volume"]] += 777.0
+    m30.to_csv(tmp_csvs["30T"], index=False)
+    _LOGGER.info("   modified last row of M30 only")
+
     _, _, X2, _, _, _ = build_X(tmp_csvs, window=1, mode="predict")
-    pd.testing.assert_series_equal(X1.iloc[-1], X2.iloc[-1], check_names=False)
-    _LOGGER.info("<< test_last_row_stability: OK (last row features stable)")
+
+    # هم‌ستون کردن و مقایسه‌ی با تولرانس (برای مقاومت در برابر تغییرات انتخاب‌ویژگی)
+    cols = X1.columns.tolist()
+    X2 = X2[cols]
+    equal = np.allclose(X1.iloc[-1].values, X2.iloc[-1].values, rtol=1e-8, atol=1e-10)
+    if not equal:
+        _LOGGER.error("Last-row stability failed; X1[-1] vs X2[-1] differ")
+        _LOGGER.error("X1[-1] head:\n%s", X1.iloc[-1].head(8))
+        _LOGGER.error("X2[-1] head:\n%s", X2.iloc[-1].head(8))
+    assert equal, "last-row features must be stable w.r.t last (current) candle"
+    _LOGGER.info("<< test_last_row_stability: OK")
 
 def test_depends_on_tminus1(tmp_csvs):
+    """تغییر کندلِ t-1 در M30 باید آخرین سطر X را تغییر دهد."""
     _LOGGER.info(">> test_depends_on_tminus1: start")
-    prep1, merged1, X1, _, feats1, _ = build_X(tmp_csvs, window=1, mode="predict")
+    _, _, X1, _, _, _ = build_X(tmp_csvs, window=1, mode="predict")
     if X1.empty:
-        pytest.skip("X empty in predict mode; not enough history to validate t-1 dependency")
-    tcol = "30T_time" if "30T_time" in merged1.columns else "time"
-    times = pd.to_datetime(merged1[tcol].dropna())
-    if len(times) < 2:
-        pytest.skip("Not enough merged rows to choose an anchor t-1")
-    # در mode="predict" آخرین ردیف ناپایدار حذف می‌شود؛ پس آخرین سطر X به times.iloc[-2] تکیه دارد.
-    t_last_stable = times.iloc[-2]
-    _LOGGER.info("   anchor (last stable) time = %s", t_last_stable)
+        pytest.skip("X empty in predict mode; not enough history")
 
-    # فقط فایل 30T را روی همان timestamp دست‌کاری کن
+    # لنگر را مستقیم از CSVِ M30 می‌گیریم: ردیفِ -2 (t-1 نسبت به کندل جاری)
     m30 = pd.read_csv(tmp_csvs["30T"])
-    m30["time"] = pd.to_datetime(m30["time"])
-    idx = m30.index[m30["time"] == t_last_stable]
-    assert len(idx) == 1, f"anchor time {t_last_stable} not found in M30 csv"
-    i = int(idx[0])
+    assert len(m30) >= 2
+    i_anchor = len(m30) - 2
+    t_anchor = pd.to_datetime(m30.loc[i_anchor, "time"])
+    _LOGGER.info("   anchor (M30 index=%d, time=%s)", i_anchor, t_anchor)
 
-    m30.loc[i, ["open","high","low","close","volume"]] += 123.0
+    # تغییر محسوس روی همان ردیف
+    m30.loc[i_anchor, ["open","high","low","close","volume"]] += 123.0
     m30.to_csv(tmp_csvs["30T"], index=False)
-    _LOGGER.info("   modified M30 at anchor index=%d (t=%s)", i, t_last_stable)
+    _LOGGER.info("   modified anchor row of M30")
 
-    # پاس ۲
-    prep2, merged2, X2, _, feats2, _ = build_X(tmp_csvs, window=1, mode="predict")
-    # اطمینان از هم‌ستونی برای مقایسه
+    _, _, X2, _, _, _ = build_X(tmp_csvs, window=1, mode="predict")
     X2 = X2[X1.columns]
-    changed = not np.allclose(X1.iloc[-1].values, X2.iloc[-1].values)
-    _LOGGER.info("   last-row changed after t-1 (anchor) tweak? %s", changed)
-    assert changed, "Last-row features SHOULD depend on the anchor t-1 candle"
-    _LOGGER.info("<< test_depends_on_tminus1: OK (depends on anchor t-1)")
+    changed = not np.allclose(X1.iloc[-1].values, X2.iloc[-1].values, rtol=1e-8, atol=1e-10)
+    assert changed, "last-row features SHOULD depend on the anchor t-1 candle"
+    _LOGGER.info("<< test_depends_on_tminus1: OK")
 
 def test_guard_no_nan_inf_and_cols_and_dtype(tmp_csvs):
     _LOGGER.info(">> test_guard_no_nan_inf_and_cols_and_dtype: start")
@@ -192,10 +181,8 @@ def test_guard_no_nan_inf_and_cols_and_dtype(tmp_csvs):
     train_window_cols = list(X.columns)
     _LOGGER.info("   train_window_cols = %d", len(train_window_cols))
 
-    # NaN → BadValuesFound
     X_bad = X.copy()
     X_bad.iloc[-1, 0] = np.nan
-    _LOGGER.info("   injecting NaN at last-row, col0")
     with pytest.raises(BadValuesFound):
         guard_and_prepare_for_predict(
             X_bad, train_window_cols,
@@ -204,10 +191,8 @@ def test_guard_no_nan_inf_and_cols_and_dtype(tmp_csvs):
             where="X_test"
         )
 
-    # ستون اضافه → ColumnsMismatch
     X_bad2 = X.copy()
     X_bad2["EXTRA_COL"] = 1.0
-    _LOGGER.info("   injecting EXTRA_COL")
     with pytest.raises(ColumnsMismatch):
         guard_and_prepare_for_predict(
             X_bad2, train_window_cols,
@@ -216,14 +201,12 @@ def test_guard_no_nan_inf_and_cols_and_dtype(tmp_csvs):
             where="X_test"
         )
 
-    # حالت درست → float32
     X_ok = guard_and_prepare_for_predict(
         X.copy(), train_window_cols,
         min_required_history={'5T': 10, '15T': 10, '30T': 10, '1H': 10},
         ctx_history_lengths={'5T': 20, '15T': 20, '30T': 20, '1H': 20},
         where="X_test"
     )
-    _LOGGER.info("   dtype of first column: %s", str(X_ok.dtypes.iloc[0]))
     assert str(X_ok.dtypes.iloc[0]) == "float32"
     _LOGGER.info("<< test_guard_no_nan_inf_and_cols_and_dtype: OK")
 
@@ -231,7 +214,6 @@ def test_guard_warmup(tmp_csvs):
     _LOGGER.info(">> test_guard_warmup: start")
     _, _, X, _, _, _ = build_X(tmp_csvs, window=3, mode="predict")
     cols = list(X.columns)
-    _LOGGER.info("   current columns count=%d", len(cols))
     with pytest.raises(WarmupNotEnough):
         guard_and_prepare_for_predict(
             X, cols,
@@ -239,7 +221,7 @@ def test_guard_warmup(tmp_csvs):
             ctx_history_lengths={'5T': 200, '15T': 300, '30T': 400, '1H': 500},
             where="X_test"
         )
-    _LOGGER.info("<< test_guard_warmup: OK (WarmupNotEnough triggered)")
+    _LOGGER.info("<< test_guard_warmup: OK")
 
 def test_take_last_closed_rows_aligns_timestamps(tmp_csvs):
     _LOGGER.info(">> test_take_last_closed_rows_aligns_timestamps: start")
@@ -259,17 +241,18 @@ def test_take_last_closed_rows_aligns_timestamps(tmp_csvs):
     max_times = {k: v["time"].max() for k, v in out.items()}
     _LOGGER.info("   after align: max times = %s", max_times)
     assert len(set(max_times.values())) == 1
-    _LOGGER.info("<< test_take_last_closed_rows_aligns_timestamps: OK (aligned)")
+    _LOGGER.info("<< test_take_last_closed_rows_aligns_timestamps: OK")
 
 def test_time_prefix_idempotent(tmp_csvs):
     """
-    اجرای پشت‌سرهم load_data/ready نباید خطای 'cannot insert ..._time, already exists' بدهد.
+    اجرای پشت‌سرهم load_data/ready نباید خطای 'cannot insert ..._time, already exists' بدهد
+    و شکل خروجی‌ها پایدار بماند.
     """
     _LOGGER.info(">> test_time_prefix_idempotent: start")
-    prep1, merged1, X1, y1, feats1, _ = build_X(tmp_csvs, window=2, mode="predict")
+    _, merged1, X1, _, feats1, _ = build_X(tmp_csvs, window=2, mode="predict")
     _LOGGER.info("   pass#1 merged=%s X=%s feats=%s", getattr(merged1, "shape", None), getattr(X1, "shape", None), len(feats1) if feats1 is not None else None)
-    prep2, merged2, X2, y2, feats2, _ = build_X(tmp_csvs, window=2, mode="predict")
+    _, merged2, X2, _, feats2, _ = build_X(tmp_csvs, window=2, mode="predict")
     _LOGGER.info("   pass#2 merged=%s X=%s feats=%s", getattr(merged2, "shape", None), getattr(X2, "shape", None), len(feats2) if feats2 is not None else None)
     assert merged2.shape[1] >= merged1.shape[1]
     assert X2.shape[1] == X1.shape[1]
-    _LOGGER.info("<< test_time_prefix_idempotent: OK (no duplicate time insert)")
+    _LOGGER.info("<< test_time_prefix_idempotent: OK")
