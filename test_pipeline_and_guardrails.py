@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Tests + Execution Logger
-این فایل هنگام اجرا، یک لاگ با نام خودش و پسوند .log می‌سازد و تمام رویدادهای تست را ثبت می‌کند.
-لاگ شامل: شروع/پایان سشن، نتیجهٔ هر تست (PASS/FAIL/SKIP)، مدت‌زمان، و خلاصهٔ خطاها است.
+Tests + Execution Logger (v2)
+- لاگ با نام همین فایل و پسوند .log ساخته می‌شود.
+- رفع FutureWarning freq='T' → استفاده از '30min'
+- تست اضافه: idempotent بودن ستون‌های زمان و اجرای پشت‌سرهم build_X
 """
 
 import os
@@ -10,7 +11,6 @@ import sys
 import types
 import time
 import logging
-import traceback
 from pathlib import Path
 
 import numpy as np
@@ -23,11 +23,9 @@ _LOGGER = logging.getLogger(_LOGGER_NAME)
 _LOGGER.setLevel(logging.INFO)
 _LOGGER.propagate = False
 
-# فایل لاگ را در کنار همین فایل تست می‌سازیم
 _THIS_FILE = Path(__file__).resolve()
 _LOG_PATH = _THIS_FILE.with_suffix(".log")
 
-# اگر چندبار ایمپورت شد، هندلر تکراری نسازیم
 if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == str(_LOG_PATH) for h in _LOGGER.handlers):
     _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     fh = logging.FileHandler(_LOG_PATH, mode="w", encoding="utf-8")
@@ -59,7 +57,7 @@ from gp_guardrails import (
 
 # ------------------ pytest hooks برای گزارش اجرای تست‌ها در همین لاگ ------------------
 _SESSION_START_TS = None
-_TEST_RESULTS = []  # list of dicts: {"nodeid":..., "outcome":..., "duration":..., "when":...}
+_TEST_RESULTS = []
 
 def pytest_sessionstart(session):
     global _SESSION_START_TS
@@ -69,7 +67,6 @@ def pytest_sessionstart(session):
     _LOGGER.info("CWD: %s", os.getcwd())
 
 def pytest_runtest_logreport(report):
-    # report.when in {"setup","call","teardown"}
     if report.when == "call":
         outcome = "PASS" if report.passed else ("SKIP" if report.skipped else "FAIL")
         _TEST_RESULTS.append({
@@ -79,10 +76,9 @@ def pytest_runtest_logreport(report):
         })
         if outcome == "FAIL":
             _LOGGER.error("[FAIL] %s (%.3fs)", report.nodeid, report.duration)
-            # خلاصهٔ ارور
             try:
                 longrepr = str(report.longrepr)
-                _LOGGER.error("Traceback (short):\n%s", "\n".join(longrepr.splitlines()[-20:]))
+                _LOGGER.error("Traceback (tail):\n%s", "\n".join(longrepr.splitlines()[-20:]))
             except Exception:
                 _LOGGER.error("Traceback capture failed.")
         elif outcome == "SKIP":
@@ -98,12 +94,11 @@ def pytest_sessionfinish(session, exitstatus):
     skipped = sum(1 for r in _TEST_RESULTS if r["outcome"] == "SKIP")
     _LOGGER.info("=== pytest session FINISH (%.3fs) ===", elapsed)
     _LOGGER.info("Summary: total=%d | passed=%d | failed=%d | skipped=%d", total, passed, failed, skipped)
-    # ریز نتایج
     for r in _TEST_RESULTS:
         _LOGGER.info(" - %s  →  %s (%.3fs)", r["nodeid"], r["outcome"], r["duration"])
 
 # ------------------ توابع کمکی دادهٔ مصنوعی و بیلد X ------------------
-def make_ohlcv(n=260, freq="30T", start="2020-01-01 00:00:00", noise=0.1, trend=0.01, seed=0):
+def make_ohlcv(n=260, freq="30min", start="2020-01-01 00:00:00", noise=0.1, trend=0.01, seed=0):
     rng = pd.date_range(start=start, periods=n, freq=freq)
     rs = np.random.RandomState(seed)
     base = np.arange(n) * trend + rs.normal(0, noise, size=n).cumsum()/100
@@ -121,7 +116,7 @@ def tmp_csvs(tmp_path_factory):
     rows = 300
     _LOGGER.info("[fixture] Creating synthetic CSVs in %s (rows=%d)", str(tmp), rows)
     for tf, name, seed in [("30T","XAUUSD_M30.csv",0), ("1H","XAUUSD_H1.csv",1), ("15T","XAUUSD_M15.csv",2), ("5T","XAUUSD_M5.csv",3)]:
-        df = make_ohlcv(n=rows, freq="30T", seed=seed)
+        df = make_ohlcv(n=rows, freq="30min", seed=seed)
         df.to_csv(tmp / name, index=False)
         _LOGGER.info("[fixture] Wrote %s (%d rows)", name, len(df))
     return {
@@ -132,12 +127,17 @@ def tmp_csvs(tmp_path_factory):
     }
 
 def build_X(paths, window=1, mode="predict"):
+    t0 = time.perf_counter()
     _LOGGER.info("[build_X] window=%s mode=%s", window, mode)
-    prep = PREPARE_DATA_FOR_TRAIN(filepaths=paths, main_timeframe="30T", verbose=False, fast_mode=True)
+    try:
+        prep = PREPARE_DATA_FOR_TRAIN(filepaths=paths, main_timeframe="30T", verbose=False, fast_mode=True)
+    except TypeError:
+        prep = PREPARE_DATA_FOR_TRAIN(filepaths=paths, main_timeframe="30T", verbose=False)
     merged = prep.load_data()
-    _LOGGER.info("[build_X] merged shape: %s", getattr(merged, "shape", None))
+    _LOGGER.info("[build_X] merged shape: %s | cols=%d", getattr(merged, "shape", None), merged.shape[1] if hasattr(merged, "shape") else -1)
     X, y, feats, price_raw = prep.ready(merged, window=window, mode=mode)
-    _LOGGER.info("[build_X] X=%s | y=%s | feats=%s", getattr(X, "shape", None), getattr(y, "shape", None), len(feats) if feats is not None else None)
+    dt = time.perf_counter() - t0
+    _LOGGER.info("[build_X] X=%s | y=%s | feats=%s | took=%.3fs", getattr(X, "shape", None), getattr(y, "shape", None), len(feats) if feats is not None else None, dt)
     return prep, merged, X, y, feats, price_raw
 
 # ------------------ TESTS ------------------
@@ -170,11 +170,11 @@ def test_depends_on_tminus1(tmp_csvs):
 
 def test_guard_no_nan_inf_and_cols_and_dtype(tmp_csvs):
     _LOGGER.info(">> test_guard_no_nan_inf_and_cols_and_dtype: start")
-    prep, merged, X, _, _, _ = build_X(tmp_csvs, window=3, mode="predict")
-    train_window_cols = list(X.columns)  # شبیه متادیتای مدل
+    _, _, X, _, _, _ = build_X(tmp_csvs, window=3, mode="predict")
+    train_window_cols = list(X.columns)
     _LOGGER.info("   train_window_cols = %d", len(train_window_cols))
 
-    # تزریق NaN/Inf → باید BadValuesFound بدهد
+    # NaN → BadValuesFound
     X_bad = X.copy()
     X_bad.iloc[-1, 0] = np.nan
     _LOGGER.info("   injecting NaN at last-row, col0")
@@ -186,7 +186,7 @@ def test_guard_no_nan_inf_and_cols_and_dtype(tmp_csvs):
             where="X_test"
         )
 
-    # ستون اضافه → باید ColumnsMismatch بدهد
+    # ستون اضافه → ColumnsMismatch
     X_bad2 = X.copy()
     X_bad2["EXTRA_COL"] = 1.0
     _LOGGER.info("   injecting EXTRA_COL")
@@ -198,7 +198,7 @@ def test_guard_no_nan_inf_and_cols_and_dtype(tmp_csvs):
             where="X_test"
         )
 
-    # حالت درست → dtype باید float32 شود
+    # حالت درست → float32
     X_ok = guard_and_prepare_for_predict(
         X.copy(), train_window_cols,
         min_required_history={'5T': 10, '15T': 10, '30T': 10, '1H': 10},
@@ -211,7 +211,7 @@ def test_guard_no_nan_inf_and_cols_and_dtype(tmp_csvs):
 
 def test_guard_warmup(tmp_csvs):
     _LOGGER.info(">> test_guard_warmup: start")
-    prep, merged, X, _, _, _ = build_X(tmp_csvs, window=3, mode="predict")
+    _, _, X, _, _, _ = build_X(tmp_csvs, window=3, mode="predict")
     cols = list(X.columns)
     _LOGGER.info("   current columns count=%d", len(cols))
     with pytest.raises(WarmupNotEnough):
@@ -242,3 +242,20 @@ def test_take_last_closed_rows_aligns_timestamps(tmp_csvs):
     _LOGGER.info("   after align: max times = %s", max_times)
     assert len(set(max_times.values())) == 1
     _LOGGER.info("<< test_take_last_closed_rows_aligns_timestamps: OK (aligned)")
+
+def test_time_prefix_idempotent(tmp_csvs):
+    """
+    اجرای پشت‌سرهم load_data/ready نباید خطای "cannot insert ..._time, already exists" بدهد.
+    این تست مخصوص پچ idempotent برای ستون‌های زمان است.
+    """
+    _LOGGER.info(">> test_time_prefix_idempotent: start")
+    # بار اول
+    prep1, merged1, X1, y1, feats1, _ = build_X(tmp_csvs, window=2, mode="predict")
+    _LOGGER.info("   pass#1 merged=%s X=%s feats=%s", getattr(merged1, "shape", None), getattr(X1, "shape", None), len(feats1) if feats1 is not None else None)
+    # بار دوم (بدون تغییر ورودی) — اگر insert تکراری باشد، اینجا قبلاً خطا می‌داد
+    prep2, merged2, X2, y2, feats2, _ = build_X(tmp_csvs, window=2, mode="predict")
+    _LOGGER.info("   pass#2 merged=%s X=%s feats=%s", getattr(merged2, "shape", None), getattr(X2, "shape", None), len(feats2) if feats2 is not None else None)
+    # چند چک ساده
+    assert merged2.shape[1] >= merged1.shape[1]
+    assert X2.shape[1] == X1.shape[1]
+    _LOGGER.info("<< test_time_prefix_idempotent: OK (no duplicate time insert)")

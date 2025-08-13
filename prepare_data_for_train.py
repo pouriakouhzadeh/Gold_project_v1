@@ -49,6 +49,7 @@ from numba_utils import (
     numba_skew,
     numba_up_count,
 )
+from time_utils import TimeColumnFixer as TFix
 
 patch_sklearn(verbose=False)
 
@@ -603,13 +604,14 @@ class PREPARE_DATA_FOR_TRAIN:
 
         # ---------- 2) ادغام روی تایم‌فریم اصلی ----------
         main_tf  = self.main_timeframe
-        main_df  = dfs[0].set_index(f"{main_tf}_time", drop=False)
+        main_df  = dfs[0].set_index(f"{main_tf}_time", drop=True)
         for (tf, _), df in zip(list(self.filepaths.items())[1:], dfs[1:]):
             main_df = main_df.join(
                 df.set_index(f"{tf}_time", drop=False),
                 how="outer",
                 rsuffix=f"_{tf}",
             )
+            
 
         # ---------- 3) حذف ستون‌های «ناپایدار» که قبلاً برای هر TF کشف شده ----------
         for tf, bad_set in self.bad_cols_tf.items():
@@ -632,9 +634,9 @@ class PREPARE_DATA_FOR_TRAIN:
             main_df.ffill(inplace=True)
 
         # ---------- 6) نهایی‌سازی اندیس / حذف duplications ----------
-        main_df.reset_index(drop=False, inplace=True)
+        main_df.reset_index(drop=True, inplace=True)    
         tcol = f"{main_tf}_time"
-        if tcol not in main_df.columns:             # ایمنی اگر ستون جابه‌جا شد
+        if tcol not in main_df.columns:             
             main_df.rename(columns={main_df.columns[0]: tcol}, inplace=True)
         main_df = main_df.loc[~main_df[tcol].duplicated(keep="last")]
 
