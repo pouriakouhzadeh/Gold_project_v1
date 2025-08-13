@@ -522,12 +522,31 @@ class PREPARE_DATA_FOR_TRAIN:
         y   = y.iloc[:L].reset_index(drop=True)
         t_idx = t_idx.iloc[:L].reset_index(drop=True)
 
-        # فقط در TRAIN: حذف ردیف آخر (چون y(t آخر) نداریم)
-        if mode == "train" and len(X_f) > 0:
-            X_f = X_f.iloc[:-1].reset_index(drop=True)
-            y   = y.iloc[:-1].reset_index(drop=True)
-            t_idx = t_idx.iloc[:-1].reset_index(drop=True)
+        # ➋ فقط در TRAIN: حذف ردیف‌هایی که هدف ندارند (close_{t+1} وجود ندارد)
+        if mode == "train":
+            close_col = f"{self.main_timeframe}_close"
+            # y معتبر وقتی است که close(t+1) موجود باشد
+            diff_next = data[close_col].shift(-1) - data[close_col]  # t+1 - t
+            valid = diff_next.iloc[:len(df_diff)].reset_index(drop=True).notna()
+
+            # هم‌ترازی با پنجره‌بندی (window-1 ردیف ابتدای X حذف شده‌اند)
+            if window > 1 and len(valid) >= (window - 1):
+                valid = valid.iloc[window - 1:].reset_index(drop=True)
+
+            # هم‌طول‌سازی با X_f
+            L = min(len(valid), len(X_f))
+            valid = valid.iloc[:L].astype(bool)
+
+            # فیلتر کردنِ نمونه‌ها
+            X_f = X_f.loc[valid].reset_index(drop=True)
+            y   = y.loc[valid].reset_index(drop=True)
+            try:
+                t_idx = t_idx.loc[valid].reset_index(drop=True)  # اگر with_times=True
+            except NameError:
+                pass
+
             self.train_columns_after_window = X_f.columns.tolist()
+
 
         price_raw = data[close_col].iloc[:len(df_diff)].reset_index(drop=True)
         if window > 1:
