@@ -588,6 +588,14 @@ class GeneticAlgorithmRunner:
         y_pred = np.full_like(y, -1, dtype=int)   # -1 ⇒ No-Trade
         y_pred[y_prob <= self.neg_thr] = 0
         y_pred[y_prob >= self.pos_thr] = 1
+        # --- هم‌ترازی ایمن: اگر به هر دلیل طول‌ها متفاوت بود، کوتاه کن
+        if len(price_ser) != len(y_pred):
+            min_len = min(len(price_ser), len(y_pred))
+            LOGGER.warning("Length mismatch (prices=%d, preds=%d) → trimming to %d",
+                        len(price_ser), len(y_pred), min_len)
+            price_ser = price_ser.iloc[:min_len].reset_index(drop=True)
+            y         = y.iloc[:min_len].reset_index(drop=True)
+            y_pred    = y_pred[:min_len]
 
         mask = y_pred != -1                    # تنها نمونه‌های معامله‌شده
         conf = float(mask.mean())              # نسبتِ دارای پیش‌بینی

@@ -447,108 +447,97 @@ class PREPARE_DATA_FOR_TRAIN:
         window: int = 1,
         selected_features: List[str] | None = None,
         mode: str = "train",
-    ) -> Tuple[pd.DataFrame, pd.Series, List[str], pd.Series]:
+        with_times: bool = False,
+    ):
         strict_cols = bool(selected_features)
-        # ---------------- Basic checks ----------------
+
         close_col = f"{self.main_timeframe}_close"
         if close_col not in data.columns:
             raise ValueError(f"{close_col} missing")
 
-        # ---------------- Target ----------------
-        # AFTER (بالای تابع همان است)
+        # y(t) = 1{close(t+1) > close(t)}
         y = ((data[close_col].shift(-1) - data[close_col]) > 0).astype(int)
-        if mode == "train":
-            # این حذف در ادامه و بعد از پنجره‌بندی نهایی انجام می‌شود
-            pass
-        else:
-            y.iloc[:] = 0  # dummy for predict
-            
-            
-            
-        time_cols = [
-            c for c in data.columns
-            if any(tok in c for tok in ["hour", "day_of_week", "is_weekend"])
-        ]
+        if mode != "train":
+            y.iloc[:] = 0  # در predict فقط برای هم‌ترازی نگه می‌داریم
+
+        # ستون‌ها
+        time_cols = [c for c in data.columns if any(tok in c for tok in ["hour","day_of_week","is_weekend"])]
         feat_cols = [c for c in data.columns if c not in time_cols + [close_col]]
 
-        # ---------------- Diff Features (unified) ----------------
+        # 🔑 فیچرها فقط از گذشته ساخته می‌شوند: diff روی shift(1)
         df_diff = self._compute_diff(data, feat_cols, strict_cols)
-
-        # --------- Clean NA / Inf ----------
         df_diff.replace([np.inf, -np.inf], np.nan, inplace=True)
         df_diff.ffill(inplace=True)
         df_diff.dropna(how="all", inplace=True)
         df_diff.reset_index(drop=True, inplace=True)
-        y = y.iloc[: len(df_diff)].reset_index(drop=True)
-        
-        # ⚠️ در حالت PREDICT، همیشه «آخرین سطرِ ناپایدار» را حذف کن
-        # تا آخرین رکوردِ باقی‌مانده برابر با t-1 (پایدار) باشد.
-        if mode == "predict":
-            if len(df_diff) >= 1:
-                df_diff = df_diff.iloc[:-1].reset_index(drop=True)
-                # y در predict مصرف نمی‌شود، ولی برای هم‌ترازی نگه می‌داریم
-                y = y.iloc[: len(df_diff)].reset_index(drop=True)
 
-        # ---------------- Feature Selection ----------------
-# ---------------- Feature Selection (+tminus support) ----------------
-# --- تشخیص اینکه آیا کاربر لیست post-window (با _tminus) داده است؟
-        tminus_regex = re.compile(r"_tminus\d+$")
-        has_tminus   = bool(selected_features and any(tminus_regex.search(f) for f in selected_features))
+        # y را با df_diff هم‌قد کن
+        y = y.iloc[:len(df_diff)].reset_index(drop=True)
 
+        # ⚠️ در PREDICT هیچ‌چیز را حذف نکن؛ ردیف آخر X از t−1 و t−2 ساخته شده و پایدار است.
+        # ❌ این بلوک را اگر داری حذف کن:
+        # if mode == "predict":
+        #     df_diff = df_diff.iloc[:-1]  # ← این باید حذف شود
+
+        # انتخاب فیچر (+ پشتیبانی از _tminus)
+        import re as _re
+        tminus_regex = _re.compile(r"_tminus\d+$")
+        has_tminus = bool(selected_features and any(tminus_regex.search(f) for f in selected_features))
         if has_tminus:
-            # ❶ استخراج نامِ ستون پایه (قبل از پنجره‌بندی)
             base_feats = {tminus_regex.sub("", f) for f in selected_features}
-            # ❷ ستون‌هایی که در df_diff واقعاً موجودند نگه می‌داریم
             feats = [f for f in base_feats if f in df_diff.columns]
-            strict_cols = True                 # فیلترهای بعدی اعمال نشود
+            strict_cols = True
         else:
             if selected_features is None:
                 feats = self.select_features(df_diff, y)
             elif selected_features == []:
                 feats = df_diff.columns.tolist()
-            else:                              # لیستِ معمولیِ pre-window
-                feats = [f for f in selected_features if f in df_diff]
+            else:
+                feats = [f for f in selected_features if f in df_diff.columns]
 
-        # --- حذف فیچرهای معیوبِ شناسایی‌شده ---
         if (not strict_cols) and self.bad_cols_tf:
             bad_union = set().union(*self.bad_cols_tf.values())
             feats = [f for f in feats if f not in bad_union]
 
         X_f = df_diff[feats].copy()
 
-        # ---------------- Windowing ----------------
-        # ---------------- Windowing (unified) ----------------
-        X_f, y, feats = self._apply_window(
-            X_f, y, feats, window, selected_features, has_tminus
-        )
+        # پنجره‌بندی
+        X_f, y, feats = self._apply_window(X_f, y, feats, window, selected_features, has_tminus)
 
-        # ---------------- Final Clean ----------------
-        # AFTER (در انتهای تابع ready)
-
-        # پاک‌سازی پایه
+        # پاکسازی نهایی
         X_f.replace([np.inf, -np.inf], np.nan, inplace=True)
         X_f = X_f.fillna(X_f.median())
 
-        # --- ترازبندی نهایی برای آموزش ---
-        # همواره در TRAIN، آخرین ردیف را حذف می‌کنیم تا مدل هیچ‌وقت «ردیف آخر» را نبیند.
-        if mode == "train":
-            # اطمینان از هم‌طولی
-            L = min(len(X_f), len(y))
-            X_f = X_f.iloc[:L]
-            y   = y.iloc[:L]
+        # زمان‌های هم‌تراز (اختیاری)
+        tcol = f"{self.main_timeframe}_time" if f"{self.main_timeframe}_time" in data.columns else "time"
+        t_idx = pd.to_datetime(data[tcol]).reset_index(drop=True)
+        if len(t_idx) > 0:
+            t_idx = t_idx.iloc[1:].reset_index(drop=True)  # چون diff یک ردیف می‌سوزاند
+        if window > 1 and len(t_idx) >= window-1:
+            t_idx = t_idx.iloc[window-1:].reset_index(drop=True)
 
-            if L > 0:
-                X_f = X_f.iloc[:-1].reset_index(drop=True)
-                y   = y.iloc[:-1].reset_index(drop=True)
+        # هم‌ترازی طول‌ها
+        L = min(len(X_f), len(y), len(t_idx))
+        X_f = X_f.iloc[:L].reset_index(drop=True)
+        y   = y.iloc[:L].reset_index(drop=True)
+        t_idx = t_idx.iloc[:L].reset_index(drop=True)
 
+        # فقط در TRAIN: حذف ردیف آخر (چون y(t آخر) نداریم)
+        if mode == "train" and len(X_f) > 0:
+            X_f = X_f.iloc[:-1].reset_index(drop=True)
+            y   = y.iloc[:-1].reset_index(drop=True)
+            t_idx = t_idx.iloc[:-1].reset_index(drop=True)
             self.train_columns_after_window = X_f.columns.tolist()
 
-        # price_raw برای معیارهای مالی/گزارش
-        price_raw = data[close_col].iloc[: len(df_diff)].reset_index(drop=True)
+        price_raw = data[close_col].iloc[:len(df_diff)].reset_index(drop=True)
         if window > 1:
-            price_raw = price_raw.iloc[window - 1 :].reset_index(drop=True)
+            price_raw = price_raw.iloc[window-1:].reset_index(drop=True)
+        price_raw = price_raw.iloc[:len(X_f)].reset_index(drop=True)
 
-        return X_f.reset_index(drop=True), y.reset_index(drop=True), feats, price_raw
+        if with_times:
+            return X_f, y, feats, price_raw, t_idx
+        else:
+            return X_f, y, feats, price_raw
 
     # ================= 4) READY_INCREMENTAL =================
     def ready_incremental(
