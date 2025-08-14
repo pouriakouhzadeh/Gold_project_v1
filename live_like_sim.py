@@ -3,14 +3,15 @@
 """
 live_like_sim.py — Live-like backtest (REAL vs TRAIN-aligned)
 
-REAL  mode (default):  predict on X_t  → GT(t→t+1)   [مثل محیط واقعی]
-TRAIN mode (--mode train): predict on X_{t-1} → GT(t-1→t) [مطابق بچ/آموزش]
+REAL  mode (default):  «بعد از ساخت فیچرها» آخرین ردیف حذف می‌شود تا X آخر = t-1 باشد
+                       و GT = 1{ close(t+1) > close(t) } (حرکت t→t+1).
 
-نکته مهم: چون در شبیه‌سازی از CSVهای کوتاه (tail) استفاده می‌کنیم،
-drift-scan و کشف ستون‌های ناپایدار روی این tail معنی‌دار نیست.
-بنابراین پیش‌فرض: fast_mode=True (بدون drift-scan). اگر در TRAIN
-با fast_mode=False بوده‌اید و تاریخ شروع مشترک را دارید، فقط در آن صورت
---fast-mode 0 را فعال کنید.
+TRAIN mode (--mode train): مطابق بچ/آموزش (X_{t-1} → GT(t-1→t)).
+
+نکته مهم:
+- در این اسکریپت هیچ «حذفِ قبل از فیچر» نداریم. ردیف خام t می‌ماند تا فیچرهای t-1 پایدار شوند؛
+  سپس بعد از ساخت فیچرها، ردیف آخر فیچر حذف می‌شود (فقط در REAL).
+- برای CSVهای کوتاه «لایو»، --fast-mode 1 توصیه می‌شود (drift-scan خاموش).
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ def parse_args():
     p.add_argument("--n-test", type=int, default=4000, help="# of last M30 bars to simulate")
     p.add_argument("--log-file", default="live_like_sim.log", help="Path to rotating log file")
 
-    # Context tails (چند ردیف آخر هر TF را نگه داریم که warm-up اندیکاتورها پوشش داده شود)
+    # Context tails (چند ردیف آخر هر TF برای warm-up اندیکاتورها)
     p.add_argument("--ctx-5t", type=int, default=3000)
     p.add_argument("--ctx-15t", type=int, default=1200)
     p.add_argument("--ctx-30t", type=int, default=500)
@@ -48,7 +49,7 @@ def parse_args():
 
     # Alignment: real | train
     p.add_argument("--mode", choices=["real", "train"], default="real",
-                   help="real: X_t→(t→t+1) | train: X_{t-1}→(t-1→t)")
+                   help="real: X_{t-1}→(t→t+1) via post-feature drop | train: X_{t-1}→(t-1→t)")
 
     # PREP fast_mode (default True توصیه می‌شود چون drift-scan روی tail خراب می‌کند)
     p.add_argument("--fast-mode", type=int, default=1, choices=[0,1],
@@ -114,11 +115,9 @@ def write_live_csvs_until(
         df = dfs_full[tf]
         df_cut = df[df["time"] <= t_until]
         ctx = int(ctx_map.get(tf, 500))
-        # حداقل دو ردیف برای ایمنی diff/shift
-        df_cut = df_cut.tail(max(2, ctx)).copy()
+        df_cut = df_cut.tail(max(2, ctx)).copy()  # حداقل 2 ردیف برای diff/shift
         if df_cut.empty:
             df_cut = df.head(2).copy()
-        # شبیه CSV خروجی MT
         df_cut["time"] = df_cut["time"].dt.strftime("%Y-%m-%d %H:%M")
         df_cut.to_csv(out_path, index=False)
 
@@ -235,7 +234,7 @@ def main():
 
             # 3) Build X (+times) according to mode
             if args.mode == "train":
-                # مثل TRAIN: ردیف آخر بعد از پنجره‌بندی حذف می‌شود → X آخر معادل t-1
+                # مثل TRAIN: آخرین X معادل t-1 است
                 out = prep.ready(
                     merged.copy(),
                     window=window,
@@ -243,7 +242,6 @@ def main():
                     mode="train",
                     with_times=True,
                 )
-                # unpack
                 X, y, _, _, t_idx = out
                 if X.empty or len(y) == 0:
                     total_pred += 1; undecided += 1
@@ -257,13 +255,14 @@ def main():
                 t_feat = pd.to_datetime(t_idx.iloc[-1])  # t-1
                 gt = int(y.iloc[-1])                     # حرکت t-1→t
             else:
-                # REAL: در PREDICT هیچ حذف آخری نداریم → آخرین X = t
+                # REAL: بعد از ساخت فیچرها، ردیف آخر فیچر حذف می‌شود تا X آخر = t-1 باشد
                 out = prep.ready(
                     merged.copy(),
                     window=window,
                     selected_features=feat_cols,
                     mode="predict",
                     with_times=True,
+                    predict_drop_last=True,    # ← تغییر اصلی: حذفِ «پس از فیچر»
                 )
                 X, _, _, _, t_idx = out
                 if X.empty or t_idx.empty:
@@ -275,8 +274,8 @@ def main():
                     if not args.keep_csv: delete_live_csvs(tmp_dir)
                     continue
 
-                t_feat = pd.to_datetime(t_idx.iloc[-1])          # t
-                gt = compute_gt_next(dfs_full["30T"], t_feat)    # GT(t→t+1)
+                t_feat = pd.to_datetime(t_idx.iloc[-1])          # t-1
+                gt = compute_gt_next(dfs_full["30T"], t_feat)    # GT(t→t+1) با t = t_feat
 
             # 4) Feature columns must match training (order + presence)
             missing = [c for c in feat_cols if c not in X.columns]
@@ -354,8 +353,21 @@ if __name__ == "__main__":
     main()
 
 
-
-# python3 live_like_sim.py --mode real --fast-mode 1
-# python3 live_like_sim.py --mode train --fast-mode 1
-# python3 live_like_sim.py --mode real --fast-mode 0
-# ولی برای CSVهای کوتاه «لایو»، --fast-mode 1 توصیه می‌شود.
+# اجرای نمونه:
+# ۱) حالت train-aligned (عین batch)
+# python3 live_like_sim.py \
+#   --mode train \
+#   --fast-mode 1 \
+#   --base-data-dir . \
+#   --symbol XAUUSD \
+#   --n-test 4000 \
+#   --log-file live_like_train.log
+#
+# ۲) حالت REAL با حذف «پس از فیچر» (برای محیط واقعی)
+# python3 live_like_sim.py \
+#   --mode real \
+#   --fast-mode 1 \
+#   --base-data-dir . \
+#   --symbol XAUUSD \
+#   --n-test 600 \
+#   --log-file live_like_real.log

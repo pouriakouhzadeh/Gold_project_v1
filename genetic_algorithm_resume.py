@@ -320,7 +320,8 @@ def evaluate_cv(ind):
         X, y, _, price_ser = PREP_SHARED.ready(DATA_TRAIN_SHARED,
                                             window=window,
                                             selected_features=[],
-                                            mode="train")
+                                            mode="train",
+                                            real_protocol=True)
         if X.empty:
             return (0.0,)
 
@@ -389,7 +390,8 @@ class GeneticAlgorithmRunner:
             # -------------------- save tain raw with def ready for test-------------
             X_tail, _, _, _ = prep.ready(raw.tail(2001),
                                         selected_features=self.final_cols,
-                                        mode="predict")
+                                        mode="predict",
+                                        real_protocol=True)
             X_tail.to_csv("raw_tail2000_clean.csv", index=False)
             LOGGER.info(f"[main] Saved cleaned tail to raw_tail2000_clean.csv, Number of cols = {X_tail.shape[1]}")
             # ------ sort & split ------
@@ -508,7 +510,8 @@ class GeneticAlgorithmRunner:
         X, y, feats, _ = prep.ready(data_tr,
                             window=window,
                             selected_features=None,
-                            mode="train")
+                            mode="train",
+                            real_protocol=True)
 
         if X.empty:
             return None, []
@@ -547,7 +550,7 @@ class GeneticAlgorithmRunner:
                 window=window,
                 selected_features=self.final_cols,   # ⬅️ دقیقاً ستون‌های Train
                 mode="train",
-        )
+                real_protocol=True) 
 
         X_thr = X_thr[self.final_cols]
         if X_thr.empty:                       # ← جلوگیری از خطا
@@ -577,7 +580,8 @@ class GeneticAlgorithmRunner:
             window=window,
             selected_features=feats,
             mode="train",
-        )
+            real_protocol=True) 
+        
         X = X[self.final_cols]                # ستون‌های نهایی مدل
         if X.empty:                           # ← جلوگیری از خطا
             LOGGER.info(f"[{label}] X empty – skipped")

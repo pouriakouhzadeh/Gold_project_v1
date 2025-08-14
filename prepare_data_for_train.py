@@ -448,8 +448,8 @@ class PREPARE_DATA_FOR_TRAIN:
         selected_features: List[str] | None = None,
         mode: str = "train",
         with_times: bool = False,
+        predict_drop_last: bool = False,   # ← جدید
     ):
-        strict_cols = bool(selected_features)
 
         close_col = f"{self.main_timeframe}_close"
         if close_col not in data.columns:
@@ -552,6 +552,15 @@ class PREPARE_DATA_FOR_TRAIN:
         if window > 1:
             price_raw = price_raw.iloc[window-1:].reset_index(drop=True)
         price_raw = price_raw.iloc[:len(X_f)].reset_index(drop=True)
+        # --- REAL-Stable: بعد از ساخت فیچرها، آخرین ردیف را حذف کن تا X آخر = t-1 باشد
+        if (mode != "train") and predict_drop_last and len(X_f) >= 1:
+            X_f      = X_f.iloc[:-1].reset_index(drop=True)
+            y        = y.iloc[:-1].reset_index(drop=True)
+            if with_times and (t_idx is not None) and (len(t_idx) >= 1):
+                t_idx = t_idx.iloc[:-1].reset_index(drop=True)
+            if price_raw is not None and len(price_raw) >= 1:
+                price_raw = price_raw.iloc[:-1].reset_index(drop=True)
+
 
         if with_times:
             return X_f, y, feats, price_raw, t_idx
