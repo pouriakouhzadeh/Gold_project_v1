@@ -321,7 +321,7 @@ def evaluate_cv(ind):
                                             window=window,
                                             selected_features=[],
                                             mode="train",
-                                            real_protocol=True)
+                                            predict_drop_last=True)
         if X.empty:
             return (0.0,)
 
@@ -391,7 +391,7 @@ class GeneticAlgorithmRunner:
             X_tail, _, _, _ = prep.ready(raw.tail(2001),
                                         selected_features=self.final_cols,
                                         mode="predict",
-                                        real_protocol=True)
+                                        predict_drop_last=False)
             X_tail.to_csv("raw_tail2000_clean.csv", index=False)
             LOGGER.info(f"[main] Saved cleaned tail to raw_tail2000_clean.csv, Number of cols = {X_tail.shape[1]}")
             # ------ sort & split ------
@@ -511,7 +511,7 @@ class GeneticAlgorithmRunner:
                             window=window,
                             selected_features=None,
                             mode="train",
-                            real_protocol=True)
+                            predict_drop_last=True)
 
         if X.empty:
             return None, []
@@ -550,7 +550,7 @@ class GeneticAlgorithmRunner:
                 window=window,
                 selected_features=self.final_cols,   # ⬅️ دقیقاً ستون‌های Train
                 mode="train",
-                real_protocol=True) 
+                predict_drop_last=True) 
 
         X_thr = X_thr[self.final_cols]
         if X_thr.empty:                       # ← جلوگیری از خطا
@@ -580,7 +580,7 @@ class GeneticAlgorithmRunner:
             window=window,
             selected_features=feats,
             mode="train",
-            real_protocol=True) 
+            predict_drop_last=True) 
         
         X = X[self.final_cols]                # ستون‌های نهایی مدل
         if X.empty:                           # ← جلوگیری از خطا

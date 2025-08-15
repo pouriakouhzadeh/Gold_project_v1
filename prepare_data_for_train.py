@@ -448,7 +448,7 @@ class PREPARE_DATA_FOR_TRAIN:
         selected_features: List[str] | None = None,
         mode: str = "train",
         with_times: bool = False,
-        predict_drop_last: bool = False,   # ← جدید
+        predict_drop_last: bool = False,   # ⬅️ جدید
     ):
 
         close_col = f"{self.main_timeframe}_close"
@@ -560,6 +560,7 @@ class PREPARE_DATA_FOR_TRAIN:
                 t_idx = t_idx.iloc[:-1].reset_index(drop=True)
             if price_raw is not None and len(price_raw) >= 1:
                 price_raw = price_raw.iloc[:-1].reset_index(drop=True)
+
 
 
         if with_times:

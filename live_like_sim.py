@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-live_like_sim.py — Live-like backtest (REAL vs TRAIN-aligned)
+live_like_sim.py — شبیه‌سازی «شبیه-لایو» برای دو پروتکل:
+  • TRAIN-ALIGNED:  X_{t-1}  →  GT(t-1→t)   (عینِ batch)
+  • REAL:
+      - اگر --predict-drop-last=0:  X_t  →  GT(t→t+1)
+      - اگر --predict-drop-last=1:  پس از ساخت فیچرها، آخرین ردیف حذف می‌شود،
+        و با بریدن CSVها تا t_cur (که همان t+1 است)، X آخر می‌شود t، ولی
+        به‌دلیل drop-last، X آخر عملاً t-1 است؛ در نتیجه GT روی t_feat (=t-1)
+        محاسبه می‌شود که همان هدف t→t+1 را می‌سنجد، بدون استفاده از مقادیر
+        ناپایدار t.
 
-REAL  mode (default):  «بعد از ساخت فیچرها» آخرین ردیف حذف می‌شود تا X آخر = t-1 باشد
-                       و GT = 1{ close(t+1) > close(t) } (حرکت t→t+1).
+نکتهٔ مهم:
+- برای مقایسه دقیق با batch، از حالت TRAIN استفاده کنید:
+    --mode train --fast-mode 1
+- برای شبیه‌سازی واقعیِ t→t+1 با حذفِ «بعد از فیچر»، اجرا کنید:
+    --mode real --predict-drop-last 1 --fast-mode 1
 
-TRAIN mode (--mode train): مطابق بچ/آموزش (X_{t-1} → GT(t-1→t)).
-
-نکته مهم:
-- در این اسکریپت هیچ «حذفِ قبل از فیچر» نداریم. ردیف خام t می‌ماند تا فیچرهای t-1 پایدار شوند؛
-  سپس بعد از ساخت فیچرها، ردیف آخر فیچر حذف می‌شود (فقط در REAL).
-- برای CSVهای کوتاه «لایو»، --fast-mode 1 توصیه می‌شود (drift-scan خاموش).
+نیازمندی: کلاس PREPARE_DATA_FOR_TRAIN باید پارامتر
+predict_drop_last را در ready(...) بپذیرد و «بعد از ساخت فیچرها»
+آخرین ردیف را حذف کند (طبق راهنمایی‌ای که اعمال کردید).
 """
 
 from __future__ import annotations
 import argparse, os, shutil, logging, sys, time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -27,7 +35,7 @@ from sklearn.pipeline import Pipeline
 
 # -------------------- CLI --------------------
 def parse_args():
-    p = argparse.ArgumentParser("Live-like simulation (real vs train-aligned)")
+    p = argparse.ArgumentParser("Live-like simulation (TRAIN vs REAL; drop-last-after-features supported)")
     p.add_argument("--model", default="best_model.pkl", help="Path to best_model.pkl")
     p.add_argument("--base-data-dir", default=".", help="Folder containing full-history CSVs")
     p.add_argument("--tmp-dir", default="./_sim_csv", help="Folder to write per-iteration live CSVs")
@@ -35,7 +43,7 @@ def parse_args():
     p.add_argument("--n-test", type=int, default=4000, help="# of last M30 bars to simulate")
     p.add_argument("--log-file", default="live_like_sim.log", help="Path to rotating log file")
 
-    # Context tails (چند ردیف آخر هر TF برای warm-up اندیکاتورها)
+    # Context tails (برای warm-up اندیکاتورها روی هر TF)
     p.add_argument("--ctx-5t", type=int, default=3000)
     p.add_argument("--ctx-15t", type=int, default=1200)
     p.add_argument("--ctx-30t", type=int, default=500)
@@ -49,11 +57,22 @@ def parse_args():
 
     # Alignment: real | train
     p.add_argument("--mode", choices=["real", "train"], default="real",
-                   help="real: X_{t-1}→(t→t+1) via post-feature drop | train: X_{t-1}→(t-1→t)")
+                   help="real: predict on X_t or X_{t-1} (با drop-last) | train: X_{t-1} → (t-1→t)")
 
-    # PREP fast_mode (default True توصیه می‌شود چون drift-scan روی tail خراب می‌کند)
+    # AFTER-feature drop of last row (برای REAL)
+    p.add_argument("--predict-drop-last", type=int, choices=[0,1], default=1,
+                   help="In REAL mode: drop last row AFTER feature creation (default=1)")
+
+    # PREP fast_mode (توصیه برای tail CSV = 1)
     p.add_argument("--fast-mode", type=int, default=1, choices=[0,1],
                    help="1: disable drift-scan/bad-cols scan (recommended for tail CSVs)")
+
+    # ممیزی
+    p.add_argument("--audit", type=int, default=0, help="Every N steps, print CSV last times & t_cur/t_feat")
+
+    # اجبار اجرای سریالی joblib (در صورت نیاز)
+    p.add_argument("--no-parallel", type=int, default=0, choices=[0,1],
+                   help="Try to force serial joblib backend (debug)")
 
     return p.parse_args()
 
@@ -67,6 +86,17 @@ def setup_logger(path: str):
     ch = logging.StreamHandler(sys.stdout); ch.setFormatter(fmt)
     log.addHandler(fh); log.addHandler(ch)
     return log
+
+def maybe_force_serial_joblib(flag: bool, log: logging.Logger):
+    if not flag:
+        return
+    try:
+        import joblib
+        joblib.parallel_backend('threading')
+        os.environ["JOBLIB_START_METHOD"] = "threading"
+        log.info("Joblib backend forced to 'threading' for debugging.")
+    except Exception as e:
+        log.warning("Could not force joblib backend: %s", e)
 
 # -------------------- file maps --------------------
 BASE_FILENAMES = {
@@ -110,12 +140,12 @@ def write_live_csvs_until(
     live_paths: Dict[str, str],
     ctx_map: Dict[str, int],
 ) -> None:
-    """Write 'live' CSVs as if MT exported up to and including t_until."""
+    """Write 'live' CSVs as if platform exported up to and including t_until."""
     for tf, out_path in live_paths.items():
         df = dfs_full[tf]
         df_cut = df[df["time"] <= t_until]
         ctx = int(ctx_map.get(tf, 500))
-        df_cut = df_cut.tail(max(2, ctx)).copy()  # حداقل 2 ردیف برای diff/shift
+        df_cut = df_cut.tail(max(2, ctx)).copy()
         if df_cut.empty:
             df_cut = df.head(2).copy()
         df_cut["time"] = df_cut["time"].dt.strftime("%Y-%m-%d %H:%M")
@@ -127,10 +157,21 @@ def delete_live_csvs(tmp_dir: Path):
         try: p.unlink()
         except Exception: pass
 
+def read_last_times_from_live(live_paths: Dict[str,str]) -> Dict[str, Optional[pd.Timestamp]]:
+    out: Dict[str, Optional[pd.Timestamp]] = {}
+    for tf, path in live_paths.items():
+        try:
+            df = pd.read_csv(path)
+            t = pd.to_datetime(df["time"].iloc[-1])
+        except Exception:
+            t = None
+        out[tf] = t
+    return out
+
 # -------------------- GT helper --------------------
 def compute_gt_next(m30_df: pd.DataFrame, t_ref: pd.Timestamp) -> Optional[int]:
     """
-    GT_real(t) = 1{ close(t+1) > close(t) } from full stable M30 data.
+    GT(t_ref) = 1{ close(t_ref+1) > close(t_ref) } from full stable M30 data.
     """
     idx = m30_df.index[m30_df["time"] == t_ref]
     if len(idx) == 0: return None
@@ -138,10 +179,16 @@ def compute_gt_next(m30_df: pd.DataFrame, t_ref: pd.Timestamp) -> Optional[int]:
     if i + 1 >= len(m30_df): return None
     return int((float(m30_df.loc[i+1, "close"]) - float(m30_df.loc[i, "close"])) > 0)
 
+def prev_m30_time(m30_df: pd.DataFrame, t: pd.Timestamp) -> Optional[pd.Timestamp]:
+    idx = m30_df.index[m30_df["time"] == t]
+    if len(idx) == 0: return None
+    i = int(idx[0])
+    if i - 1 < 0: return None
+    return pd.to_datetime(m30_df.loc[i-1, "time"])
+
 # -------------------- PREP wrapper --------------------
 def build_prep(filepaths: Dict[str, str], fast_mode: bool):
     from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
-    # drift-scan فقط وقتی fast_mode=False است (پیش‌فرض این اسکریپت: True)
     try:
         return PREPARE_DATA_FOR_TRAIN(
             main_timeframe="30T",
@@ -150,7 +197,6 @@ def build_prep(filepaths: Dict[str, str], fast_mode: bool):
             fast_mode=bool(fast_mode),
         )
     except TypeError:
-        # نسخه قدیمی بدون fast_mode
         return PREPARE_DATA_FOR_TRAIN(
             main_timeframe="30T", filepaths=filepaths, verbose=False
         )
@@ -159,6 +205,7 @@ def build_prep(filepaths: Dict[str, str], fast_mode: bool):
 def main():
     args = parse_args()
     log = setup_logger(args.log_file)
+    maybe_force_serial_joblib(bool(args.no_parallel), log)
 
     # Load model bundle
     mdl_path = Path(args.model).expanduser().resolve()
@@ -192,12 +239,13 @@ def main():
     if len(m30) < args.n_test + 1:
         raise RuntimeError(f"Not enough M30 rows ({len(m30)}) for n-test={args.n_test}")
 
-    # Decision points = last n_test closed bars on 30T
+    # انتخاب نقاط تصمیم: آخرین n_test کندلِ بسته‌شده‌ی 30T
     anchor_times = m30["time"].tail(args.n_test).reset_index(drop=True)
-    mode_name = "TRAIN-ALIGNED" if (args.mode == "train") else "REAL"
+
+    mode_name = "TRAIN-ALIGNED" if (args.mode == "train") else ("REAL (drop-last)" if args.predict_drop_last else "REAL")
     log.info("Prepared %d anchor times. Mode=%s. Starting simulation …", len(anchor_times), mode_name)
 
-    # PREP روی CSVهای «لایو» tail: پیش‌فرض fast_mode=True تا drift/bad_cols اجرا نشود
+    # PREP روی CSVهای «لایو»: fast_mode=True توصیه می‌شود
     prep = build_prep({
         "30T": live_paths["30T"],
         "15T": live_paths["15T"],
@@ -206,18 +254,17 @@ def main():
     }, fast_mode=bool(args.fast_mode))
 
     wins = loses = undecided = decided = total_pred = 0
-    first_warn_miss = True
 
     try:
         for k, t_cur in enumerate(anchor_times, start=1):
             t_cur = pd.to_datetime(t_cur)
 
-            # 1) Write live CSVs (up to and including t_cur)
+            # 1) بنویس تا و شامل t_cur
             t0 = time.perf_counter()
             write_live_csvs_until(dfs_full, t_cur, live_paths, ctx_map)
             t_csv = time.perf_counter() - t0
 
-            # 2) Merge & engineer via PREP (same path as training)
+            # 2) Merge & engineer via PREP (همان مسیر TRAIN)
             t1 = time.perf_counter()
             merged = prep.load_data()
             t_load = time.perf_counter() - t1
@@ -232,9 +279,8 @@ def main():
                 if not args.keep_csv: delete_live_csvs(tmp_dir)
                 continue
 
-            # 3) Build X (+times) according to mode
+            # 3) آماده‌سازی X (+times)
             if args.mode == "train":
-                # مثل TRAIN: آخرین X معادل t-1 است
                 out = prep.ready(
                     merged.copy(),
                     window=window,
@@ -242,7 +288,7 @@ def main():
                     mode="train",
                     with_times=True,
                 )
-                X, y, _, _, t_idx = out
+                X, y, _, price_ser, t_idx = out
                 if X.empty or len(y) == 0:
                     total_pred += 1; undecided += 1
                     acc = (wins / decided) if decided else 0.0
@@ -254,18 +300,26 @@ def main():
 
                 t_feat = pd.to_datetime(t_idx.iloc[-1])  # t-1
                 gt = int(y.iloc[-1])                     # حرکت t-1→t
+
             else:
-                # REAL: بعد از ساخت فیچرها، ردیف آخر فیچر حذف می‌شود تا X آخر = t-1 باشد
+                # REAL: با یا بدون drop-last بعد از فیچر
                 out = prep.ready(
                     merged.copy(),
                     window=window,
                     selected_features=feat_cols,
                     mode="predict",
                     with_times=True,
-                    predict_drop_last=True,    # ← تغییر اصلی: حذفِ «پس از فیچر»
+                    predict_drop_last=bool(args.predict_drop_last),
                 )
-                X, _, _, _, t_idx = out
-                if X.empty or t_idx.empty:
+                # نسخه جدید ۵-خروجی می‌دهد: X, _, feats, price_ser, t_idx
+                if len(out) == 5:
+                    X, _, _, price_ser, t_idx = out
+                else:
+                    # پشتیبانی از نسخه‌های قدیمی‌تر
+                    X, _, _, t_idx = out
+                    price_ser = None
+
+                if X.empty or t_idx is None or len(t_idx) == 0:
                     total_pred += 1; undecided += 1
                     acc = (wins / decided) if decided else 0.0
                     log.info("[%-4d] %s  → X empty (warm-up). cum: wins=%d loses=%d undecided=%d decided=%d acc=%.4f [csv %.3fs | load %.3fs]",
@@ -274,23 +328,37 @@ def main():
                     if not args.keep_csv: delete_live_csvs(tmp_dir)
                     continue
 
-                t_feat = pd.to_datetime(t_idx.iloc[-1])          # t-1
-                gt = compute_gt_next(dfs_full["30T"], t_feat)    # GT(t→t+1) با t = t_feat
+                t_feat = pd.to_datetime(t_idx.iloc[-1])
 
-            # 4) Feature columns must match training (order + presence)
+                # GT همیشه از CSV کامل محاسبه می‌شود
+                gt = compute_gt_next(dfs_full["30T"], t_feat)
+
+            # 4) ممیزی (اختیاری)
+            if args.audit and (k % int(args.audit) == 0):
+                last_times = read_last_times_from_live(live_paths)
+                msg = (f"[AUDIT {k}] last_csv: 5T={last_times.get('5T')} | "
+                       f"15T={last_times.get('15T')} | 30T={last_times.get('30T')} | 1H={last_times.get('1H')}")
+                log.info(msg)
+                # اگر drop-last فعال است، انتظار داریم t_feat == prev_m30(t_cur)
+                if args.mode == "real" and bool(args.predict_drop_last):
+                    t_prev = prev_m30_time(dfs_full["30T"], t_cur)
+                    log.info("[AUDIT %d] t_cur=%s | expected t_feat=%s | actual t_feat=%s | GT=%s",
+                             k, t_cur, t_prev, t_feat, "-" if gt is None else gt)
+                else:
+                    log.info("[AUDIT %d] t_cur=%s | t_feat=%s | GT=%s",
+                             k, t_cur, t_feat, "-" if gt is None else gt)
+
+            # 5) Feature columns must match training (order + presence)
             missing = [c for c in feat_cols if c not in X.columns]
             if missing:
                 total_pred += 1; undecided += 1
-                if first_warn_miss:
-                    log.warning("Feature mismatch with training. Showing once… "
-                                "(e.g. missing: %s)", ", ".join(missing[:10]))
-                    first_warn_miss = False
-                log.warning("[%-4d] %s  → missing %d features; skip.",
-                            k, t_feat.strftime("%Y-%m-%d %H:%M"), len(missing))
+                log.warning("[%-4d] %s  → missing %d features; e.g. %s … skip.",
+                            k, t_feat.strftime("%Y-%m-%d %H:%M"),
+                            len(missing), ", ".join(missing[:10]))
                 if not args.keep_csv: delete_live_csvs(tmp_dir)
                 continue
 
-            # 5) Prepare last row (fill NaNs like training)
+            # 6) Prepare last row (fill NaNs like training)
             x_last = X.iloc[[-1]][feat_cols].replace([np.inf, -np.inf], np.nan)
             if x_last.isna().any().any():
                 med = X[feat_cols].replace([np.inf, -np.inf], np.nan).median(numeric_only=True)
@@ -303,7 +371,7 @@ def main():
                 continue
             x_last = x_last.astype("float32")
 
-            # 6) Predict
+            # 7) Predict
             proba = float(pipe_fit.predict_proba(x_last)[:, 1][0])
             if proba <= neg_thr:
                 pred = 0
@@ -312,7 +380,7 @@ def main():
             else:
                 pred = -1
 
-            # 7) Score & log
+            # 8) Score & log
             total_pred += 1
             if (gt is None) or (pred == -1):
                 undecided += 1
@@ -338,8 +406,8 @@ def main():
                 delete_live_csvs(tmp_dir)
 
         final_acc = (wins / decided) if decided else 0.0
-        log.info("DONE. total=%d | decided=%d | wins=%d | loses=%d | undecided=%d | acc=%.4f | mode=%s | fast_mode=%s",
-                 total_pred, decided, wins, loses, undecided, final_acc, mode_name, bool(args.fast_mode))
+        log.info("DONE. total=%d | decided=%d | wins=%d | loses=%d | undecided=%d | acc=%.4f | mode=%s | fast_mode=%s | predict_drop_last=%s",
+                 total_pred, decided, wins, loses, undecided, final_acc, mode_name, bool(args.fast_mode), bool(args.predict_drop_last))
 
     finally:
         if not args.keep_csv:
@@ -353,21 +421,33 @@ if __name__ == "__main__":
     main()
 
 
-# اجرای نمونه:
-# ۱) حالت train-aligned (عین batch)
-# python3 live_like_sim.py \
+# like train :
+#     python3 live_like_sim.py \
 #   --mode train \
 #   --fast-mode 1 \
 #   --base-data-dir . \
 #   --symbol XAUUSD \
 #   --n-test 4000 \
 #   --log-file live_like_train.log
-#
-# ۲) حالت REAL با حذف «پس از فیچر» (برای محیط واقعی)
+
+
+# real stable :
 # python3 live_like_sim.py \
 #   --mode real \
+#   --predict-drop-last 1 \
 #   --fast-mode 1 \
+#   --audit 50 \
 #   --base-data-dir . \
 #   --symbol XAUUSD \
 #   --n-test 600 \
 #   --log-file live_like_real.log
+
+# برای شبیه‌سازی واقعیِ t→t+1 با حذف «بعد از فیچر» (پروتکل REAL-Stable):
+# python3 live_like_sim.py \
+#   --mode real \
+#   --predict-drop-last 0 \
+#   --fast-mode 1 \
+#   --base-data-dir . \
+#   --symbol XAUUSD \
+#   --n-test 600 \
+#   --log-file live_like_real_xt.log
