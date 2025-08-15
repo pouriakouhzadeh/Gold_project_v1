@@ -575,38 +575,32 @@ class PREPARE_DATA_FOR_TRAIN:
         data_window: pd.DataFrame,
         window: int = 1,
         selected_features: List[str] | None = None,
+        with_times: bool = False,
+        predict_drop_last: bool = True,
     ):
-        """
-        Live-safe wrapper around ``ready``.
-        آخرین دو رکورد خام نگه داشته می‌شود تا عملیات diff دقیقاً مثل حالت
-        batch باشد و هیچ ستونِ _tminus از داده بی‌خبر نماند.
-        """
-        if not hasattr(self, "_live_prev2"):
-            # اولین فراخوان: فقط بافر را پر می‌کنیم
+        if not hasattr(self, "_live_prev2") or self._live_prev2 is None:
             self._live_prev2 = data_window.iloc[-2:].copy()
-            return pd.DataFrame(), []
+            return (pd.DataFrame(), [], None) if with_times else (pd.DataFrame(), [])
 
-        # چسباندن دو رکورد قبلی به ابتدای پنجرهٔ جدید
-        concat = pd.concat(
-            [self._live_prev2, data_window], ignore_index=True
-        )
+        concat = pd.concat([self._live_prev2, data_window], ignore_index=True)
 
-        # حساب دقیق ویژگی‌ها – عین ready
-        X_full, _, feats, _ = self.ready(
+        X_full, _, feats, price_raw, t_idx = self.ready(
             concat,
             window=window,
             selected_features=selected_features,
             mode="predict",
+            with_times=True,
+            predict_drop_last=predict_drop_last
         )
 
-        # بافر را برای فراخوان بعد به‌روزرسانی کن
         self._live_prev2 = data_window.iloc[-2:].copy()
 
-        # ممکن است چند ردیف بدهد (اگر window>1) → فقط آخرین رکورد
         if X_full.empty:
-            return pd.DataFrame(), feats
+            return (pd.DataFrame(), feats, None) if with_times else (pd.DataFrame(), feats)
 
-        return X_full.tail(1).reset_index(drop=True), feats
+        X_last = X_full.tail(1).reset_index(drop=True)
+        t_feat = pd.to_datetime(t_idx.iloc[-1]) if (t_idx is not None and len(t_idx) > 0) else None
+        return (X_last, feats, t_feat) if with_times else (X_last, feats)
 
     # ================= 5) LOAD & MERGE =================
     def load_data(self) -> pd.DataFrame:
