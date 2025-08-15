@@ -465,6 +465,7 @@ class PREPARE_DATA_FOR_TRAIN:
         feat_cols = [c for c in data.columns if c not in time_cols + [close_col]]
 
         # 🔑 فیچرها فقط از گذشته ساخته می‌شوند: diff روی shift(1)
+        strict_cols = bool(selected_features)
         df_diff = self._compute_diff(data, feat_cols, strict_cols)
         df_diff.replace([np.inf, -np.inf], np.nan, inplace=True)
         df_diff.ffill(inplace=True)
