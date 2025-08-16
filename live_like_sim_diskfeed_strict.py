@@ -1,26 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ultra‑fast live‑like simulator with batch parity (no per‑step feature rebuild)
-----------------------------------------------------------------------------
-ایده:
-- تمام ادغام چند تایم‌فریم و مهندسی ویژگی‌ها را «یکبار» برای بازهٔ موردنیاز می‌سازیم.
-- سپس برای هر t فقط همان ردیفِ پایدارِ t-1 را از ماتریس فیچرهای ازقبل‌ساخته می‌خوانیم.
-- این دقیقاً معادل لایوِ بدون لیک است (چون در PREP همه‌چیز با shift(1)/diff ساخته شده).
-- نتیجه: 10ها تا 100ها برابر سریع‌تر از حالت دیسک‌فید در هر استپ.
+Realistic disk‑feed live simulator (strict) + batch parity
+=========================================================
 
-ویژگی‌ها:
-- کشف خودکار ستون‌های آموزشی از train_distribution.json
-- کشف خودکار window و thresholds از JSONهای کنار مدل (در صورت موجود بودن)
-- گزارش دقت لایو، دقت بچ روی همان بازه، و دقت بچ «دقیقاً روی تایم‌هایی که لایو تصمیم گرفته» + دلتا
-- امکان ذخیرهٔ per-step CSV
+این اسکریپت «دقیقاً» شبیه محیط واقعی رفتار می‌کند:
+- در هر گام، چهار CSV (5T/15T/30T/1H) مثل خروجی متاتریدر «تا همان زمان t_cur» روی دیسک موجود است.
+- سپس همان فایل‌ها لود می‌شوند، Clean/Feature ساخته می‌شود، «بعد از آماده‌سازی» ردیف ناپایدار حذف می‌شود.
+- از `ready_incremental` برای وارم‌آپ و تولید تنها ردیف پایدار t−1 استفاده می‌شود.
+- بعد پیش‌بینی انجام می‌شود و GT از CSV 30T اصلی ساخته و گزارش می‌شود.
+- فایل‌های موقت به‌صورت افزایشی «append» می‌شوند (بازنویسی کامل در هر استپ نداریم) → سرعت بهتر با حفظ دقتِ محیط واقعی.
+- در پایان، پاریتی با Batch روی همان بازه گزارش می‌شود.
 
-نکته:
-- اگر بخواهی «دیسک‌فید واقعی» را هم تست کنی، اسکریپت جداگانهٔ diskfeed را نگه دار؛ این اسکریپت برای سرعت است.
+نکات مهم سرعت:
+- اندیکاتورها برای هر دستهٔ CSV «یک‌بار» محاسبه می‌شوند (دقیقاً مطابق خواستهٔ شما).
+- برای شروع، تاریخچه‌ای با طول `--history-bars` بار ۳۰ دقیقه‌ای قبل از اولین t_cur فراهم می‌کنیم تا همهٔ اندیکاتورها warm-up داشته باشند. این تاریخچه در فایل‌های CSV باقی می‌ماند و در هر استپ فقط دادهٔ جدید «append» می‌شود.
+- از fast_mode=1 استفاده شده (صرفاً برای خاموش‌کردن drift-scan، هیچ «trim» داخلی اعمال نمی‌شود).
+
+اجرا:
+python3 live_like_sim_diskfeed_strict.py \
+  --mode real \
+  --split tail --n-test 4000 \
+  --history-bars 2500 \
+  --fast-mode 1 \
+  --audit 50 \
+  --base-data-dir /home/pouria/gold_project9 \
+  --symbol XAUUSD \
+  --model /home/pouria/gold_project9/best_model.pkl \
+  --use-model-thresholds 1 \
+  --tmp-dir _sim_csv \
+  --cleanup 1 \
+  --save-csv live_like_results.csv \
+  --log-file live_like_real.log
 """
 from __future__ import annotations
 
-import os, sys, json, argparse, logging, pickle, ast, glob
+import os, sys, json, argparse, logging, pickle, ast, glob, shutil
 from logging.handlers import RotatingFileHandler
 from typing import List, Optional, Tuple, Dict, Any
 import numpy as np
@@ -40,7 +55,7 @@ from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN  # type: ignore
 # --------------------------- Logger ---------------------------
 
 def setup_logger(log_file: Optional[str]) -> logging.Logger:
-    log = logging.getLogger("live_like_fast")
+    log = logging.getLogger("live_like_diskfeed_strict")
     log.setLevel(logging.INFO)
     log.handlers.clear()
     fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -71,7 +86,7 @@ def _smart_load_model(path: str):
             import gzip
             with gzip.open(path, "rb") as g:
                 return pickle.load(g)
-        if head in (b"x\x9c", b"x\xda"):  # zlib
+        if head in (b"x\x9c", b"x\xda"):
             import zlib
             data = open(path, "rb").read()
             try:
@@ -92,8 +107,6 @@ def _smart_load_model(path: str):
         pass
     raise RuntimeError(f"Could not load model from '{path}'. Save with joblib/pickle or a compatible format.")
 
-# ----------------------- Columns / thresholds ------------------
-
 _COLS_KEYS = ("train_window_cols", "train_cols", "columns", "features", "feature_names", "cols")
 _THR_KEYS  = ("neg_thr", "pos_thr", "negative_threshold", "positive_threshold")
 _WIN_KEYS  = ("window_size", "window", "win", "train_window")
@@ -110,7 +123,6 @@ def _find_cols_recursively(obj: Any) -> Optional[List[str]]:
     if los:
         return los
     if isinstance(obj, dict):
-        # Direct keys
         for k in _COLS_KEYS:
             for kk in (k, k.upper(), k.lower()):
                 if kk in obj:
@@ -127,7 +139,6 @@ def _find_cols_recursively(obj: Any) -> Optional[List[str]]:
                                     return los
                             except Exception:
                                 pass
-        # Nested
         for v in obj.values():
             if isinstance(v, (dict, list, tuple)):
                 los = _find_cols_recursively(v)
@@ -161,7 +172,6 @@ def recover_thresholds_and_window(search_dirs: List[str], log: logging.Logger) -
     jsons: List[str] = []
     for d in search_dirs:
         jsons.extend(sorted(glob.glob(os.path.join(d or ".", "*.json"))))
-    # Prioritize typical names
     jsons = sorted(jsons, key=lambda p: (0 if os.path.basename(p).lower() in ("model_meta.json", "thresholds.json", "meta.json") else 1, p))
     neg = pos = None
     win = None
@@ -169,7 +179,6 @@ def recover_thresholds_and_window(search_dirs: List[str], log: logging.Logger) -
         try:
             with open(p, "r", encoding="utf-8") as f:
                 obj = json.load(f)
-            # Thresholds
             for k in _THR_KEYS:
                 for kk in (k, k.upper(), k.lower()):
                     if kk in obj and isinstance(obj[kk], (int, float)):
@@ -177,15 +186,10 @@ def recover_thresholds_and_window(search_dirs: List[str], log: logging.Logger) -
                             neg = float(obj[kk])
                         if "pos" in kk or "positive" in kk:
                             pos = float(obj[kk])
-            # Window
             for k in _WIN_KEYS:
                 for kk in (k, k.upper(), k.lower()):
                     if kk in obj and isinstance(obj[kk], int) and obj[kk] > 0:
                         win = int(obj[kk])
-            # Nested search
-            if isinstance(obj, dict):
-                cols = _find_cols_recursively(obj)
-                # ignore here; only thresholds/window in this function
         except Exception:
             continue
     if any(v is not None for v in (neg, pos, win)):
@@ -212,12 +216,10 @@ def coerce_pipeline(obj: Any) -> Any:
     if hasattr(obj, "predict_proba"):
         return obj
     if isinstance(obj, dict):
-        # common keys
         for k in ("pipeline", "model", "estimator", "clf", "sk_pipeline"):
             if k in obj and hasattr(obj[k], "predict_proba"):
                 return obj[k]
     raise TypeError("Loaded model object is not a scikit-learn pipeline/classifier with predict_proba.")
-
 
 # ----------------------- Time helpers ---------------------------
 
@@ -247,18 +249,68 @@ def compute_gt_from_m30(m30: pd.DataFrame, t_feat: pd.Timestamp) -> Optional[int
             return None
     if pos + 1 >= len(m30):
         return None
-    c0 = float(m30.iloc[pos]["close"]) if "close" in m30.columns else float(m30.iloc[pos]["Close"])
-    c1 = float(m30.iloc[pos + 1]["close"]) if "close" in m30.columns else float(m30.iloc[pos + 1]["Close"])
+    c0 = float(m30.iloc[pos]["close"])
+    c1 = float(m30.iloc[pos + 1]["close"])
     return 1 if (c1 - c0) > 0 else 0
 
+# ----------------------- Disk‑feed helpers ----------------------
+
+def ensure_tmp_dir(tmp_dir: str, cleanup: bool):
+    if cleanup and os.path.isdir(tmp_dir):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    os.makedirs(tmp_dir, exist_ok=True)
+
+
+def load_base_csvs(base_dir: str, symbol: str) -> Dict[str, pd.DataFrame]:
+    fps = {
+        "30T": os.path.join(base_dir, f"{symbol}_M30.csv"),
+        "15T": os.path.join(base_dir, f"{symbol}_M15.csv"),
+        "5T":  os.path.join(base_dir, f"{symbol}_M5.csv"),
+        "1H":  os.path.join(base_dir, f"{symbol}_H1.csv"),
+    }
+    dfs: Dict[str, pd.DataFrame] = {}
+    for tf, p in fps.items():
+        if not os.path.isfile(p):
+            raise FileNotFoundError(f"CSV not found for {tf}: {p}")
+        df = pd.read_csv(p)
+        if "time" not in df.columns:
+            raise ValueError(f"'time' column missing in {tf} CSV")
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+        dfs[tf] = df
+    return dfs
+
+
+def write_initial_tmp(tmp_dir: str, dfs: Dict[str, pd.DataFrame], t_hist_start: pd.Timestamp, t0: pd.Timestamp):
+    for tf, df in dfs.items():
+        mask = (df["time"] >= t_hist_start) & (df["time"] <= t0)
+        out = df.loc[mask].copy()
+        out.to_csv(os.path.join(tmp_dir, f"XAUUSD_{'M30' if tf=='30T' else ('M15' if tf=='15T' else ('M5' if tf=='5T' else 'H1'))}.csv"), index=False)
+
+
+def append_new_rows(tmp_dir: str, base_df: pd.DataFrame, tf: str, last_written_time: Optional[pd.Timestamp], t_cur: pd.Timestamp) -> Optional[pd.Timestamp]:
+    # compute new rows to append: (last_written_time, t_cur]
+    if last_written_time is None:
+        mask = base_df["time"] <= t_cur
+    else:
+        mask = (base_df["time"] > last_written_time) & (base_df["time"] <= t_cur)
+    new = base_df.loc[mask]
+    if new.empty:
+        return last_written_time
+    out_path = os.path.join(tmp_dir, f"XAUUSD_{'M30' if tf=='30T' else ('M15' if tf=='15T' else ('M5' if tf=='5T' else 'H1'))}.csv")
+    mode = "a" if os.path.exists(out_path) else "w"
+    header = not os.path.exists(out_path) if mode == "a" else True
+    new.to_csv(out_path, mode=mode, header=header, index=False)
+    return pd.Timestamp(new.iloc[-1]["time"])  # last written
 
 # ------------------------------ main ------------------------------
 
 def main():
-    ap = argparse.ArgumentParser("Ultra‑fast live‑like simulator with batch parity")
+    ap = argparse.ArgumentParser("Strict disk‑feed live simulator + batch parity")
     ap.add_argument("--mode", default="real", choices=["real"])  # reserved
     ap.add_argument("--split", default="tail", choices=["ga", "tail"], help="Anchor selection")
     ap.add_argument("--n-test", type=int, default=4000, help="Used in split=tail")
+    ap.add_argument("--history-bars", type=int, default=2500, help="Initial 30T history bars before first anchor")
     ap.add_argument("--fast-mode", type=int, default=1, help="Use PREP fast_mode (skip drift scan)")
     ap.add_argument("--audit", type=int, default=50, help="Log every N steps (1=every step)")
     ap.add_argument("--base-data-dir", default=".")
@@ -269,16 +321,17 @@ def main():
     ap.add_argument("--pos-thr", type=float, default=None)
     ap.add_argument("--use-model-thresholds", type=int, default=1)
     ap.add_argument("--window", type=int, default=0)
+    ap.add_argument("--tmp-dir", default="_sim_csv")
+    ap.add_argument("--cleanup", type=int, default=1, help="Remove tmp dir at end")
     ap.add_argument("--save-csv", default="")
     ap.add_argument("--log-file", default=None)
     args = ap.parse_args()
 
     log = setup_logger(args.log_file)
-    log.info("==> Starting live_like_fast with args: %s", vars(args))
+    log.info("==> Starting live_like_diskfeed_strict with args: %s", vars(args))
 
     # --- Load model
     obj = _smart_load_model(args.model)
-    # Try to recover columns from model object if dict
     model_side_cols = None
     if isinstance(obj, dict):
         for k in _COLS_KEYS:
@@ -294,7 +347,6 @@ def main():
         cols = recover_cols_from_train_distribution([os.path.dirname(args.model), os.getcwd()], log)
     if not cols:
         raise ValueError("Could not obtain train_window_cols from model dict or train_distribution.json")
-    # unique order
     seen = set()
     train_window_cols = [str(c) for c in cols if not (str(c) in seen or seen.add(str(c)))]
 
@@ -320,23 +372,9 @@ def main():
     log.info("Loaded model OK | window=%d | neg_thr=%.6f | pos_thr=%.6f | #cols=%d",
              window, neg_thr, pos_thr, len(train_window_cols))
 
-    # --- Base CSVs (read-only raw for GT & trimming anchors quickly)
-    paths = {
-        "30T": os.path.join(args.base_data_dir, f"{args.symbol}_M30.csv"),
-        "1H":  os.path.join(args.base_data_dir, f"{args.symbol}_H1.csv"),
-        "15T": os.path.join(args.base_data_dir, f"{args.symbol}_M15.csv"),
-        "5T":  os.path.join(args.base_data_dir, f"{args.symbol}_M5.csv"),
-    }
-    for tf, p in paths.items():
-        if not os.path.isfile(p):
-            raise FileNotFoundError(f"CSV not found for {tf}: {p}")
-
-    m30 = pd.read_csv(paths["30T"])  # for building anchors + GT
-    if "time" not in m30.columns:
-        raise ValueError("'time' column missing in 30T CSV")
-    m30["time"] = pd.to_datetime(m30["time"], errors="coerce")
-    m30 = m30.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
-
+    # --- Load base CSVs (for anchor & GT)
+    base = load_base_csvs(args.base_data_dir, args.symbol)
+    m30 = base["30T"]
     all_times_30 = pd.to_datetime(m30["time"]).sort_values()
 
     if args.split == "ga":
@@ -348,70 +386,62 @@ def main():
         anchors = list(all_times_30.tail(args.n_test))
         log.info("Using TAIL anchors → n_test=%d", len(anchors))
 
-    # --- Build a single merged+processed DataFrame just once (trimmed to a safety window)
-    t_min = pd.Timestamp(anchors[0])
-    t_max = pd.Timestamp(anchors[-1])
+    # --- Prepare tmp dir & initial seed
+    ensure_tmp_dir(args.tmp_dir, cleanup=True)
     dt30 = timeframe_delta("30T")
-    safety_bars = max(1500, window * 300)  # generous buffer for indicators & windowing
-    safety_start = t_min - safety_bars * dt30
+    t0 = pd.Timestamp(anchors[0])
+    t_hist_start = t0 - args.history_bars * dt30
+    write_initial_tmp(args.tmp_dir, base, t_hist_start, t0)
 
-    # Tell PREP to trim from safety_start
-    filepaths_ordered = {
-        "30T": paths["30T"],
-        "1H":  paths["1H"],
-        "15T": paths["15T"],
-        "5T":  paths["5T"],
+    # Track last written times per TF
+    last_written: Dict[str, Optional[pd.Timestamp]] = {}
+    for tf, df in base.items():
+        mask = (df["time"] >= t_hist_start) & (df["time"] <= t0)
+        last_written[tf] = pd.Timestamp(df.loc[mask].iloc[-1]["time"]) if mask.any() else None
+
+    # --- PREP bound to tmp files (no trimming inside)
+    tmp_filepaths = {
+        "30T": os.path.join(args.tmp_dir, "XAUUSD_M30.csv"),
+        "1H":  os.path.join(args.tmp_dir, "XAUUSD_H1.csv"),
+        "15T": os.path.join(args.tmp_dir, "XAUUSD_M15.csv"),
+        "5T":  os.path.join(args.tmp_dir, "XAUUSD_M5.csv"),
     }
+    prep = PREPARE_DATA_FOR_TRAIN(filepaths=tmp_filepaths, main_timeframe="30T", verbose=False, fast_mode=bool(args.fast_mode))
 
-    prep = PREPARE_DATA_FOR_TRAIN(filepaths=filepaths_ordered, main_timeframe="30T", verbose=False, fast_mode=bool(args.fast_mode))
-    prep.shared_start_date = safety_start  # سخت‌گیرانه از این تاریخ به بعد
-
-    log.info("Building merged+features once from %s to >= %s (safety=%d bars)…", str(safety_start)[:19], str(t_max)[:19], safety_bars)
-    raw_all = prep.load_data()  # heavy just once
-    main_time_col = f"{prep.main_timeframe}_time"
-    all_times_merged = pd.to_datetime(raw_all[main_time_col])
-
-    # --- Precompute PREDICT features for the whole slice (drop last unstable row)
-    Xp, _, _, _, t_idx_p = prep.ready(
-        raw_all,
-        window=window,
-        selected_features=train_window_cols,
-        mode="predict",
-        with_times=True,
-        predict_drop_last=True,
-    )
-    # Map time -> row index for instant lookup
-    t_map = {pd.Timestamp(t): i for i, t in enumerate(pd.to_datetime(t_idx_p))}
-
-    log.info("Prepared PREDICT features: rows=%d, cols=%d (will index by time)", len(Xp), Xp.shape[1])
-
-    # --- Live-like loop (ultra-fast)
+    # --- Loop
     wins = loses = undecided = 0
     y_true_decided: List[int] = []
     y_pred_decided: List[int] = []
     live_times_decided: List[pd.Timestamp] = []
-
     rows_csv: List[Dict[str, Any]] = []
 
     for step, t_cur in enumerate(anchors, start=1):
-        t_feat = pd.Timestamp(t_cur) - dt30
-        idx = t_map.get(t_feat, None)
-        if idx is None:
-            undecided += 1
+        # Append new rows from base to tmp files up to t_cur
+        for tf in ("30T", "1H", "15T", "5T"):
+            last_written[tf] = append_new_rows(args.tmp_dir, base[tf], tf, last_written.get(tf), pd.Timestamp(t_cur))
+
+        # Build features ONCE for current CSV state (strict realism)
+        raw_all = prep.load_data()  # heavy but only once per-step (on growing tmp files)
+
+        # Incremental ready: pass only a small tail window; warm-up on first call
+        tail_len = max(window + 3, 12)
+        data_window = raw_all.tail(tail_len)
+        X_tail, feats = prep.ready_incremental(data_window, window=window, selected_features=train_window_cols)
+        if X_tail.empty:
             if int(args.audit) == 1 or (args.audit and (step % int(args.audit) == 0)):
-                log.info("[%d/%d] t_cur=%s | t_feat=%s | idx=∅ → ∅ | cum decided=%d ∅=%d",
-                         step, len(anchors), str(t_cur)[:16], str(t_feat)[:16], wins+loses, undecided)
+                log.info("[WARM] ready_incremental primed at step %d; skipping prediction.", step)
             continue
 
-        xrow = Xp.iloc[[idx]].reindex(columns=train_window_cols, fill_value=0.0)
+        X_in = X_tail.reindex(columns=train_window_cols, fill_value=0.0)
         try:
-            p = float(pipeline.predict_proba(xrow)[:, 1][0])
+            p = float(pipeline.predict_proba(X_in)[:, 1][0])
         except Exception as e:
             undecided += 1
             log.error("[%d/%d] Predict failed at %s: %s → ∅", step, len(anchors), str(t_cur)[:16], e)
             continue
 
         pred = (0 if p <= neg_thr else (1 if p >= pos_thr else -1))
+        t_feat = pd.Timestamp(t_cur) - dt30  # چون آخرین ردیفِ پایدارِ ورودی مربوط به t−1 است
         gt = compute_gt_from_m30(m30, t_feat)
 
         outcome = "∅"
@@ -448,12 +478,12 @@ def main():
 
     # --- Final live metrics
     decided = wins + loses
-    acc_live = wins / decided if decided > 0 else float("nan")
     try:
         from sklearn.metrics import balanced_accuracy_score
         bal_live = balanced_accuracy_score(y_true_decided, y_pred_decided) if decided > 0 else float("nan")
     except Exception:
         bal_live = float("nan")
+    acc_live = wins / decided if decided > 0 else float("nan")
     coverage_live = decided / (decided + undecided) if (decided + undecided) > 0 else float("nan")
 
     log.info("[LIVE] decided=%d (wins=%d, loses=%d) · ∅=%d · acc=%s · bal_acc=%s · coverage=%.2f",
@@ -462,12 +492,28 @@ def main():
              ("{:.4f}".format(bal_live) if decided>0 else "n/a"),
              coverage_live)
 
-    # --- Batch parity on the exact slice
-    # Build a contiguous test slice from t_min..t_max
-    mask_slice = (all_times_merged >= (t_min)) & (all_times_merged <= (t_max))
-    test_slice = raw_all.loc[mask_slice].copy()
+    # --- Batch parity on exact slice
+    # Build contiguous slice from first to last anchor (using base CSVs, not tmp)
+    t_min = pd.Timestamp(anchors[0])
+    t_max = pd.Timestamp(anchors[-1])
 
-    Xb, yb, _, _, t_idx_b = prep.ready(
+    # For batch parity، مستقیماً از فایل‌های پایه استفاده می‌کنیم (تمام تاریخ موجود).
+    prep_batch = PREPARE_DATA_FOR_TRAIN(
+        filepaths={
+            "30T": os.path.join(args.base_data_dir, f"{args.symbol}_M30.csv"),
+            "1H":  os.path.join(args.base_data_dir, f"{args.symbol}_H1.csv"),
+            "15T": os.path.join(args.base_data_dir, f"{args.symbol}_M15.csv"),
+            "5T":  os.path.join(args.base_data_dir, f"{args.symbol}_M5.csv"),
+        },
+        main_timeframe="30T", verbose=False, fast_mode=bool(args.fast_mode)
+    )
+    raw_all_b = prep_batch.load_data()
+    tcol = f"{prep_batch.main_timeframe}_time"
+    all_times_b = pd.to_datetime(raw_all_b[tcol])
+    mask = (all_times_b >= t_min) & (all_times_b <= t_max)
+    test_slice = raw_all_b.loc[mask].copy()
+
+    Xb, yb, _, _, t_idx_b = prep_batch.ready(
         test_slice,
         window=window,
         selected_features=train_window_cols,
@@ -498,7 +544,7 @@ def main():
              ("{:.4f}".format(bal_b) if decided_b>0 else "n/a"),
              coverage_b)
 
-    # Batch parity on live-decided times
+    # Batch parity روی دقیقاً همان زمان‌هایی که لایو تصمیم گرفته
     t_map_b = {pd.Timestamp(t): i for i, t in enumerate(pd.to_datetime(t_idx_b))}
     idxs = [t_map_b.get(pd.Timestamp(t)) for t in live_times_decided]
     idxs = [i for i in idxs if i is not None]
@@ -518,7 +564,6 @@ def main():
                  decided_b_sub,
                  ("{:.4f}".format(acc_b_sub) if decided_b_sub>0 else "n/a"),
                  ("{:.4f}".format(bal_b_sub) if decided_b_sub>0 else "n/a"))
-        # Deltas
         delta_acc = (acc_live if not np.isnan(acc_live) else np.nan) - (acc_b_sub if not np.isnan(acc_b_sub) else np.nan)
         delta_bal = (bal_live if not np.isnan(bal_live) else np.nan) - (bal_b_sub if not np.isnan(bal_b_sub) else np.nan)
         log.info("[DELTA] live_minus_batch_on_live_times → acc=%s bal_acc=%s",
@@ -531,6 +576,13 @@ def main():
         out = os.path.abspath(args.save_csv)
         pd.DataFrame(rows_csv).to_csv(out, index=False)
         log.info("Saved per-step results to %s", out)
+
+    if int(args.cleanup) == 1:
+        try:
+            shutil.rmtree(args.tmp_dir, ignore_errors=True)
+            log.info("Temporary dir '%s' removed.", args.tmp_dir)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
