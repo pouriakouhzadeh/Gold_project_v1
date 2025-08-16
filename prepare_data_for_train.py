@@ -244,19 +244,21 @@ class PREPARE_DATA_FOR_TRAIN:
                 f"(0/NaN ≥{ratio_thr:.0%} or ≥{min_fail} →{z_bad}, "
                 f"fwd ≥{ratio_thr:.0%} or ≥{min_fail} →{f_bad})")
 
-    def __init__(self, filepaths: dict[str, str] | None = None, main_timeframe="30T", verbose=True, fast_mode: bool = False):
-        defaults = {"30T": "XAUUSD_M30.csv", "1H": "XAUUSD_H1.csv", "15T": "XAUUSD_M15.csv", "5T": "XAUUSD_M5.csv"}
-        self.filepaths = filepaths or defaults
+    def __init__(self, filepaths: dict[str, str] | None = None, main_timeframe="30T",
+                verbose=True, fast_mode: bool = False, strict_disk_feed: bool = False):
+        self.filepaths = filepaths
         self.main_timeframe = main_timeframe
         self.verbose = verbose
-        self.fast_mode = fast_mode                         # ← NEW
+        self.fast_mode = bool(fast_mode)
+        self.strict_disk_feed = bool(strict_disk_feed)
         self.train_columns_after_window: List[str] = []
 
         # فقط در حالت معمول (Train) drift-scan شود؛ در fast_mode خاموش
         self.shared_start_date = None
-        if not fast_mode:
+        if (not fast_mode) and (not strict_disk_feed):
             self.drift_finder = DriftBasedStartDateSuggester(self.filepaths)
             self.shared_start_date = self.drift_finder.find_shared_start_date()
+
             if verbose:
                 print(f"📅 Shared drift-aware training start date: {self.shared_start_date}")
 
@@ -279,9 +281,10 @@ class PREPARE_DATA_FOR_TRAIN:
         df.dropna(subset=["time"], inplace=True)
         df.sort_values("time", inplace=True)
 
-        if self.shared_start_date:
+        if self.shared_start_date and (not self.strict_disk_feed):
             df = df[df["time"] >= self.shared_start_date]
             print(f"[{tf}] ⏳ Trimmed data from {self.shared_start_date.date()}")
+
         df.set_index("time", inplace=True)
         if self.verbose:
             print(f"len df {tf} = {len(df)}")
@@ -621,7 +624,16 @@ class PREPARE_DATA_FOR_TRAIN:
 
         # ---------- 2) ادغام روی تایم‌فریم اصلی ----------
         main_tf  = self.main_timeframe
-        main_df  = dfs[0].set_index(f"{main_tf}_time", drop=False)
+        df0 = dfs[0]
+        main_tf = getattr(self, "main_timeframe", "30T")
+        if f"{main_tf}_time" not in df0.columns:
+            # اگر در این شاخه قبل‌تر rename نشده بود، از ستون time بساز
+            if "time" in df0.columns:
+                df0[f"{main_tf}_time"] = pd.to_datetime(df0["time"], errors="coerce")
+            else:
+                raise KeyError(f"Missing '{main_tf}_time' and 'time' columns in main timeframe dataframe.")
+        main_df = df0.set_index(f"{main_tf}_time", drop=False)
+
         for (tf, _), df in zip(list(self.filepaths.items())[1:], dfs[1:]):
             main_df = main_df.join(
                 df.set_index(f"{tf}_time", drop=False),

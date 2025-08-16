@@ -1,37 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Realistic disk‑feed live simulator (strict) + batch parity
+Realistic disk-feed live simulator (strict) + batch parity
 =========================================================
 
-این اسکریپت «دقیقاً» شبیه محیط واقعی رفتار می‌کند:
-- در هر گام، چهار CSV (5T/15T/30T/1H) مثل خروجی متاتریدر «تا همان زمان t_cur» روی دیسک موجود است.
-- سپس همان فایل‌ها لود می‌شوند، Clean/Feature ساخته می‌شود، «بعد از آماده‌سازی» ردیف ناپایدار حذف می‌شود.
-- از `ready_incremental` برای وارم‌آپ و تولید تنها ردیف پایدار t−1 استفاده می‌شود.
-- بعد پیش‌بینی انجام می‌شود و GT از CSV 30T اصلی ساخته و گزارش می‌شود.
-- فایل‌های موقت به‌صورت افزایشی «append» می‌شوند (بازنویسی کامل در هر استپ نداریم) → سرعت بهتر با حفظ دقتِ محیط واقعی.
+- در هر گام، چهار CSV (5T/15T/30T/1H) دقیقا تا t_cur روی دیسک وجود دارد.
+- همان CSVها لود می‌شوند، Clean/Feature ساخته می‌شود، و «بعد از آماده‌سازی» ردیف ناپایدار حذف می‌شود.
+- از ready_incremental برای وارم‌آپ و تولید فقط ردیف پایدار t−1 استفاده می‌شود.
+- پیش‌بینی انجام می‌شود و GT از CSV 30T اصلی ساخته می‌شود.
+- فایل‌های tmp به‌صورت افزایشی append می‌شوند (یک‌بار پردازش سنگین در هر استپ).
 - در پایان، پاریتی با Batch روی همان بازه گزارش می‌شود.
 
-نکات مهم سرعت:
-- اندیکاتورها برای هر دستهٔ CSV «یک‌بار» محاسبه می‌شوند (دقیقاً مطابق خواستهٔ شما).
-- برای شروع، تاریخچه‌ای با طول `--history-bars` بار ۳۰ دقیقه‌ای قبل از اولین t_cur فراهم می‌کنیم تا همهٔ اندیکاتورها warm-up داشته باشند. این تاریخچه در فایل‌های CSV باقی می‌ماند و در هر استپ فقط دادهٔ جدید «append» می‌شود.
-- از fast_mode=1 استفاده شده (صرفاً برای خاموش‌کردن drift-scan، هیچ «trim» داخلی اعمال نمی‌شود).
-
-اجرا:
-python3 live_like_sim_diskfeed_strict.py \
-  --mode real \
-  --split tail --n-test 4000 \
-  --history-bars 2500 \
-  --fast-mode 1 \
-  --audit 50 \
-  --base-data-dir /home/pouria/gold_project9 \
-  --symbol XAUUSD \
-  --model /home/pouria/gold_project9/best_model.pkl \
-  --use-model-thresholds 1 \
-  --tmp-dir _sim_csv \
-  --cleanup 1 \
-  --save-csv live_like_results.csv \
-  --log-file live_like_real.log
+اجرای نمونه (یک خط):
+python3 live_like_sim_diskfeed_strict.py --mode real --split tail --n-test 4000 --history-bars 2500 --fast-mode 1 --audit 1 --base-data-dir /home/pouria/gold_project9 --symbol XAUUSD --model /home/pouria/gold_project9/best_model.pkl --use-model-thresholds 1 --tmp-dir _sim_csv --cleanup 1 --save-csv live_like_results.csv --log-file live_like_real.log
 """
 from __future__ import annotations
 
@@ -253,7 +234,7 @@ def compute_gt_from_m30(m30: pd.DataFrame, t_feat: pd.Timestamp) -> Optional[int
     c1 = float(m30.iloc[pos + 1]["close"])
     return 1 if (c1 - c0) > 0 else 0
 
-# ----------------------- Disk‑feed helpers ----------------------
+# ----------------------- Disk-feed helpers ----------------------
 
 def ensure_tmp_dir(tmp_dir: str, cleanup: bool):
     if cleanup and os.path.isdir(tmp_dir):
@@ -306,7 +287,7 @@ def append_new_rows(tmp_dir: str, base_df: pd.DataFrame, tf: str, last_written_t
 # ------------------------------ main ------------------------------
 
 def main():
-    ap = argparse.ArgumentParser("Strict disk‑feed live simulator + batch parity")
+    ap = argparse.ArgumentParser("Strict disk-feed live simulator + batch parity")
     ap.add_argument("--mode", default="real", choices=["real"])  # reserved
     ap.add_argument("--split", default="tail", choices=["ga", "tail"], help="Anchor selection")
     ap.add_argument("--n-test", type=int, default=4000, help="Used in split=tail")
@@ -325,6 +306,9 @@ def main():
     ap.add_argument("--cleanup", type=int, default=1, help="Remove tmp dir at end")
     ap.add_argument("--save-csv", default="")
     ap.add_argument("--log-file", default=None)
+    # اختیاری: بازنویسی کامل فایل‌های tmp و پاکسازی در هر استپ
+    ap.add_argument("--rewrite-per-step", type=int, default=0)
+    ap.add_argument("--cleanup-per-step", type=int, default=0)
     args = ap.parse_args()
 
     log = setup_logger(args.log_file)
@@ -391,6 +375,8 @@ def main():
     dt30 = timeframe_delta("30T")
     t0 = pd.Timestamp(anchors[0])
     t_hist_start = t0 - args.history_bars * dt30
+
+    # seed
     write_initial_tmp(args.tmp_dir, base, t_hist_start, t0)
 
     # Track last written times per TF
@@ -399,29 +385,44 @@ def main():
         mask = (df["time"] >= t_hist_start) & (df["time"] <= t0)
         last_written[tf] = pd.Timestamp(df.loc[mask].iloc[-1]["time"]) if mask.any() else None
 
-    # --- PREP bound to tmp files (no trimming inside)
+    # --- PREP bound to tmp files (no trimming inside) → strict_disk_feed=True
     tmp_filepaths = {
         "30T": os.path.join(args.tmp_dir, "XAUUSD_M30.csv"),
         "1H":  os.path.join(args.tmp_dir, "XAUUSD_H1.csv"),
         "15T": os.path.join(args.tmp_dir, "XAUUSD_M15.csv"),
         "5T":  os.path.join(args.tmp_dir, "XAUUSD_M5.csv"),
     }
-    prep = PREPARE_DATA_FOR_TRAIN(filepaths=tmp_filepaths, main_timeframe="30T", verbose=False, fast_mode=bool(args.fast_mode))
+    prep = PREPARE_DATA_FOR_TRAIN(
+        filepaths=tmp_filepaths,
+        main_timeframe="30T",
+        verbose=False,
+        fast_mode=bool(args.fast_mode),
+        strict_disk_feed=True,
+    )
 
     # --- Loop
     wins = loses = undecided = 0
+    TP = TN = FP = FN = 0
     y_true_decided: List[int] = []
     y_pred_decided: List[int] = []
     live_times_decided: List[pd.Timestamp] = []
     rows_csv: List[Dict[str, Any]] = []
+    total_steps = len(anchors)
 
     for step, t_cur in enumerate(anchors, start=1):
-        # Append new rows from base to tmp files up to t_cur
-        for tf in ("30T", "1H", "15T", "5T"):
-            last_written[tf] = append_new_rows(args.tmp_dir, base[tf], tf, last_written.get(tf), pd.Timestamp(t_cur))
+        t_cur = pd.Timestamp(t_cur)
+
+        if int(args.rewrite_per_step) == 1:  # بازنویسی کامل فایل‌ها تا t_cur
+            ensure_tmp_dir(args.tmp_dir, cleanup=True)
+            write_initial_tmp(args.tmp_dir, base, t_hist_start, t_cur)
+            last_written = {tf: t_cur for tf in ("30T", "1H", "15T", "5T")}
+        else:
+            # Append new rows from base to tmp files up to t_cur
+            for tf in ("30T", "1H", "15T", "5T"):
+                last_written[tf] = append_new_rows(args.tmp_dir, base[tf], tf, last_written.get(tf), t_cur)
 
         # Build features ONCE for current CSV state (strict realism)
-        raw_all = prep.load_data()  # heavy but only once per-step (on growing tmp files)
+        raw_all = prep.load_data()  # heavy but once per-step (on growing tmp files)
 
         # Incremental ready: pass only a small tail window; warm-up on first call
         tail_len = max(window + 3, 12)
@@ -433,39 +434,59 @@ def main():
             continue
 
         X_in = X_tail.reindex(columns=train_window_cols, fill_value=0.0)
-        # جلوگیری از خطای NaN/Inf در مدل‌هایی مثل LogisticRegression
-        X_in = X_in.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        X_in = X_in.replace([np.inf, -np.inf], np.nan).fillna(0.0)  # safety for LR
+
         try:
             p = float(pipeline.predict_proba(X_in)[:, 1][0])
         except Exception as e:
             undecided += 1
-            log.error("[%d/%d] Predict failed at %s: %s → ∅", step, len(anchors), str(t_cur)[:16], e)
+            log.error("[%d/%d] Predict failed at %s: %s → ∅", step, total_steps, str(t_cur)[:16], e)
             continue
 
         pred = (0 if p <= neg_thr else (1 if p >= pos_thr else -1))
-        t_feat = pd.Timestamp(t_cur) - dt30  # چون آخرین ردیفِ پایدارِ ورودی مربوط به t−1 است
+        t_feat = t_cur - dt30  # آخرین ردیف پایدار ورودی مربوط به t−1 است
         gt = compute_gt_from_m30(m30, t_feat)
 
         outcome = "∅"
         if (gt is None) or (pred == -1):
             undecided += 1
         else:
-            if pred == gt:
-                wins += 1; outcome = "WIN"
-            else:
-                loses += 1; outcome = "LOSE"
+            if gt == 1 and pred == 1:
+                TP += 1; wins += 1; outcome = "WIN"
+            elif gt == 0 and pred == 0:
+                TN += 1; wins += 1; outcome = "WIN"
+            elif gt == 0 and pred == 1:
+                FP += 1; loses += 1; outcome = "LOSE"
+            elif gt == 1 and pred == 0:
+                FN += 1; loses += 1; outcome = "LOSE"
             y_true_decided.append(int(gt))
             y_pred_decided.append(int(pred))
             live_times_decided.append(t_feat)
 
         decided = wins + loses
         acc = (wins / decided) if decided > 0 else float("nan")
+        tpr = TP / (TP + FN) if (TP + FN) > 0 else float("nan")
+        tnr = TN / (TN + FP) if (TN + FP) > 0 else float("nan")
+        bal_running = ((tpr + tnr) / 2.0) if (not np.isnan(tpr) and not np.isnan(tnr)) else float("nan")
+        coverage = decided / (decided + undecided) if (decided + undecided) > 0 else float("nan")
 
         if int(args.audit) == 1 or (args.audit and (step % int(args.audit) == 0)):
-            log.info("[%d/%d] t_cur=%s | t_feat=%s | proba=%.6f | pred=%s | gt=%s → %s | acc=%s | decided=%d | ∅=%d",
-                     step, len(anchors), str(t_cur)[:16], str(t_feat)[:16], p, pred,
-                     ("?" if gt is None else str(gt)), outcome,
-                     ("{:.4f}".format(acc) if decided>0 else "n/a"), decided, undecided)
+            log.info(
+                "[%d/%d] t_cur=%s | t_feat=%s | proba=%.6f | pred=%s | gt=%s → %s | acc=%s | bal_acc=%s | coverage=%.2f | decided=%d | ∅=%d",
+                step, total_steps, str(t_cur)[:16], str(t_feat)[:16], p, pred,
+                ("?" if gt is None else str(gt)), outcome,
+                ("{:.4f}".format(acc) if decided>0 else "n/a"),
+                ("{:.4f}".format(bal_running) if decided>0 else "n/a"),
+                (coverage if not np.isnan(coverage) else 0.0), decided, undecided,
+            )
+
+        if int(args.cleanup_per_step) == 1:
+            # حذف فایل‌های tmp پس از هر استپ (دقیقاً معادل دریافت تک‌شات از متاتریدر؛ کندتر است)
+            for fn in ("XAUUSD_M30.csv", "XAUUSD_M15.csv", "XAUUSD_M5.csv", "XAUUSD_H1.csv"):
+                try:
+                    os.remove(os.path.join(args.tmp_dir, fn))
+                except FileNotFoundError:
+                    pass
 
         if args.save_csv:
             rows_csv.append({
@@ -476,6 +497,9 @@ def main():
                 "pred": pred,
                 "gt": (None if gt is None else int(gt)),
                 "outcome": outcome,
+                "acc_running": (None if np.isnan(acc) else float(acc)),
+                "bal_acc_running": (None if np.isnan(bal_running) else float(bal_running)),
+                "coverage_running": (None if np.isnan(coverage) else float(coverage)),
             })
 
     # --- Final live metrics
@@ -495,11 +519,9 @@ def main():
              coverage_live)
 
     # --- Batch parity on exact slice
-    # Build contiguous slice from first to last anchor (using base CSVs, not tmp)
     t_min = pd.Timestamp(anchors[0])
     t_max = pd.Timestamp(anchors[-1])
 
-    # For batch parity، مستقیماً از فایل‌های پایه استفاده می‌کنیم (تمام تاریخ موجود).
     prep_batch = PREPARE_DATA_FOR_TRAIN(
         filepaths={
             "30T": os.path.join(args.base_data_dir, f"{args.symbol}_M30.csv"),
