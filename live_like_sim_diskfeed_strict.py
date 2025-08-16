@@ -393,12 +393,11 @@ def main():
         "5T":  os.path.join(args.tmp_dir, "XAUUSD_M5.csv"),
     }
     prep = PREPARE_DATA_FOR_TRAIN(
-        filepaths=tmp_filepaths,
-        main_timeframe="30T",
-        verbose=False,
-        fast_mode=bool(args.fast_mode),
-        strict_disk_feed=True,
+        filepaths=tmp_filepaths, main_timeframe="30T",
+        verbose=False, fast_mode=bool(args.fast_mode),
+        strict_disk_feed=True
     )
+
 
     # --- Loop
     wins = loses = undecided = 0
