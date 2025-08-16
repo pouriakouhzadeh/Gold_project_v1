@@ -433,6 +433,8 @@ def main():
             continue
 
         X_in = X_tail.reindex(columns=train_window_cols, fill_value=0.0)
+        # جلوگیری از خطای NaN/Inf در مدل‌هایی مثل LogisticRegression
+        X_in = X_in.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         try:
             p = float(pipeline.predict_proba(X_in)[:, 1][0])
         except Exception as e:

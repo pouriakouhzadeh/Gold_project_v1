@@ -508,6 +508,10 @@ class PREPARE_DATA_FOR_TRAIN:
         # پاکسازی نهایی
         X_f.replace([np.inf, -np.inf], np.nan, inplace=True)
         X_f = X_f.fillna(X_f.median())
+        # --- NEW: ensure no NaN/Inf at predict time ---
+        X_f.replace([np.inf, -np.inf], np.nan, inplace=True)
+        if mode != "train":
+            X_f = X_f.fillna(0.0)   # برای پیش‌بینی، ورودی کاملاً بدون NaN
 
         # زمان‌های هم‌تراز (اختیاری)
         tcol = f"{self.main_timeframe}_time" if f"{self.main_timeframe}_time" in data.columns else "time"
