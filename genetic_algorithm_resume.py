@@ -66,7 +66,9 @@ _fmt = "%(asctime)s %(levelname)s: %(message)s"
 _date = "%Y-%m-%d %H:%M:%S"
 
 log_path = "/home/pouria/genetic.log"
-file_hdl = RotatingFileHandler(log_path, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+os.makedirs(os.path.dirname(log_path), exist_ok=True)  # ⬅️ پوشه را بساز
+file_hdl = RotatingFileHandler(log_path, maxBytes=20_000_000, backupCount=3, encoding="utf-8")
+
 
 file_hdl.setFormatter(logging.Formatter(_fmt, _date))
 LOGGER.addHandler(file_hdl)
@@ -246,9 +248,9 @@ def _fit_and_score_fold(tr_idx, ts_idx, X_full, y_full, price_series, hyper, cal
 
     X_tr, X_ts = X_tr_raw[feats], X_ts_raw[feats]
 
-    pipe = ModelPipeline(hyper, calibrate=True,
-                      calib_method=calib_method).fit(X_tr, y_tr)
-    y_pred = pipe.pipeline.predict(X_ts)       # 1 = لانگ، 0 = نقد
+    # در مرحله GA کالیبراسیون را خاموش می‌کنیم تا سریع و بدون لیکیج باشد
+    pipe = ModelPipeline(hyper, calibrate=False, calib_method=calib_method).fit(X_tr, y_tr)
+    y_pred = pipe.predict(X_ts)       # 1 = لانگ، 0 = نقد
 
     # ── استخراج قیمت خام (ستون 30T_close) ──
     prices = price_series.iloc[ts_idx].astype(float).values
@@ -326,11 +328,11 @@ def evaluate_cv(ind):
             return (0.0,)
 
         hyper = {
-            "C":C, "max_iter":max_iter, "tol":tol, "penalty":penalty,
-            "solver":solver, "fit_intercept":fit_intercept,
-            "class_weight":class_weight
-            # ← multi_class عمداً حذف شد
+            "C": C, "max_iter": max_iter, "tol": tol, "penalty": penalty,
+            "solver": solver, "fit_intercept": fit_intercept,
+            "class_weight": class_weight, "multi_class": multi_class
         }
+
 
         tscv = TimeSeriesSplit(n_splits=3)
         scores = Parallel(n_jobs=-1, backend="loky")(
@@ -384,7 +386,23 @@ class GeneticAlgorithmRunner:
                         start_gen)
 
             LOGGER.info("[main] Initialising PREPARE_DATA_FOR_TRAIN …")
-            prep = PREPARE_DATA_FOR_TRAIN(main_timeframe="30T")
+            # ⬅️ مسیر واقعی پوشه‌ی CSVها دقیقا همین‌جاست:
+            data_dir = "/home/pouria/gold_project9"
+            symbol   = "XAUUSD"
+
+            # نگاشت دقیق به نام‌های موجود:
+            filepaths = {
+                "30T": f"{data_dir}/{symbol}_M30.csv",
+                "15T": f"{data_dir}/{symbol}_M15.csv",
+                "5T":  f"{data_dir}/{symbol}_M5.csv",
+                "1H":  f"{data_dir}/{symbol}_H1.csv",
+            }
+
+            for tf, fp in filepaths.items():
+                LOGGER.info("[paths] %s → %s", tf, fp)
+
+            prep = PREPARE_DATA_FOR_TRAIN(filepaths=filepaths, main_timeframe="30T")
+
             raw  = prep.load_data()
             LOGGER.info("[main] Raw data loaded → rows = %d, shape = %s", len(raw), raw.shape)
             # -------------------- save tain raw with def ready for test-------------
@@ -507,32 +525,54 @@ class GeneticAlgorithmRunner:
         fit_intercept, class_weight, multi_class,
         window, calib_method) = ind
 
-        X, y, feats, _ = prep.ready(data_tr,
-                            window=window,
-                            selected_features=None,
-                            mode="train",
-                            predict_drop_last=False)
+        X, y, feats, _ = prep.ready(
+            data_tr,
+            window=window,
+            selected_features=None,
+            mode="train",
+            predict_drop_last=False
+        )
 
         if X.empty:
             return None, []
 
+        # ⬅️ multi_class را هم پاس بده تا سازگاری کامل شود
         hyper = {
-            "C":C, "max_iter":max_iter, "tol":tol, "penalty":penalty,
-            "solver":solver, "fit_intercept":fit_intercept,
-            "class_weight":class_weight
-            # ← multi_class عمداً حذف شد
+            "C": C, "max_iter": max_iter, "tol": tol, "penalty": penalty,
+            "solver": solver, "fit_intercept": fit_intercept,
+            "class_weight": class_weight, "multi_class": multi_class
         }
+
         model = ModelPipeline(
             hyper,
             calibrate=True,
-            calib_method=calib_method           # ← پاس ژن
+            calib_method=calib_method
         ).fit(X, y)
-        
+
         self.final_cols = list(X.columns)
         LOGGER.info("[helper] Final model built with %d features", len(self.final_cols))
 
-        scaler = model.pipeline.named_steps.get("scaler")
-        X_proc = scaler.transform(X) if scaler is not None else X.values
+        # ⬅️ اسکیلرِ فیت-شده ممکن است مستقیماً در دسترس نباشد (CalibratedCV کلون می‌سازد)
+        #    برای پایدارسازیِ DriftChecker، اگر اسکیلرِ فیت-شده نبود، یک StandardScaler روی X فیت کن.
+        scaler = None
+        try:
+            # نسخهٔ جدید ModelPipeline یک wrapper دارد
+            scaler = model.get_scaler()
+        except Exception:
+            pass
+
+        try:
+            if (scaler is not None) and hasattr(scaler, "mean_"):
+                X_proc = scaler.transform(X)
+            else:
+                from sklearn.preprocessing import StandardScaler
+                _tmp = StandardScaler().fit(X)
+                X_proc = _tmp.transform(X)
+        except Exception:
+            from sklearn.preprocessing import StandardScaler
+            _tmp = StandardScaler().fit(X)
+            X_proc = _tmp.transform(X)
+
         DriftChecker(verbose=False).fit_on_train(
             pd.DataFrame(X_proc, columns=X.columns),
             bins=10, quantile=False
@@ -546,11 +586,12 @@ class GeneticAlgorithmRunner:
         window = ind[8]
         
         X_thr, y_thr, _, _ = prep.ready(
-                data_thr,
-                window=window,
-                selected_features=self.final_cols,   # ⬅️ دقیقاً ستون‌های Train
-                mode="train",
-                predict_drop_last=False) 
+            data_thr,
+            window=window,
+            selected_features=self.final_cols,   # ⬅️ ستون‌های نهایی Train
+            mode="train",
+            predict_drop_last=False)
+
 
         X_thr = X_thr[self.final_cols]
         if X_thr.empty:                       # ← جلوگیری از خطا
@@ -575,12 +616,13 @@ class GeneticAlgorithmRunner:
 
         window = ind[8]                       # ژنِ اندازهٔ پنجره
         # ❶ چهار خروجی می‌گیریم؛ price_ser همان سریِ 30T_close است
+        # ⬅️ دقیقاً همان ستون‌های نهایی Train را به ready بده تا X با لایو یکی شود
         X, y, _, price_ser = prep.ready(
             data_part,
             window=window,
-            selected_features=feats,
+            selected_features=self.final_cols,
             mode="train",
-            predict_drop_last=False) 
+            predict_drop_last=False)
         
         X = X[self.final_cols]                # ستون‌های نهایی مدل
         if X.empty:                           # ← جلوگیری از خطا
@@ -608,32 +650,32 @@ class GeneticAlgorithmRunner:
             bal_acc = balanced_accuracy_score(y[mask], y_pred[mask])
         else:
             bal_acc = 0.0
-        # ───────── معیار مالی (Sharpe − MaxDD) ─────────
-        if mask.any():
-            prices = price_ser[mask].astype(float).values
-            if len(prices) >= 2:
-                ret_mkt = np.diff(prices) / prices[:-1]
-                pos_shift = np.roll(y_pred[mask], 1)
-                pos_shift[0] = 0
-                pos_shift = pos_shift[:-1]                  # طول = len(ret_mkt)
-                ret_str = np.where(pos_shift == 1, ret_mkt, 0.0)
+        # ───────── معیار مالی (Sharpe − MaxDD) بدون فیلترکردن قیمت‌ها ─────────
+        prices = price_ser.astype(float).values
+        if len(prices) >= 2:
+            ret_mkt = np.diff(prices) / prices[:-1]    # طول = N-1
 
-                ret_ser = pd.Series(ret_str)
-                if ret_ser.std() > 0:
-                    periods_per_year = 252 * 48             # کندل ۳۰دقیقه‌ای
-                    sharpe = (ret_ser.mean() / ret_ser.std()
-                            * np.sqrt(periods_per_year))
-                else:
-                    sharpe = 0.0
+            # پوزیشن بر اساس سیگنال کندل قبلی (y_pred[t] برای بازه t→t+1)
+            pos = np.zeros_like(ret_mkt, dtype=float)
+            if len(y_pred) >= 2:
+                L = min(len(ret_mkt), len(y_pred) - 1)
+                pos[:L] = (y_pred[:-1][:L] == 1).astype(float)
 
-                cum_eq = ret_ser.add(1).cumprod()
-                maxdd = (cum_eq.cummax() - cum_eq).max()
-                norm_sharpe = (np.tanh(sharpe / 5) + 1) / 2
-                norm_dd     = 1.0 - min(maxdd, 1.0)
-                score       = 0.4 * norm_sharpe + 0.4 * norm_dd + 0.2 * bal_acc
-                     # معیار اصلی
+            ret_str = ret_mkt * pos
+            ret_ser = pd.Series(ret_str)
+
+            if ret_ser.std() > 0:
+                periods_per_year = 252 * 48
+                sharpe = (ret_ser.mean() / ret_ser.std()) * np.sqrt(periods_per_year)
             else:
-                score = sharpe = maxdd = 0.0
+                sharpe = 0.0
+
+            cum_eq = ret_ser.add(1).cumprod()
+            maxdd  = (cum_eq.cummax() - cum_eq).max()
+
+            norm_sharpe = (np.tanh(sharpe / 5) + 1) / 2
+            norm_dd     = 1.0 - min(maxdd, 1.0)
+            score       = 0.4 * norm_sharpe + 0.4 * norm_dd + 0.2 * bal_acc
         else:
             score = sharpe = maxdd = 0.0
 
@@ -661,11 +703,17 @@ class GeneticAlgorithmRunner:
             "solver":solver,"fit_intercept":fit_intercept,
             "class_weight":class_weight,"multi_class":multi_class
         }
-        scaler = model.pipeline.named_steps.get("scaler")
+        scaler = None
+        try:
+            # سازگار با نسخهٔ جدید ModelPipeline (wrapper)
+            scaler = model.pipeline.named_steps.get("scaler")
+        except Exception:
+            pass
+
         ModelSaver().save_full(
             pipeline=model.pipeline, hyperparams=hyper, scaler=scaler,
             window_size=window, neg_thr=self.neg_thr, pos_thr=self.pos_thr,
-            feats=feats, feat_mask=None, train_window_cols=self.final_cols,
+            feats=feats, feat_mask=[], train_window_cols=self.final_cols,   # ⬅️ لیست خالی
         )
         LOGGER.info("[save] All artefacts persisted to disk successfull")
 

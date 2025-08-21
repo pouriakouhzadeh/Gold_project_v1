@@ -10,7 +10,7 @@ Full data‑preparation pipeline for GA trainer (legacy‑compatible).
 * بذر تصادفی ثابت (2025) و لاگ‌گیری خلاصه
 """
 from __future__ import annotations
-
+import os
 import gc
 import re
 from collections import defaultdict
@@ -246,12 +246,24 @@ class PREPARE_DATA_FOR_TRAIN:
 
     def __init__(self, filepaths: dict[str, str] | None = None, main_timeframe="30T",
                 verbose=True, fast_mode: bool = False, strict_disk_feed: bool = False):
-        self.filepaths = filepaths
         self.main_timeframe = main_timeframe
         self.verbose = verbose
         self.fast_mode = bool(fast_mode)
         self.strict_disk_feed = bool(strict_disk_feed)
         self.train_columns_after_window: List[str] = []
+
+        # ⬅️ دیفالت امن برای مسیرها
+        if filepaths is None:
+            base = os.environ.get("BASE_DATA_DIR", ".")
+            symbol = os.environ.get("SYMBOL", "XAUUSD")
+            self.filepaths = {
+                "30T": f"{base}/{symbol}_30T.csv",
+                "15T": f"{base}/{symbol}_15T.csv",
+                "5T":  f"{base}/{symbol}_5T.csv",
+                "1H":  f"{base}/{symbol}_1H.csv",
+            }
+        else:
+            self.filepaths = filepaths
 
         # فقط در حالت معمول (Train) drift-scan شود؛ در fast_mode خاموش
         self.shared_start_date = None
@@ -271,9 +283,11 @@ class PREPARE_DATA_FOR_TRAIN:
             print(f"📅 Shared drift-aware training start date: {self.shared_start_date}")
 
 
-    # ================= 1) LOAD & FEATURE ENGINEER =================
+        # ================= 1) LOAD & FEATURE ENGINEER =================
     def load_and_process_timeframe(self, tf: str, filepath: str) -> pd.DataFrame:
         # print("Load and process time frame start ...")
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"[{tf}] Data file not found: {os.path.abspath(filepath)}")
         df = ClearData().clean(pd.read_csv(filepath))
         if "time" not in df.columns:
             raise ValueError("'time' column missing in CSV")
@@ -458,10 +472,13 @@ class PREPARE_DATA_FOR_TRAIN:
         if close_col not in data.columns:
             raise ValueError(f"{close_col} missing")
 
-        # y(t) = 1{close(t+1) > close(t)}
-        y = ((data[close_col].shift(-1) - data[close_col]) > 0).astype(int)
+        # y_next(t) = 1{ close(t+2) > close(t+1) }  ← برچسب «بازهٔ بعدی»
+        # این هم‌راستا با هدف ماست: فیچرهای t-1 → پیش‌بینی بازه [t → t+1]
+        y = (data[close_col].shift(-1) - data[close_col] > 0).shift(-1)
+
+        # در حالت predict، برچسب واقعی نداریم؛ فقط برای هم‌قدی با X یک سری صفر می‌سازیم
         if mode != "train":
-            y.iloc[:] = 0  # در predict فقط برای هم‌ترازی نگه می‌داریم
+            y = pd.Series(np.zeros(len(data), dtype="Int64"))
 
         # ستون‌ها
         time_cols = [c for c in data.columns if any(tok in c for tok in ["hour","day_of_week","is_weekend"])]
@@ -530,24 +547,18 @@ class PREPARE_DATA_FOR_TRAIN:
         y   = y.iloc[:L].reset_index(drop=True)
         t_idx = t_idx.iloc[:L].reset_index(drop=True)
 
-        # ➋ فقط در TRAIN: حذف ردیف‌هایی که هدف ندارند (close_{t+1} وجود ندارد)
+        # ➋ فقط در TRAIN: حذف ردیف‌هایی که برچسب «بازهٔ بعدی» ندارند (close_{t+2} موجود نیست)
         if mode == "train":
-            close_col = f"{self.main_timeframe}_close"
-            # y معتبر وقتی است که close(t+1) موجود باشد
-            diff_next = data[close_col].shift(-1) - data[close_col]  # t+1 - t
-            valid = diff_next.iloc[:len(df_diff)].reset_index(drop=True).notna()
-
-            # هم‌ترازی با پنجره‌بندی (window-1 ردیف ابتدای X حذف شده‌اند)
-            if window > 1 and len(valid) >= (window - 1):
-                valid = valid.iloc[window - 1:].reset_index(drop=True)
+            # بعد از window، خودِ y ممکن است NaN داشته باشد؛ همان را معیار می‌گیریم
+            valid = y.notna()
 
             # هم‌طول‌سازی با X_f
             L = min(len(valid), len(X_f))
             valid = valid.iloc[:L].astype(bool)
 
-            # فیلتر کردنِ نمونه‌ها
+            # فیلتر نهایی
             X_f = X_f.loc[valid].reset_index(drop=True)
-            y   = y.loc[valid].reset_index(drop=True)
+            y   = y.loc[valid].astype(int).reset_index(drop=True)
             try:
                 t_idx = t_idx.loc[valid].reset_index(drop=True)  # اگر with_times=True
             except NameError:
@@ -611,7 +622,26 @@ class PREPARE_DATA_FOR_TRAIN:
 
     # ================= 5) LOAD & MERGE =================
     def load_data(self) -> pd.DataFrame:
+        if not self.filepaths or not isinstance(self.filepaths, dict):
+            raise ValueError("[load_data] filepaths not provided or invalid")
+
         logging.info("[load_data] parallel load %d timeframes", len(self.filepaths))
+
+        # ⬅️ فقط فایل‌های موجود را نگه داریم؛ نبودن 30T = خطای فوری
+        existing = {tf: fp for tf, fp in self.filepaths.items() if os.path.exists(fp)}
+        missing  = {tf: fp for tf, fp in self.filepaths.items() if tf not in existing}
+
+        for tf, fp in missing.items():
+            print(f"⚠️ File not found: {os.path.abspath(fp)}")
+
+        if self.main_timeframe not in existing:
+            raise FileNotFoundError(f"[load_data] Main timeframe '{self.main_timeframe}' file is missing: "
+                                    f"{os.path.abspath(self.filepaths.get(self.main_timeframe, ''))}")
+
+        # اگر فقط 30T داری، همین کافی‌ست؛ بقیه تایم‌فریم‌ها اختیاری هستند
+        self.filepaths = existing
+        logging.info("[load_data] using %d existing timeframes (%s)",
+                    len(self.filepaths), ", ".join(sorted(self.filepaths.keys())))
 
         # ---------- 1) موازی-خوانی و مهندسی هر تایم‌فریم ----------
         dfs = Parallel(
