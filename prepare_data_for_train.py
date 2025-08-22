@@ -481,7 +481,7 @@ class PREPARE_DATA_FOR_TRAIN:
             raise ValueError(f"{close_col} missing")
 
         # y_next(t) = 1{ close(t+1) > close(t) }  → سپس یک پله شیفت می‌دهیم تا با X(t-1) تراز شود
-        y = ((data[close_col].shift(-1) - data[close_col]) > 0).shift(-1)
+        y = (data[close_col].shift(-1) - data[close_col] > 0)
 
         # در حالت predict فقط برای هم‌قدی با X یک سری صفر می‌سازیم (مقدار استفاده نمی‌شود)
         if mode != "train":
@@ -544,7 +544,7 @@ class PREPARE_DATA_FOR_TRAIN:
         tcol = f"{self.main_timeframe}_time" if f"{self.main_timeframe}_time" in data.columns else "time"
         t_idx = pd.to_datetime(data[tcol]).reset_index(drop=True)
         if len(t_idx) > 0:
-            t_idx = t_idx.iloc[1:].reset_index(drop=True)  # چون diff یک ردیف می‌سوزاند
+            t_idx = t_idx.iloc[2:].reset_index(drop=True)  # چون shift(1).diff
         if window > 1 and len(t_idx) >= window-1:
             t_idx = t_idx.iloc[window-1:].reset_index(drop=True)
 
