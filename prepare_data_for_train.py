@@ -451,7 +451,15 @@ class PREPARE_DATA_FOR_TRAIN:
             X_filled = X_corr.replace([np.inf, -np.inf], np.nan).fillna(X_corr.median())
             # 3) Mutual information
             X_scaled = MinMaxScaler().fit_transform(X_filled)
-            mi = mutual_info_classif(X_scaled, y_tr, random_state=SEED)
+
+            # ردیف‌هایی که y در آن‌ها NaN است را کنار بگذار (آخر دنباله)
+            mask = pd.Series(y_tr).notna().to_numpy()
+            if mask.sum() < 2:
+                continue
+
+            y_arr = pd.Series(y_tr).loc[mask].astype(np.int64).to_numpy(copy=False)
+            mi = mutual_info_classif(X_scaled[mask], y_arr, random_state=SEED)
+
             pool.extend(pd.Series(mi, index=X_corr.columns).nlargest(top_k).index.tolist())
         counts = pd.Series(pool).value_counts()
         # print("Feature selection finished")
@@ -472,13 +480,12 @@ class PREPARE_DATA_FOR_TRAIN:
         if close_col not in data.columns:
             raise ValueError(f"{close_col} missing")
 
-        # y_next(t) = 1{ close(t+2) > close(t+1) }  ← برچسب «بازهٔ بعدی»
-        # این هم‌راستا با هدف ماست: فیچرهای t-1 → پیش‌بینی بازه [t → t+1]
-        y = (data[close_col].shift(-1) - data[close_col] > 0).shift(-1)
+        # y_next(t) = 1{ close(t+1) > close(t) }  → سپس یک پله شیفت می‌دهیم تا با X(t-1) تراز شود
+        y = ((data[close_col].shift(-1) - data[close_col]) > 0).shift(-1)
 
-        # در حالت predict، برچسب واقعی نداریم؛ فقط برای هم‌قدی با X یک سری صفر می‌سازیم
+        # در حالت predict فقط برای هم‌قدی با X یک سری صفر می‌سازیم (مقدار استفاده نمی‌شود)
         if mode != "train":
-            y = ((data[close_col].shift(-1) - data[close_col]) > 0).astype(np.int8)
+            y = pd.Series(np.zeros(len(data), dtype=np.int8))
 
         # ستون‌ها
         time_cols = [c for c in data.columns if any(tok in c for tok in ["hour","day_of_week","is_weekend"])]
@@ -581,6 +588,11 @@ class PREPARE_DATA_FOR_TRAIN:
                 price_raw = price_raw.iloc[:-1].reset_index(drop=True)
 
 
+        # y را اگر Series است، به NumPy int64 تبدیل کن (بدون کپی اضافی)
+        try:
+            y = pd.Series(y).astype(np.int64).to_numpy(copy=False)
+        except Exception:
+            pass
 
         if with_times:
             return X_f, y, feats, price_raw, t_idx
