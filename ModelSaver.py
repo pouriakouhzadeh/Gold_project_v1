@@ -1,8 +1,7 @@
 # ModelSaver.py
-import joblib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
+import joblib, os
 
 class ModelSaver:
     """
@@ -12,6 +11,10 @@ class ModelSaver:
 
     def __init__(self, filename: str = "best_model.pkl") -> None:
         self.filename = filename
+
+    def load_full(self, model_dir: str):
+        path = os.path.join(model_dir, self.filename)
+        return joblib.load(path)
 
     def save_full(
         self,

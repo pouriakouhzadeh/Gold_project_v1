@@ -588,11 +588,10 @@ class PREPARE_DATA_FOR_TRAIN:
                 price_raw = price_raw.iloc[:-1].reset_index(drop=True)
 
 
-        # y را اگر Series است، به NumPy int64 تبدیل کن (بدون کپی اضافی)
-        try:
-            y = pd.Series(y).astype(np.int64).to_numpy(copy=False)
-        except Exception:
-            pass
+        if mode == "train":
+            y = pd.Series(y).astype(np.int64)          # Series (برای .iloc)
+        else:
+            y = pd.Series(y).astype(np.int64).to_numpy(copy=False)  # numpy در predict
 
         if with_times:
             return X_f, y, feats, price_raw, t_idx

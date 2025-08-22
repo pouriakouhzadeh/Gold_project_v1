@@ -431,7 +431,7 @@ class GeneticAlgorithmRunner:
             # map روی pool
             if "map" in TOOLBOX.__dict__:
                 TOOLBOX.unregister("map")
-            TOOLBOX.register("map", lambda f, it: list(pool.imap_unordered(f, it, chunksize=1)))
+            TOOLBOX.register("map", lambda f, it: pool.map(f, it, chunksize=1))
 
             # مقدار نسل فعلی برای هندلرها
             # اگر از چک‌پوینت آمده‌ایم، روی همان gen بنشان؛ وگرنه 0

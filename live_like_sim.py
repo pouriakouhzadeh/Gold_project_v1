@@ -21,12 +21,11 @@ import os, sys, shutil, json, math, tempfile, warnings, argparse, logging
 from typing import Dict, Tuple, List
 import numpy as np
 import pandas as pd
-
+import joblib
 warnings.filterwarnings("ignore")
 
 # --- Project imports (must be in PYTHONPATH) ---
 from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
-from ModelSaver import ModelSaver     # relies on your existing implementation
 
 # ------------------------- CLI -------------------------
 def parse_args():
@@ -64,23 +63,6 @@ def cut_by_time(df: pd.DataFrame, start, end) -> pd.DataFrame:
     m = (df["time"] >= start) & (df["time"] <= end)
     return df.loc[m].copy()
 
-def load_artifacts(model_dir: str):
-    """
-    Load everything saved by your ModelSaver.save_full(...)
-    Expected keys (by your GA code): pipeline, hyperparams, window_size, neg_thr, pos_thr,
-    feats, feat_mask, train_window_cols
-    """
-    ms = ModelSaver()
-    arte = ms.load_full(model_dir)   # Assumes your ModelSaver has a symmetric load_full
-    # Normalise keys
-    pipeline = arte.get("pipeline") or arte.get("model") or arte.get("pipeline_obj")
-    window   = int(arte.get("window_size") or arte.get("window") or 1)
-    neg_thr  = float(arte.get("neg_thr", 0.5))
-    pos_thr  = float(arte.get("pos_thr", 0.5))
-    final_cols = arte.get("train_window_cols") or arte.get("final_cols") or arte.get("feats") or []
-    if not isinstance(final_cols, list):
-        final_cols = list(final_cols)
-    return pipeline, window, neg_thr, pos_thr, final_cols
 
 def decide(prob: float, neg_thr: float, pos_thr: float):
     """Return -1 (∅), 0 (short/cash), or 1 (long)."""
@@ -125,9 +107,17 @@ def main():
     main_df = raw_df["30T"]
 
     # --- Load model artefacts ---
+
     try:
-        pipeline, window, neg_thr, pos_thr, final_cols = load_artifacts(args.model_dir)
-    except Exception as e:
+        payload = joblib.load(os.path.join(args.model_dir, "best_model.pkl"))
+        pipeline  = payload["pipeline"]
+        window    = int(payload.get("window_size", 1))
+        neg_thr   = float(payload.get("neg_thr", 0.5))
+        pos_thr   = float(payload.get("pos_thr", 0.5))
+        final_cols = payload.get("train_window_cols") or payload.get("feats") or []
+        if not isinstance(final_cols, list):
+            final_cols = list(final_cols)
+    except Exception:
         log.exception("Failed to load model artifacts from %s", args.model_dir)
         sys.exit(1)
 
@@ -195,7 +185,7 @@ def main():
                 window=window,
                 selected_features=final_cols,
                 mode="predict",
-                predict_drop_last=True  # ← remove the unstable last (cutoff) row
+                predict_drop_last=False  # ← remove the unstable last (cutoff) row
             )
             if X_live.empty:
                 # Not enough rows to construct stable features
