@@ -478,7 +478,7 @@ class PREPARE_DATA_FOR_TRAIN:
 
         # در حالت predict، برچسب واقعی نداریم؛ فقط برای هم‌قدی با X یک سری صفر می‌سازیم
         if mode != "train":
-            y = pd.Series(np.zeros(len(data), dtype="Int64"))
+            y = ((data[close_col].shift(-1) - data[close_col]) > 0).astype(np.int8)
 
         # ستون‌ها
         time_cols = [c for c in data.columns if any(tok in c for tok in ["hour","day_of_week","is_weekend"])]
