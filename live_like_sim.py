@@ -323,8 +323,9 @@ def main():
                     window=window,
                     selected_features=final_cols,
                     mode="predict",
-                    predict_drop_last=True
+                    predict_drop_last=False  # ← مثل Train: سیگنالِ زمان t را نگه دار
                 )
+
                 if X_live.empty:
                     logging.getLogger("live-like").warning("X_live empty at cutoff %s (skip)", cutoff_time)
                     if not args.keep_tmp: shutil.rmtree(iter_dir, ignore_errors=True)
