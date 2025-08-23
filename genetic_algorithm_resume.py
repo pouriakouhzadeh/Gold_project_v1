@@ -637,11 +637,10 @@ class GeneticAlgorithmRunner:
         # --- هم‌ترازی ایمن: اگر به هر دلیل طول‌ها متفاوت بود، کوتاه کن
         if len(price_ser) != len(y_pred):
             min_len = min(len(price_ser), len(y_pred))
-            LOGGER.warning("Length mismatch (prices=%d, preds=%d) → trimming to %d",
-                        len(price_ser), len(y_pred), min_len)
             price_ser = price_ser.iloc[:min_len].reset_index(drop=True)
-            y         = y.iloc[:min_len].reset_index(drop=True)
-            y_pred    = y_pred[:min_len]
+            # قبلی: y = y.iloc[:min_len].reset_index(drop=True)
+            y = y.iloc[:min_len].reset_index(drop=True) if hasattr(y, "iloc") else y[:min_len]
+            y_pred = y_pred[:min_len]
 
         mask = y_pred != -1                    # تنها نمونه‌های معامله‌شده
         conf = float(mask.mean())              # نسبتِ دارای پیش‌بینی

@@ -96,9 +96,9 @@ class ModelPipeline:
         if solver == "liblinear" and multi_class == "multinomial":
             multi_class = "auto"
 
-        extra_multi = {}
-        if multi_class != "auto":
-            extra_multi["multi_class"] = multi_class
+        # extra_multi = {}
+        # if multi_class != "auto":
+        #     extra_multi["multi_class"] = multi_class
 
         base_lr = LogisticRegression(
             C=C,
@@ -111,9 +111,8 @@ class ModelPipeline:
             warm_start=True,
             random_state=42,
             n_jobs=-1,
-            **extra_multi,
+            # هیچ multi_classـی پاس نده
         )
-
         # --- Inner estimator with preprocessing INSIDE (no leakage) ---
         inner_estimator = ImbPipeline([
             ('scaler', StandardScaler()),

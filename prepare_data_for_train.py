@@ -76,11 +76,15 @@ def _timedelta_to_seconds(df: pd.DataFrame):
 
 # ---------------- SAFE RESAMPLE ----------------
 
-def _safe_agg_group(grp: pd.DataFrame, agg_dict: dict[str, callable]):
+def _safe_agg_group(key: pd.Timestamp, grp: pd.DataFrame, agg_dict: dict[str, callable]):
     if len(grp) >= 2:
-        return grp.iloc[:-1].agg(agg_dict).to_frame().T
+        out = grp.iloc[:-1].agg(agg_dict)
+        out.name = key                # اندیس = کلید گروه (لبهٔ چپ با فرکانس 30T)
+        return out.to_frame().T
     if len(grp) == 1:
-        return grp.iloc[[0]]
+        g = grp.iloc[[0]].copy()
+        g.index = pd.DatetimeIndex([key])
+        return g
     return None
 
 # ---------------- MAIN CLASS ----------------
@@ -389,7 +393,10 @@ class PREPARE_DATA_FOR_TRAIN:
                 col: (base_aggs[col] if col in base_aggs else (lambda x: x.shift(1).iloc[-1] if len(x) > 1 else np.nan))
                 for col in df.columns
             }
-            resampled_rows = [_safe_agg_group(grp, agg_dict) for _, grp in df.groupby(pd.Grouper(freq=self.main_timeframe))]
+            resampled_rows = [
+            _safe_agg_group(key, grp, agg_dict)
+            for key, grp in df.groupby(pd.Grouper(freq=self.main_timeframe))
+            ]
             df = pd.concat([r for r in resampled_rows if r is not None]) if resampled_rows else pd.DataFrame(columns=df.columns)
             df = df[~df.index.duplicated(keep="last")]
             df.replace([np.inf, -np.inf], np.nan, inplace=True); df.ffill(inplace=True); df.dropna(how="all", inplace=True)
@@ -588,10 +595,13 @@ class PREPARE_DATA_FOR_TRAIN:
                 price_raw = price_raw.iloc[:-1].reset_index(drop=True)
 
 
+        # --- normalize y type just before return ---
         if mode == "train":
-            y = pd.Series(y).astype(np.int64)          # Series (برای .iloc)
+            # در Train لازم است Series باشد تا با TimeSeriesSplit/.iloc سازگار بماند
+            y = pd.Series(y, dtype="int64").reset_index(drop=True)
         else:
-            y = pd.Series(y).astype(np.int64).to_numpy(copy=False)  # numpy در predict
+            # در Predict از y استفاده نمی‌کنیم؛ فقط هم‌قد X_f باشد
+            y = np.zeros(len(X_f), dtype=np.int64)
 
         if with_times:
             return X_f, y, feats, price_raw, t_idx
