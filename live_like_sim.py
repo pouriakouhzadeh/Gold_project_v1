@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Live-like rolling simulation with 4 TFs (5m/15m/30m/1h).
-- Cut data strictly up to cutoff_time (inclusive).
-- Build features in predict mode with predict_drop_last=True (drop unstable last row).
-- Predict last stable row → decision for [cutoff → cutoff+1].
-- Compare vs true next-bar direction on 30T.
-- Stream verbose progress to console.
+- Cuts raw CSVs to [start .. cutoff] (inclusive).
+- Builds features in predict mode with predict_drop_last=True (drop unstable last row).
+- Predicts last stable row → decision for [cutoff → cutoff+1].
+- Compares vs true next-bar direction on 30T.
+- Streams detailed logs to console.
 
-Run example:
+Example:
 python3 live_like_sim.py \
   --data-dir /home/pouria/gold_project9 \
   --symbol XAUUSD \
@@ -25,34 +25,66 @@ import numpy as np
 import pandas as pd
 import joblib
 
-# ---------- مهم: برای فایل‌های pickle بزرگ/تو در تو ----------
+# برای pickle های بزرگ/تو در تو
 sys.setrecursionlimit(200_000)
-
 warnings.filterwarnings("ignore")
 
 # --- Project imports ---
-# مهم: قبل از load کردن pickle، کلاس‌های مربوطه را import کن
+# مهم: قبل از load کردن pickle، ماژول را import و monkey-patch می‌کنیم
 try:
-    import model_pipeline  # لازم برای _CompatWrapper و Pipeline
-except Exception as _e:
-    # اگر نبود هم بعداً هنگام joblib.load پیام FATAL می‌دهیم
+    import model_pipeline
+    # اگر کلاس وجود دارد، قبل از joblib.load آن را patch کن تا recursion رخ ندهد
+    if hasattr(model_pipeline, "_CompatWrapper"):
+        _CW = model_pipeline._CompatWrapper
+
+        def _cw_safe_getattr(self, item):
+            # روی dunderها delegation نکن؛ اجازه بده AttributeError عادی برگردد
+            if item.startswith("__") and item.endswith("__"):
+                raise AttributeError(item)
+            # در حین unpickle ممکن است _model هنوز set نشده باشد
+            try:
+                target = object.__getattribute__(self, "_model")
+            except Exception:
+                raise AttributeError(item)
+            # جلوگیری از لوپ
+            if target is self or target is None:
+                raise AttributeError(item)
+            return getattr(target, item)
+
+        def _cw_getstate(self):
+            # فقط state لازم را ذخیره کن
+            return {"_model": getattr(self, "_model", None),
+                    "_inner": getattr(self, "_inner", None)}
+
+        def _cw_setstate(self, state):
+            self._model = state.get("_model", None)
+            self._inner = state.get("_inner", None)
+            self.named_steps = getattr(self._inner, "named_steps", {})
+            self.steps = getattr(self._inner, "steps", [])
+
+        # Monkey-patch
+        _CW.__getattr__ = _cw_safe_getattr
+        _CW.__getstate__ = _cw_getstate
+        _CW.__setstate__ = _cw_setstate
+
+except Exception:
+    # اگر نبود، ادامه می‌دهیم؛ در joblib.load خطا را خواهیم دید
     pass
 
 from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
 
 TF_MAP = {"30T": "M30", "15T": "M15", "5T": "M5", "1H": "H1"}
 
-# -------------------- logging that ALWAYS shows --------------------
+# -------------------- logging --------------------
 def build_logger(verbose: bool) -> logging.Logger:
     logger = logging.getLogger("live-like")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-    logger.propagate = False  # don’t bubble to root
+    logger.propagate = False
     for h in list(logger.handlers):
         logger.removeHandler(h)
     h = logging.StreamHandler(stream=sys.stdout)
     h.setLevel(logging.DEBUG if verbose else logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
-    h.setFormatter(fmt)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
     logger.addHandler(h)
     return logger
 
@@ -85,7 +117,7 @@ def expect_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def cut_by_time(df: pd.DataFrame, start, end) -> pd.DataFrame:
-    m = (df["time"] >= start) & (df["time"] <= end)  # inclusive end
+    m = (df["time"] >= start) & (df["time"] <= end)  # inclusive
     return df.loc[m].copy()
 
 def decide(prob: float, neg_thr: float, pos_thr: float) -> int:
@@ -147,7 +179,7 @@ def main():
             pass
         return
 
-    # وارد کردن وابستگی‌های اسکیک‌لِرن/ایمبلرن قبل از load (برای ایمنی)
+    # Pre-import sklearn/imblearn + patch_sklearn (ایمنی)
     try:
         import sklearn  # noqa
         import imblearn # noqa
@@ -178,7 +210,6 @@ def main():
         print(f"[FATAL] Invalid model payload structure: {e}", flush=True)
         return
 
-    # sanity
     for need in ("predict_proba", "predict"):
         if not hasattr(pipeline, need):
             print(f"[FATAL] Loaded pipeline lacks `{need}` method.", flush=True)
@@ -187,7 +218,7 @@ def main():
     log.info("Model loaded: window=%d thr=(neg=%.3f,pos=%.3f) final_cols=%d",
              window, neg_thr, pos_thr, len(final_cols))
 
-    # 4) Compute iteration bounds (need next bar for ground truth)
+    # 4) Compute iteration bounds
     N = len(main_df)
     need_min = args.window_rows + 2
     if N < need_min:
@@ -222,7 +253,7 @@ def main():
             cutoff_time = pd.to_datetime(main_df.loc[i, "time"])
             start_time  = pd.to_datetime(main_df.loc[i - (args.window_rows - 1), "time"])
 
-            # Build per-iteration CSVs up to cutoff_time (inclusive)
+            # Per-iteration CSVs up to cutoff (inclusive)
             iter_dir = os.path.join(tmp_root, f"iter_{k:06d}")
             os.makedirs(iter_dir, exist_ok=True)
             tmp_paths = {}
@@ -259,7 +290,7 @@ def main():
                 window=window,
                 selected_features=final_cols,
                 mode="predict",
-                predict_drop_last=True   # CRUCIAL: drop cutoff row to avoid instability
+                predict_drop_last=True   # حیاتی برای عدم اتکا به کندل cutoff
             )
             if X_live.empty:
                 log.warning("X_live empty at cutoff %s (skip)", cutoff_time)
@@ -267,7 +298,6 @@ def main():
                     shutil.rmtree(iter_dir, ignore_errors=True)
                 continue
 
-            # Align columns and predict
             if not final_cols:
                 final_cols = list(X_live.columns)
                 log.warning("final_cols was empty; using X_live columns (%d).", len(final_cols))
@@ -343,12 +373,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# python3 live_like_sim.py \
-#   --data-dir /home/pouria/gold_project9 \
-#   --symbol XAUUSD \
-#   --model-dir /home/pouria/gold_project9 \
-#   --window-rows 4000 \
-#   --tail-iters 4000 \
-#   --verbose
