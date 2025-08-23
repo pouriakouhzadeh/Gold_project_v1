@@ -25,9 +25,19 @@ import numpy as np
 import pandas as pd
 import joblib
 
+# ---------- مهم: برای فایل‌های pickle بزرگ/تو در تو ----------
+sys.setrecursionlimit(200_000)
+
 warnings.filterwarnings("ignore")
 
 # --- Project imports ---
+# مهم: قبل از load کردن pickle، کلاس‌های مربوطه را import کن
+try:
+    import model_pipeline  # لازم برای _CompatWrapper و Pipeline
+except Exception as _e:
+    # اگر نبود هم بعداً هنگام joblib.load پیام FATAL می‌دهیم
+    pass
+
 from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
 
 TF_MAP = {"30T": "M30", "15T": "M15", "5T": "M5", "1H": "H1"}
@@ -37,11 +47,8 @@ def build_logger(verbose: bool) -> logging.Logger:
     logger = logging.getLogger("live-like")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.propagate = False  # don’t bubble to root
-
-    # remove old handlers if rerun
     for h in list(logger.handlers):
         logger.removeHandler(h)
-
     h = logging.StreamHandler(stream=sys.stdout)
     h.setLevel(logging.DEBUG if verbose else logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
@@ -117,13 +124,9 @@ def main():
                 continue
         try:
             df = pd.read_csv(path)
-        except Exception as e:
-            print(f"[FATAL] Failed to read CSV {path}: {e}", flush=True)
-            return
-        try:
             df = expect_cols(df)
         except Exception as e:
-            print(f"[FATAL] Bad columns in {path}: {e}", flush=True)
+            print(f"[FATAL] Failed to read/parse {path}: {e}", flush=True)
             return
         raw_df[tf] = df
         log.info("Loaded %s rows for TF=%s", len(df), tf)
@@ -138,14 +141,26 @@ def main():
     log.info("Loading model artefacts: %s", model_path)
     if not os.path.isfile(model_path):
         print(f"[FATAL] best_model.pkl not found at: {model_path}", flush=True)
-        # list directory for debugging
         try:
             print("Directory listing:", os.listdir(args.model_dir), flush=True)
         except Exception:
             pass
         return
 
+    # وارد کردن وابستگی‌های اسکیک‌لِرن/ایمبلرن قبل از load (برای ایمنی)
     try:
+        import sklearn  # noqa
+        import imblearn # noqa
+        from sklearnex import patch_sklearn
+        patch_sklearn(verbose=False)
+    except Exception:
+        pass
+
+    try:
+        payload = joblib.load(model_path)
+    except RecursionError as e:
+        print(f"[WARN] RecursionError on joblib.load: {e}. Retrying with higher limit…", flush=True)
+        sys.setrecursionlimit(1_000_000)
         payload = joblib.load(model_path)
     except Exception as e:
         print(f"[FATAL] joblib.load failed: {e}", flush=True)
@@ -162,6 +177,12 @@ def main():
     except Exception as e:
         print(f"[FATAL] Invalid model payload structure: {e}", flush=True)
         return
+
+    # sanity
+    for need in ("predict_proba", "predict"):
+        if not hasattr(pipeline, need):
+            print(f"[FATAL] Loaded pipeline lacks `{need}` method.", flush=True)
+            return
 
     log.info("Model loaded: window=%d thr=(neg=%.3f,pos=%.3f) final_cols=%d",
              window, neg_thr, pos_thr, len(final_cols))
@@ -248,15 +269,14 @@ def main():
 
             # Align columns and predict
             if not final_cols:
-                # Fallback: use whatever was built (shouldn't normally happen)
                 final_cols = list(X_live.columns)
                 log.warning("final_cols was empty; using X_live columns (%d).", len(final_cols))
+
             X_live = X_live.reindex(columns=final_cols, fill_value=0.0)
 
             try:
                 probs = pipeline.predict_proba(X_live)[:, 1]
             except Exception:
-                # Some wrappers want raw ndarray
                 probs = pipeline.predict_proba(X_live.values)[:, 1]
 
             p_last = float(probs[-1])
@@ -323,3 +343,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# python3 live_like_sim.py \
+#   --data-dir /home/pouria/gold_project9 \
+#   --symbol XAUUSD \
+#   --model-dir /home/pouria/gold_project9 \
+#   --window-rows 4000 \
+#   --tail-iters 4000 \
+#   --verbose
