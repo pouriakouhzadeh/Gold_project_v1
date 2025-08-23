@@ -3,13 +3,12 @@
 """
 Live-like rolling simulation with 4 TFs (5m/15m/30m/1h).
 
-- در هر تکرار:
-  1) کات کردن CSVها تا بازه [start .. cutoff=t] (شامل t)
-  2) ساخت فیچرها در حالت predict با منطق بدون لیکیج (shift(1).diff)
-  3) ❗️بدون حذف ردیف آخر (predict_drop_last=False) تا ردیف آخر X همان «سیگنال در t» باشد
-  4) گرفتن p_last و نگاشت به {BUY/SELL/NONE} با آستانه‌ها
-  5) سنجش با y_true = 1{ close(t+1) > close(t) }
-  6) چاپ لاگ‌های جزئی و جمع‌بند‌ی
+تفاوت کلیدی این نسخه:
+- حقیقت (y_true) از سریِ 30T «پاک‌سازی‌شده دقیقاً مثل Train» تولید می‌شود
+  (ClearData.clean + حذف weekend + حذف duplicate) تا با آموزش یکسان باشد.
+- فیچرها با منطق بدون لیکیج ساخته می‌شوند (shift(1).diff) و
+  ردیف آخر حذف نمی‌شود (predict_drop_last=False) چون پایدار است.
+- چک هم‌ترازی: آخرین زمان فیچر باید = cutoff باشد؛ در غیر این صورت skip.
 
 اجرا:
 python3 live_like_sim.py \
@@ -31,7 +30,7 @@ import joblib
 warnings.filterwarnings("ignore")
 sys.setrecursionlimit(200_000)
 
-# --- اگر _CompatWrapper قدیمی باشد، برای ایمنی پچِ سبک ---
+# --- ایمنی برای مدل‌های pickle-شده با Wrapper قدیمی ---
 try:
     import model_pipeline
     if hasattr(model_pipeline, "_CompatWrapper"):
@@ -54,13 +53,14 @@ try:
             self._inner = st.get("_inner", None)
             self.named_steps = getattr(self._inner, "named_steps", {})
             self.steps = getattr(self._inner, "steps", [])
-        _CW.__getattr__ = _cw_safe_getattr
-        _CW.__getstate__ = _cw_getstate
-        _CW.__setstate__ = _cw_setstate
+        _CW.__getattr__   = _cw_safe_getattr
+        _CW.__getstate__  = _cw_getstate
+        _CW.__setstate__  = _cw_setstate
 except Exception:
     pass
 
 from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
+from clear_data import ClearData  # ← برای یکسان‌سازی Truth با Train
 
 TF_MAP = {"30T": "M30", "15T": "M15", "5T": "M5", "1H": "H1"}
 
@@ -109,6 +109,32 @@ def decide(prob: float, neg_thr: float, pos_thr: float) -> int:
     if prob >= pos_thr: return 1   # BUY
     return -1                      # NONE
 
+def build_truth_map(raw30: pd.DataFrame) -> pd.Series:
+    """
+    حقیقت را دقیقاً مثل Train می‌سازد:
+    - ClearData.clean
+    - حذف weekend
+    - حذف time تکراری
+    خروجی: Series با ایندکس Datetime (time) و مقدار {0/1} برای جهت کندل بعد.
+    """
+    df = ClearData().clean(raw30.copy())
+    if "time" not in df.columns:
+        raise ValueError("'time' missing in 30T CSV")
+    if "close" not in df.columns:
+        raise ValueError("'close' missing in 30T CSV")
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"]).sort_values("time")
+    # حذف weekend مثل Train.load_data()
+    df["dow"] = df["time"].dt.dayofweek
+    df = df.loc[~df["dow"].isin([5, 6])].copy()
+    df.drop(columns=["dow"], inplace=True)
+    # حذف duplications روی time
+    df = df.loc[~df["time"].duplicated(keep="last")].reset_index(drop=True)
+    # y_true = 1{ close(t+1) > close(t) }
+    y = (df["close"].shift(-1) - df["close"] > 0).astype("Int8")
+    y.index = pd.DatetimeIndex(df["time"])
+    return y  # ایندکس = time، مقدار = 0/1/NaN برای ردیف آخر
+
 def main():
     args = parse_args()
     log = build_logger(args.verbose)
@@ -150,7 +176,11 @@ def main():
         return
     main_df = raw_df["30T"]
 
-    # 3) Load model payload
+    # 3) Build truth map (یک‌بار برای همهٔ تکرارها)
+    truth_map = build_truth_map(main_df)
+    log.info("Truth map built: keys=%d (cleaned 30T timeline)", truth_map.notna().sum())
+
+    # 4) Load model payload
     model_path = os.path.join(args.model_dir, "best_model.pkl")
     log.info("Loading model artefacts: %s", model_path)
     if not os.path.isfile(model_path):
@@ -197,7 +227,7 @@ def main():
     log.info("Model loaded: window=%d thr=(neg=%.3f,pos=%.3f) final_cols=%d warmup_rows=%d",
              window, neg_thr, pos_thr, len(final_cols), warmup_rows)
 
-    # 4) Iter bounds
+    # 5) Iter bounds
     N = len(main_df)
     need_min = args.window_rows + 2
     if N < need_min:
@@ -213,12 +243,14 @@ def main():
         print("[FATAL] Nothing to simulate. Adjust --tail-iters/--window-rows.", flush=True)
         return
 
-    # 5) Accumulators
+    # 6) Accumulators
     wins = losses = unpred = preds = 0
     tp = tn = fp = fn = 0
     buy_n = sell_n = none_n = 0
+    skipped_misaligned = 0
+    skipped_no_truth   = 0
 
-    # 6) Temp dir
+    # 7) Temp dir
     tmp_root = tempfile.mkdtemp(prefix="live_like_")
     log.info("Temp root: %s", tmp_root)
 
@@ -228,7 +260,13 @@ def main():
             cutoff_time = pd.to_datetime(main_df.loc[i, "time"])
             start_time  = pd.to_datetime(main_df.loc[i - (args.window_rows - 1), "time"])
 
-            # Per-iteration cut
+            # اگر TruthMap برای این cutoff موجود نباشد، عمداً skip
+            # (یعنی این زمان در خطِ زمانی پاک‌سازی‌شده وجود ندارد)
+            if cutoff_time not in truth_map.index or pd.isna(truth_map.loc[cutoff_time]):
+                skipped_no_truth += 1
+                continue
+
+            # Per-iteration cut (تا t شامل)
             iter_dir = os.path.join(tmp_root, f"iter_{k:06d}")
             os.makedirs(iter_dir, exist_ok=True)
             tmp_paths = {}
@@ -241,40 +279,35 @@ def main():
                 tmp_paths[tf] = out_path
 
             if "30T" not in tmp_paths:
-                log.warning("No 30T rows at cutoff %s (skip)", cutoff_time)
                 if not args.keep_tmp: shutil.rmtree(iter_dir, ignore_errors=True)
                 continue
 
-            # Prepare (STRICT disk feed), NO drop-last
+            # آماده‌سازی فیچرها (STRICT feed)، بدون drop-last
             prep = PREPARE_DATA_FOR_TRAIN(
                 filepaths=tmp_paths, main_timeframe="30T",
                 verbose=False, fast_mode=True, strict_disk_feed=True
             )
             merged = prep.load_data()
             if merged.empty:
-                log.warning("Merged empty at cutoff %s (skip)", cutoff_time)
                 if not args.keep_tmp: shutil.rmtree(iter_dir, ignore_errors=True)
                 continue
 
-            # with_times=True → برای چک هم‌ترازی
+            # با زمان‌ها برای هم‌ترازی
             X_live, _, _, _, t_idx = prep.ready(
                 merged,
                 window=window,
                 selected_features=final_cols,
                 mode="predict",
                 with_times=True,
-                predict_drop_last=False   # ❗️ مهم: آخرین ردیف همان t است
+                predict_drop_last=False   # ❗️ آخرین ردیف همان t است
             )
             if X_live.empty or t_idx is None or len(t_idx) == 0:
-                log.warning("X_live/t_idx empty at cutoff %s (skip)", cutoff_time)
                 if not args.keep_tmp: shutil.rmtree(iter_dir, ignore_errors=True)
                 continue
 
-            # اطمینان از هم‌ترازی: آخرین زمان فیچر باید = cutoff باشد
             feat_time = pd.to_datetime(t_idx.iloc[-1])
             if pd.isna(feat_time) or feat_time != cutoff_time:
-                log.warning("Feature time misaligned (feat=%s vs cutoff=%s). Skipped.",
-                            feat_time, cutoff_time)
+                skipped_misaligned += 1
                 if not args.keep_tmp: shutil.rmtree(iter_dir, ignore_errors=True)
                 continue
 
@@ -289,12 +322,10 @@ def main():
             p_last = float(probs[-1])
             pred = decide(p_last, neg_thr, pos_thr)
 
-            # Truth for [t → t+1] بر اساس 30T اصلی
-            c0 = float(main_df.loc[i,   "close"])
-            c1 = float(main_df.loc[i+1, "close"])
-            y_true = 1 if (c1 - c0) > 0 else 0
+            # حقیقتِ [t → t+1] از TruthMap
+            y_true = int(truth_map.loc[cutoff_time])
 
-            # Update metrics
+            # شمارنده‌ها
             if pred == -1:
                 unpred += 1; none_n += 1; verdict = "UNPRED"
             else:
@@ -336,6 +367,7 @@ def main():
         print(f"Accuracy (predicted only): {acc:.2f}%  | Coverage: {coverage:.2f}%")
         print(f"Decisions  → BUY: {buy_n}  SELL: {sell_n}  NONE: {none_n}")
         print(f"Confusion  → TP: {tp}  TN: {tn}  FP: {fp}  FN: {fn}")
+        print(f"Skipped    → misaligned: {skipped_misaligned} | no-truth(after clean): {skipped_no_truth}")
         print("================================\n", flush=True)
 
     finally:
@@ -346,7 +378,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 # python3 live_like_sim.py \
 #   --data-dir /home/pouria/gold_project9 \
