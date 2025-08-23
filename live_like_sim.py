@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Live-like rolling simulation with 4 TFs (5m/15m/30m/1h).
+Live-like rolling simulation with 4 TFs (5m/15m/30m/1h), aligned to *pre-decision* logic:
 
-تفاوت کلیدی این نسخه:
-- حقیقت (y_true) از سریِ 30T «پاک‌سازی‌شده دقیقاً مثل Train» تولید می‌شود
-  (ClearData.clean + حذف weekend + حذف duplicate) تا با آموزش یکسان باشد.
-- فیچرها با منطق بدون لیکیج ساخته می‌شوند (shift(1).diff) و
-  ردیف آخر حذف نمی‌شود (predict_drop_last=False) چون پایدار است.
-- چک هم‌ترازی: آخرین زمان فیچر باید = cutoff باشد؛ در غیر این صورت skip.
+در هر تکرار با cutoff = t:
+  1) هر ۴ CSV به بازه [start .. t] (شامل t) کات می‌شود.
+  2) ویژگی‌ها با PREPARE_DATA_FOR_TRAIN در حالت predict ساخته می‌شوند، **اما ردیف آخر حذف می‌شود**
+     (predict_drop_last=True) تا آخرین سطر X مربوط به **t-1** باشد.
+  3) پیش‌بینی از آخرین سطر X (t-1) گرفته می‌شود → تصمیم برای بازه [t → t+1].
+  4) حقیقت y_true برای [t → t+1] از سری 30T «پاک‌سازیِ دقیقاً مثل Train» ساخته می‌شود.
+  5) همه‌چیز روی کنسول استریم می‌شود (پروب، pred، جمع‌آمار، و زمان آخرین فیچر).
 
 اجرا:
 python3 live_like_sim.py \
@@ -30,7 +31,7 @@ import joblib
 warnings.filterwarnings("ignore")
 sys.setrecursionlimit(200_000)
 
-# --- ایمنی برای مدل‌های pickle-شده با Wrapper قدیمی ---
+# --- ایمنی برای pickleهای قدیمی با Wrapper ---
 try:
     import model_pipeline
     if hasattr(model_pipeline, "_CompatWrapper"):
@@ -60,10 +61,11 @@ except Exception:
     pass
 
 from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
-from clear_data import ClearData  # ← برای یکسان‌سازی Truth با Train
+from clear_data import ClearData  # برای ساخت Truth همسان با Train
 
 TF_MAP = {"30T": "M30", "15T": "M15", "5T": "M5", "1H": "H1"}
 
+# -------------------- logging --------------------
 def build_logger(verbose: bool) -> logging.Logger:
     lg = logging.getLogger("live-like")
     lg.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -75,19 +77,22 @@ def build_logger(verbose: bool) -> logging.Logger:
     lg.addHandler(h)
     return lg
 
+# -------------------- CLI --------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Live-like rolling backtest")
-    p.add_argument("--data-dir", default="/home/pouria/gold_project9")
-    p.add_argument("--symbol", default="XAUUSD")
-    p.add_argument("--model-dir", default=".")
+    p = argparse.ArgumentParser(description="Live-like rolling backtest (pre-decision alignment)")
+    p.add_argument("--data-dir", default="/home/pouria/gold_project9",
+                   help="Directory with raw CSVs (XAUUSD_M30.csv, ...)")
+    p.add_argument("--symbol", default="XAUUSD", help="Symbol file prefix")
+    p.add_argument("--model-dir", default=".", help="Folder containing best_model.pkl")
     p.add_argument("--window-rows", type=int, default=4000,
-                   help="طول پنجرهٔ رولتایم روی 30T (ردیف).")
+                   help="Rolling window length over 30T (rows).")
     p.add_argument("--tail-iters", type=int, default=4000,
-                   help="فقط K تکرار آخر را اجرا کن.")
-    p.add_argument("--keep-tmp", action="store_true")
-    p.add_argument("--verbose", action="store_true")
+                   help="Run ONLY the last K iterations (K last cutoffs).")
+    p.add_argument("--keep-tmp", action="store_true", help="Keep per-iteration temp CSVs")
+    p.add_argument("--verbose", action="store_true", help="Verbose logging")
     return p.parse_args()
 
+# -------------------- helpers --------------------
 def expect_cols(df: pd.DataFrame) -> pd.DataFrame:
     if "time" not in df.columns:
         for cand in ("Time", "timestamp", "datetime", "Date"):
@@ -111,30 +116,28 @@ def decide(prob: float, neg_thr: float, pos_thr: float) -> int:
 
 def build_truth_map(raw30: pd.DataFrame) -> pd.Series:
     """
-    حقیقت را دقیقاً مثل Train می‌سازد:
+    حقیقت را دقیقاً مثل Train می‌سازیم:
     - ClearData.clean
     - حذف weekend
-    - حذف time تکراری
-    خروجی: Series با ایندکس Datetime (time) و مقدار {0/1} برای جهت کندل بعد.
+    - حذف duplicate روی time
+    سپس y_true(t) = 1{close(t+1) > close(t)} با ایندکس = time(t).
     """
     df = ClearData().clean(raw30.copy())
-    if "time" not in df.columns:
-        raise ValueError("'time' missing in 30T CSV")
-    if "close" not in df.columns:
-        raise ValueError("'close' missing in 30T CSV")
+    if "time" not in df.columns or "close" not in df.columns:
+        raise ValueError("30T CSV must contain 'time' and 'close'")
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
     df = df.dropna(subset=["time"]).sort_values("time")
-    # حذف weekend مثل Train.load_data()
-    df["dow"] = df["time"].dt.dayofweek
-    df = df.loc[~df["dow"].isin([5, 6])].copy()
-    df.drop(columns=["dow"], inplace=True)
-    # حذف duplications روی time
+    # حذف weekend مثل Train.load_data():
+    dow = df["time"].dt.dayofweek
+    df = df.loc[~dow.isin([5, 6])].copy()
+    # حذف duplications:
     df = df.loc[~df["time"].duplicated(keep="last")].reset_index(drop=True)
-    # y_true = 1{ close(t+1) > close(t) }
+    # حقیقت:
     y = (df["close"].shift(-1) - df["close"] > 0).astype("Int8")
     y.index = pd.DatetimeIndex(df["time"])
-    return y  # ایندکس = time، مقدار = 0/1/NaN برای ردیف آخر
+    return y  # ایندکس: time(t)
 
+# -------------------- main --------------------
 def main():
     args = parse_args()
     log = build_logger(args.verbose)
@@ -153,15 +156,16 @@ def main():
     for tf, pth in base_csvs.items():
         log.info("CSV[%s] => %s (exists=%s)", tf, pth, os.path.isfile(pth))
 
-    # 2) Load raw
+    # 2) Load raw CSVs
     raw_df: Dict[str, pd.DataFrame] = {}
     for tf, pth in base_csvs.items():
         if not os.path.isfile(pth):
             if tf == "30T":
                 print(f"[FATAL] Main TF file missing: {pth}", flush=True)
                 return
-            log.warning("Missing CSV for %s: %s (skip)", tf, pth)
-            continue
+            else:
+                log.warning("Missing CSV for %s: %s (skip)", tf, pth)
+                continue
         try:
             df = pd.read_csv(pth)
             df = expect_cols(df)
@@ -176,11 +180,11 @@ def main():
         return
     main_df = raw_df["30T"]
 
-    # 3) Build truth map (یک‌بار برای همهٔ تکرارها)
+    # 3) Truth map (once)
     truth_map = build_truth_map(main_df)
     log.info("Truth map built: keys=%d (cleaned 30T timeline)", truth_map.notna().sum())
 
-    # 4) Load model payload
+    # 4) Load model artefacts
     model_path = os.path.join(args.model_dir, "best_model.pkl")
     log.info("Loading model artefacts: %s", model_path)
     if not os.path.isfile(model_path):
@@ -223,11 +227,11 @@ def main():
             print(f"[FATAL] Loaded pipeline lacks `{need}` method.", flush=True)
             return
 
-    warmup_rows = (window - 1) + 2  # window-stack + (shift(1).diff)
+    warmup_rows = (window - 1) + 2  # پنجره‌سازی + (shift(1).diff)
     log.info("Model loaded: window=%d thr=(neg=%.3f,pos=%.3f) final_cols=%d warmup_rows=%d",
              window, neg_thr, pos_thr, len(final_cols), warmup_rows)
 
-    # 5) Iter bounds
+    # 5) Iter bounds روی سری خام 30T (فقط برای تعیین t)
     N = len(main_df)
     need_min = args.window_rows + 2
     if N < need_min:
@@ -235,7 +239,7 @@ def main():
         return
 
     base_start = args.window_rows - 1   # inclusive
-    end_idx    = N - 2                  # need i+1 for truth
+    end_idx    = N - 2                  # نیاز به i+1 برای حقیقت
     start_idx  = max(base_start, end_idx - (args.tail_iters or (end_idx-base_start+1)) + 1)
     total_iters = end_idx - start_idx + 1
     print(f"[INFO] N={N} | start_idx={start_idx} | end_idx={end_idx} | total_iters={total_iters}", flush=True)
@@ -260,8 +264,7 @@ def main():
             cutoff_time = pd.to_datetime(main_df.loc[i, "time"])
             start_time  = pd.to_datetime(main_df.loc[i - (args.window_rows - 1), "time"])
 
-            # اگر TruthMap برای این cutoff موجود نباشد، عمداً skip
-            # (یعنی این زمان در خطِ زمانی پاک‌سازی‌شده وجود ندارد)
+            # اگر t در TruthMap نیست (به‌خاطر پاک‌سازی/Weekend)، skip
             if cutoff_time not in truth_map.index or pd.isna(truth_map.loc[cutoff_time]):
                 skipped_no_truth += 1
                 continue
@@ -271,7 +274,7 @@ def main():
             os.makedirs(iter_dir, exist_ok=True)
             tmp_paths = {}
             for tf, df in raw_df.items():
-                sub = cut_by_time(df, start_time, cutoff_time)
+                sub = cut_by_time(df, start_time, cutoff_time)  # شامل t
                 if sub.empty: continue
                 out_path = os.path.join(iter_dir, f"{args.symbol}_{tf}.csv")
                 cols = ["time"] + [c for c in sub.columns if c != "time"]
@@ -282,7 +285,7 @@ def main():
                 if not args.keep_tmp: shutil.rmtree(iter_dir, ignore_errors=True)
                 continue
 
-            # آماده‌سازی فیچرها (STRICT feed)، بدون drop-last
+            # آماده‌سازی فیچرها با حذف ردیف آخر (تا t-1 تغذیه شود)
             prep = PREPARE_DATA_FOR_TRAIN(
                 filepaths=tmp_paths, main_timeframe="30T",
                 verbose=False, fast_mode=True, strict_disk_feed=True
@@ -292,21 +295,21 @@ def main():
                 if not args.keep_tmp: shutil.rmtree(iter_dir, ignore_errors=True)
                 continue
 
-            # با زمان‌ها برای هم‌ترازی
             X_live, _, _, _, t_idx = prep.ready(
                 merged,
                 window=window,
                 selected_features=final_cols,
                 mode="predict",
                 with_times=True,
-                predict_drop_last=False   # ❗️ آخرین ردیف همان t است
+                predict_drop_last=True   # ← کلیدی: آخرین ردیف حذف شود → آخرین X = t-1
             )
             if X_live.empty or t_idx is None or len(t_idx) == 0:
                 if not args.keep_tmp: shutil.rmtree(iter_dir, ignore_errors=True)
                 continue
 
-            feat_time = pd.to_datetime(t_idx.iloc[-1])
-            if pd.isna(feat_time) or feat_time != cutoff_time:
+            feat_time = pd.to_datetime(t_idx.iloc[-1])  # باید t-1 باشد
+            if pd.isna(feat_time) or not (feat_time < cutoff_time):
+                # اگر به هر دلیلی آخرین فیچر >= t بود، این تکرار را امن skip کن
                 skipped_misaligned += 1
                 if not args.keep_tmp: shutil.rmtree(iter_dir, ignore_errors=True)
                 continue
@@ -322,7 +325,7 @@ def main():
             p_last = float(probs[-1])
             pred = decide(p_last, neg_thr, pos_thr)
 
-            # حقیقتِ [t → t+1] از TruthMap
+            # حقیقتِ [t → t+1] از TruthMap (همسان Train)
             y_true = int(truth_map.loc[cutoff_time])
 
             # شمارنده‌ها
@@ -346,8 +349,9 @@ def main():
             coverage = (preds / (preds + unpred) * 100.0) if (preds + unpred) > 0 else 0.0
             dec_label = {1: "BUY ", 0: "SELL", -1: "NONE"}[pred]
 
+            # چاپِ زمان آخرین فیچر (باید t-1 باشد) برای اطمینان از هم‌ترازی
             print(
-                f"[{k+1:>5}/{total_iters}] @ {cutoff_time}  "
+                f"[{k+1:>5}/{total_iters}] @ t={cutoff_time}  X_last={feat_time}  "
                 f"p={p_last:.3f} → pred={dec_label}  true={y_true} → {verdict}   "
                 f"| cum P={preds} W={wins} L={losses} U={unpred} "
                 f"Acc={acc:.2f}% Cover={coverage:.2f}%  "
@@ -378,6 +382,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 # python3 live_like_sim.py \
 #   --data-dir /home/pouria/gold_project9 \
