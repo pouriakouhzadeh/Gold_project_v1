@@ -1,57 +1,53 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Live-like rolling simulation with 4 TFs (5m/15m/30m/1h) + dual logging (console & file).
-- Cuts raw CSVs to [start .. cutoff] (inclusive).
-- Builds features in predict mode with predict_drop_last=True (drop unstable last row).
-- Predicts last stable row (t-1) as the signal to act for [t -> t+1] per your requested logic.
-- Compares vs true next-bar direction on 30T.
-- Streams detailed logs to console AND to live_like_sim.log (overwritten each run).
+Live-like rolling simulation with 4 TFs (5m/15m/30m/1h) + strict time alignment & dual logging.
 
-Usage example:
+هدف:
+- در هر cutoff = t، داده‌ها تا خودِ t (شامل t) بریده می‌شود.
+- فیچرها با منطق پایدار (shift(1).diff) ساخته می‌شوند ⇒ X(t) فقط از گذشته (تا t−1) استفاده می‌کند.
+- اگر --predict-drop-last=False  → «سیگنالِ t» را برای [t→t+1] می‌سنجیم (تراز با Train).
+- اگر --predict-drop-last=True   → «سیگنالِ t−1» را برای [t−1→t] می‌سنجیم (برای تست ایدهٔ حذف آخرین ردیف).
+- y_true همیشه بر اساس زمانِ آخرین ردیف X محاسبه می‌شود (نه صرفاً ایندکس خام)، تا هر آف-بای-وانی گرفته شود.
+- همهٔ چاپ‌ها همزمان روی کنسول و فایل log (overwrite در هر اجرا).
+
+Usage:
 python3 live_like_sim.py \
   --data-dir /home/pouria/gold_project9 \
   --symbol XAUUSD \
   --model-dir /home/pouria/gold_project9 \
   --window-rows 4000 \
   --tail-iters 4000 \
-  --verbose
+  --verbose \
+  --log-file /home/pouria/gold_project9/live_like_sim.log \
+  --align-debug 5 \
+  --predict-drop-last False
 """
 
 from __future__ import annotations
 import os, sys, shutil, tempfile, warnings, argparse, logging
-from typing import Dict, List, TextIO
+from typing import Dict, List, TextIO, Optional
 import numpy as np
 import pandas as pd
 import joblib
 
 # -------------------- Dual logging (console + file) --------------------
 class _Tee:
-    """Duplicate writes to multiple text streams (e.g., console + file)."""
     def __init__(self, *streams: TextIO):
         self._streams = streams
     def write(self, data: str):
         for s in self._streams:
-            try:
-                s.write(data)
-            except Exception:
-                pass
+            try: s.write(data)
+            except Exception: pass
         self.flush()
     def flush(self):
         for s in self._streams:
-            try:
-                s.flush()
-            except Exception:
-                pass
+            try: s.flush()
+            except Exception: pass
 
 def _install_dual_logging(log_path: str, verbose: bool) -> logging.Logger:
-    """
-    - Truncates log file on each run.
-    - Mirrors EVERYTHING printed to console into the file by tee-ing stdout/stderr.
-    - Sets up a logging.Logger that writes to console (which is now tee'd).
-    """
     os.makedirs(os.path.dirname(os.path.abspath(log_path)) or ".", exist_ok=True)
-    log_file = open(log_path, "w", encoding="utf-8", buffering=1)  # line-buffered
+    log_file = open(log_path, "w", encoding="utf-8", buffering=1)  # truncate each run
 
     sys._orig_stdout = getattr(sys, "_orig_stdout", sys.stdout)
     sys._orig_stderr = getattr(sys, "_orig_stderr", sys.stderr)
@@ -72,7 +68,6 @@ def _install_dual_logging(log_path: str, verbose: bool) -> logging.Logger:
     return logger
 
 def _close_dual_logging(logger: logging.Logger) -> None:
-    """Restore stdio and close log file cleanly."""
     try:
         if hasattr(logger, "_tee_log_file"):
             logger._tee_log_file.flush()  # type: ignore[attr-defined]
@@ -92,13 +87,11 @@ def _close_dual_logging(logger: logging.Logger) -> None:
 sys.setrecursionlimit(200_000)
 warnings.filterwarnings("ignore")
 
-# --- Project imports ---
-# Patch _CompatWrapper to avoid recursive getattr during unpickle
+# --- Project imports & unpickle patch for _CompatWrapper ---
 try:
     import model_pipeline
     if hasattr(model_pipeline, "_CompatWrapper"):
         _CW = model_pipeline._CompatWrapper
-
         def _cw_safe_getattr(self, item):
             if item.startswith("__") and item.endswith("__"):
                 raise AttributeError(item)
@@ -109,18 +102,15 @@ try:
             if target is self or target is None:
                 raise AttributeError(item)
             return getattr(target, item)
-
         def _cw_getstate(self):
             return {"_model": getattr(self, "_model", None),
                     "_inner": getattr(self, "_inner", None)}
-
         def _cw_setstate(self, state):
             self._model = state.get("_model", None)
             self._inner = state.get("_inner", None)
             self.named_steps = getattr(self._inner, "named_steps", {})
             self.steps = getattr(self._inner, "steps", [])
-
-        _CW.__getattr__ = _cw_safe_getattr
+        _CW.__getattr__  = _cw_safe_getattr
         _CW.__getstate__ = _cw_getstate
         _CW.__setstate__ = _cw_setstate
 except Exception:
@@ -132,7 +122,7 @@ TF_MAP = {"30T": "M30", "15T": "M15", "5T": "M5", "1H": "H1"}
 
 # -------------------- CLI --------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Live-like rolling backtest (dual logging)")
+    p = argparse.ArgumentParser(description="Live-like rolling backtest (aligned & dual-logged)")
     p.add_argument("--data-dir", default="/home/pouria/gold_project9",
                    help="Directory with raw CSVs (XAUUSD_M30.csv, ...)")
     p.add_argument("--symbol", default="XAUUSD", help="Symbol file prefix")
@@ -145,6 +135,10 @@ def parse_args():
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
     p.add_argument("--log-file", default="live_like_sim.log",
                    help="Path to log file (default: ./live_like_sim.log)")
+    p.add_argument("--predict-drop-last", action="store_true",
+                   help="If set, drop last unstable row ⇒ use X at (t−1) to predict [t−1→t].")
+    p.add_argument("--align-debug", type=int, default=5,
+                   help="Print extra alignment details for first N iterations (0 to disable)")
     return p.parse_args()
 
 # -------------------- helpers --------------------
@@ -169,12 +163,18 @@ def decide(prob: float, neg_thr: float, pos_thr: float) -> int:
     if prob >= pos_thr: return 1   # BUY
     return -1                      # NONE
 
+def _find_row_by_time(df: pd.DataFrame, t: pd.Timestamp) -> Optional[int]:
+    """Find exact index in 30T raw df where time == t (returns None if not found)."""
+    m = (df["time"] == t)
+    if not m.any():
+        return None
+    return int(m[m].index[-1])
+
 # -------------------- main --------------------
 def main():
     args = parse_args()
-
-    # Dual-logging (truncate file, tee stdout/stderr)
     log = _install_dual_logging(args.log_file, args.verbose)
+
     try:
         log.info("=== live_like_sim.py starting ===")
         log.info("data-dir=%s | symbol=%s | model-dir=%s", args.data_dir, args.symbol, args.model_dir)
@@ -307,7 +307,7 @@ def main():
                     if not args.keep_tmp: shutil.rmtree(iter_dir, ignore_errors=True)
                     continue
 
-                # Prepare features (predict mode, strict feed) and DROP unstable last row (per requested logic)
+                # Prepare features (strict feed) — keep or drop last row per flag
                 prep = PREPARE_DATA_FOR_TRAIN(
                     filepaths=tmp_paths, main_timeframe="30T",
                     verbose=False, fast_mode=True, strict_disk_feed=True
@@ -318,56 +318,68 @@ def main():
                     if not args.keep_tmp: shutil.rmtree(iter_dir, ignore_errors=True)
                     continue
 
-                X_live, _, _, _ = prep.ready(
+                X_live, _, _, _, t_idx = prep.ready(
                     merged,
                     window=window,
                     selected_features=final_cols,
                     mode="predict",
-                    predict_drop_last=False  # ← مثل Train: سیگنالِ زمان t را نگه دار
+                    with_times=True,
+                    predict_drop_last=args.predict_drop_last
                 )
 
-                if X_live.empty:
+                if X_live.empty or len(t_idx) == 0:
                     logging.getLogger("live-like").warning("X_live empty at cutoff %s (skip)", cutoff_time)
                     if not args.keep_tmp: shutil.rmtree(iter_dir, ignore_errors=True)
                     continue
 
+                # Align columns
                 if not final_cols:
                     final_cols = list(X_live.columns)
                     logging.getLogger("live-like").warning("final_cols was empty; using X_live columns (%d).", len(final_cols))
-
                 X_live = X_live.reindex(columns=final_cols, fill_value=0.0)
 
+                # Last feature time & alignment check
+                x_time = pd.to_datetime(t_idx.iloc[-1])
+                if args.align_debug > 0 and k < args.align_debug:
+                    print(f"[ALIGN] cutoff={cutoff_time} | X_last_time={x_time} | drop_last={args.predict_drop_last}")
+
+                if x_time != cutoff_time and args.align_debug > 0 and k < args.align_debug:
+                    print(f"[ALIGN WARNING] X_last_time != cutoff_time at iter {k+1}. Using X_last_time for y_true lookup.")
+
+                # Predict
                 try:
                     probs = pipeline.predict_proba(X_live)[:, 1]
                 except Exception:
                     probs = pipeline.predict_proba(X_live.values)[:, 1]
-
                 p_last = float(probs[-1])
                 pred = decide(p_last, neg_thr, pos_thr)
 
-                # Ground truth for next 30T bar
-                c0 = float(main_df.loc[i,   "close"])
-                c1 = float(main_df.loc[i+1, "close"])
+                # Compute y_true by TIME (robust)
+                # اگر drop_last=False ⇒ X_last_time باید t باشد ⇒ y_true = dir[t→t+1]
+                # اگر drop_last=True  ⇒ X_last_time باید t−1 باشد ⇒ y_true = dir[t−1→t]
+                t_for_truth = x_time
+                row_idx = _find_row_by_time(main_df, t_for_truth)
+                if row_idx is None or row_idx + 1 >= len(main_df):
+                    logging.getLogger("live-like").warning("No y_true available at time %s (skip)", t_for_truth)
+                    if not args.keep_tmp: shutil.rmtree(iter_dir, ignore_errors=True)
+                    continue
+                c0 = float(main_df.loc[row_idx,   "close"])
+                c1 = float(main_df.loc[row_idx+1, "close"])
                 y_true = 1 if (c1 - c0) > 0 else 0
 
                 # Update counters
                 if pred == -1:
-                    unpred += 1
-                    none_n += 1
-                    verdict = "UNPRED"
+                    unpred += 1; none_n += 1; verdict = "UNPRED"
                 else:
                     preds += 1
                     if pred == 1: buy_n += 1
                     else:         sell_n += 1
-
                     if pred == y_true:
-                        wins += 1
-                        verdict = "WIN"
+                        wins += 1; verdict = "WIN"
                         if y_true == 1: tp += 1
                         else:           tn += 1
                     else:
-                        losses += 1
-                        verdict = "LOSS"
+                        losses += 1; verdict = "LOSS"
                         if y_true == 1: fn += 1
                         else:           fp += 1
 
@@ -376,7 +388,7 @@ def main():
                 dec_label = {1: "BUY ", 0: "SELL", -1: "NONE"}[pred]
 
                 print(
-                    f"[{k+1:>5}/{total_iters}] @ {cutoff_time}  "
+                    f"[{k+1:>5}/{total_iters}] @ {x_time}  "  # گزارش بر اساس زمان واقعی X
                     f"p={p_last:.3f} → pred={dec_label}  true={y_true} → {verdict}   "
                     f"| cum P={preds} W={wins} L={losses} U={unpred} "
                     f"Acc={acc:.2f}% Cover={coverage:.2f}%  "
@@ -402,14 +414,11 @@ def main():
                 shutil.rmtree(tmp_root, ignore_errors=True)
 
         log.info("=== live_like_sim.py finished ===")
-
     finally:
         _close_dual_logging(log)
 
 if __name__ == "__main__":
     main()
-
-
 
 
 # python3 live_like_sim.py \
@@ -418,4 +427,7 @@ if __name__ == "__main__":
 #   --model-dir /home/pouria/gold_project9 \
 #   --window-rows 4000 \
 #   --tail-iters 4000 \
-#   --verbose
+#   --verbose \
+#   --log-file /home/pouria/gold_project9/live_like_sim.log \
+#   --align-debug 5
+
