@@ -373,3 +373,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# python3 live_like_sim.py \
+#   --data-dir /home/pouria/gold_project9 \
+#   --symbol XAUUSD \
+#   --model-dir /home/pouria/gold_project9 \
+#   --window-rows 4000 \
+#   --tail-iters 4000 \
+#   --verbose
