@@ -474,14 +474,15 @@ class PREPARE_DATA_FOR_TRAIN:
 
     # ================= 3) READY (X, y, WINDOW) =================
     def ready(
-        self,
-        data: pd.DataFrame,
-        window: int = 1,
-        selected_features: List[str] | None = None,
-        mode: str = "train",
-        with_times: bool = False,
-        predict_drop_last: bool = False,   # ⬅️ جدید
-    ):
+            self,
+            data: pd.DataFrame,
+            window: int = 1,
+            selected_features: List[str] | None = None,
+            mode: str = "train",
+            with_times: bool = False,
+            predict_drop_last: bool = False,
+            train_drop_last: bool = False,     # ← برای همراستاسازی TRAIN با SIM
+        ):
 
         close_col = f"{self.main_timeframe}_close"
         if close_col not in data.columns:
@@ -560,6 +561,17 @@ class PREPARE_DATA_FOR_TRAIN:
         X_f = X_f.iloc[:L].reset_index(drop=True)
         y   = y.iloc[:L].reset_index(drop=True)
         t_idx = t_idx.iloc[:L].reset_index(drop=True)
+        # --- Anchor: طول قبل از فیلتر TRAIN برای تشخیص حذفِ انتهای دنباله
+        L_before_tail = len(X_f)
+
+        # --- NEW: اگر در TRAIN منطق drop-last می‌خواهیم، برچسب را یک گام جلو ببریم
+        #    نتیجه: X(t) (از [t-1,t-2]) با y(t+1)=حرکت [t+1→t+2] جفت می‌شود.
+        if mode == "train" and train_drop_last:
+            if isinstance(y, pd.Series):
+                y = y.shift(-1)
+            else:
+                y = pd.Series(y, dtype="float64").shift(-1)
+
 
         # ➋ فقط در TRAIN: حذف ردیف‌هایی که برچسب «بازهٔ بعدی» ندارند (close_{t+2} موجود نیست)
         if mode == "train":
@@ -580,15 +592,31 @@ class PREPARE_DATA_FOR_TRAIN:
 
             self.train_columns_after_window = X_f.columns.tolist()
 
+        # --- SAFETY: اگر هنوز آخرین ردیف حذف نشده بود، یک ردیف انتهایی را حذف کن (فقط یک‌بار)
+        if train_drop_last and len(X_f) == L_before_tail and len(X_f) >= 1:
+            X_f = X_f.iloc[:-1].reset_index(drop=True)
+            y   = y.iloc[:-1].reset_index(drop=True)
+            try:
+                t_idx = t_idx.iloc[:-1].reset_index(drop=True)
+            except Exception:
+                pass
+            if price_raw is not None and len(price_raw) >= 1:
+                price_raw = price_raw.iloc[:-1].reset_index(drop=True)
+
 
         price_raw = data[close_col].iloc[:len(df_diff)].reset_index(drop=True)
         if window > 1:
             price_raw = price_raw.iloc[window-1:].reset_index(drop=True)
         price_raw = price_raw.iloc[:len(X_f)].reset_index(drop=True)
-        # --- REAL-Stable: بعد از ساخت فیچرها، آخرین ردیف را حذف کن تا X آخر = t-1 باشد
-        if (mode != "train") and predict_drop_last and len(X_f) >= 1:
-            X_f      = X_f.iloc[:-1].reset_index(drop=True)
-            y        = y.iloc[:-1].reset_index(drop=True)
+        # --- Drop-last AFTER feature construction (for TRAIN and/or PREDICT) ---
+        _do_drop = (mode != "train" and predict_drop_last)
+        if _do_drop and len(X_f) >= 1:
+            X_f = X_f.iloc[:-1].reset_index(drop=True)
+            # y ممکن است Series یا ndarray باشد
+            if isinstance(y, pd.Series):
+                y = y.iloc[:-1].reset_index(drop=True)
+            else:
+                y = y[:-1]
             if with_times and (t_idx is not None) and (len(t_idx) >= 1):
                 t_idx = t_idx.iloc[:-1].reset_index(drop=True)
             if price_raw is not None and len(price_raw) >= 1:

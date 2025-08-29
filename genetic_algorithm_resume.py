@@ -319,11 +319,14 @@ def evaluate_cv(ind):
             return (0.0,)
         if solver == "liblinear" and multi_class == "multinomial":
             return (0.0,)
-        X, y, _, price_ser = PREP_SHARED.ready(DATA_TRAIN_SHARED,
-                                            window=window,
-                                            selected_features=[],
-                                            mode="train",
-                                            predict_drop_last=False)
+        X, y, _, price_ser = PREP_SHARED.ready(
+            DATA_TRAIN_SHARED,
+            window=window,
+            selected_features=[],
+            mode="train",
+            predict_drop_last=False,
+            train_drop_last=True
+        )
         if X.empty:
             return (0.0,)
 
@@ -409,7 +412,7 @@ class GeneticAlgorithmRunner:
             X_tail, _, _, _ = prep.ready(raw.tail(2001),
                                         selected_features=self.final_cols,
                                         mode="predict",
-                                        predict_drop_last=True)
+                                        predict_drop_last=True)   # ← لایو هم drop-last داریم
             X_tail.to_csv("raw_tail2000_clean.csv", index=False)
             LOGGER.info(f"[main] Saved cleaned tail to raw_tail2000_clean.csv, Number of cols = {X_tail.shape[1]}")
             # ------ sort & split ------
@@ -530,7 +533,8 @@ class GeneticAlgorithmRunner:
             window=window,
             selected_features=None,
             mode="train",
-            predict_drop_last=False
+            predict_drop_last=False,
+            train_drop_last=True
         )
 
         if X.empty:
@@ -588,9 +592,11 @@ class GeneticAlgorithmRunner:
         X_thr, y_thr, _, _ = prep.ready(
             data_thr,
             window=window,
-            selected_features=self.final_cols,   # ⬅️ ستون‌های نهایی Train
+            selected_features=self.final_cols,
             mode="train",
-            predict_drop_last=False)
+            predict_drop_last=False,
+            train_drop_last=True
+        )
 
 
         X_thr = X_thr[self.final_cols]
@@ -622,7 +628,9 @@ class GeneticAlgorithmRunner:
             window=window,
             selected_features=self.final_cols,
             mode="train",
-            predict_drop_last=False)
+            predict_drop_last=False,
+            train_drop_last=True
+        )
         
         X = X[self.final_cols]                # ستون‌های نهایی مدل
         if X.empty:                           # ← جلوگیری از خطا
