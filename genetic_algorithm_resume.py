@@ -549,11 +549,15 @@ class GeneticAlgorithmRunner:
             "solver": solver, "fit_intercept": fit_intercept,
             "class_weight": class_weight, "multi_class": multi_class
         }
+        # چون مدل نهایی را با SMOTE آموزش می‌دهیم، از وزن‌دهی balanced صرف‌نظر کنیم
+        if class_weight == "balanced":
+            hyper["class_weight"] = None
 
         model = ModelPipeline(
             hyper,
             calibrate=True,
-            calib_method=calib_method
+            calib_method=calib_method,
+            use_smote_in_fit=True          # ← روشن
         ).fit(X, y)
 
         self.final_cols = list(X.columns)
