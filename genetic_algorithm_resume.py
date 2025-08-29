@@ -717,12 +717,10 @@ class GeneticAlgorithmRunner:
             "solver":solver,"fit_intercept":fit_intercept,
             "class_weight":class_weight,"multi_class":multi_class
         }
-        scaler = None
         try:
-            # سازگار با نسخهٔ جدید ModelPipeline (wrapper)
-            scaler = model.pipeline.named_steps.get("scaler")
+            scaler = model.get_scaler()   # مطمئن و سازگار با CalibratedCV
         except Exception:
-            pass
+            scaler = None
 
         ModelSaver().save_full(
             pipeline=model.pipeline, hyperparams=hyper, scaler=scaler,
