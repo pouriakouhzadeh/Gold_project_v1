@@ -1,48 +1,27 @@
-"""Leak-free calibrated logistic regression pipeline (compat-safe)
-
-Changes vs previous version:
-- Moves StandardScaler + SMOTE *inside* the estimator used by CalibratedClassifierCV
-  so that resampling/scaling happen **only** on training folds during calibration (no leakage).
-- Keeps backward compatibility: `model.pipeline.named_steps.get("scaler")` still works
-  via a thin compatibility wrapper around the underlying estimator.
-"""
-
+# model_pipeline.py
 from __future__ import annotations
+from typing import Any, Dict, Optional, Tuple
+import numpy as np
+import pandas as pd
 
-from sklearnex import patch_sklearn
-patch_sklearn(verbose=False)
-
-import logging
-logging.getLogger("sklearnex").setLevel(logging.WARNING)
-logging.getLogger("sklearn").setLevel(logging.WARNING)
-logging.getLogger("daal4py").setLevel(logging.WARNING)
-
-from typing import Any, Dict, Optional
-
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.preprocessing import StandardScaler
-
-from imblearn.pipeline import Pipeline as ImbPipeline
-from imblearn.over_sampling import SMOTE
 
 
 class _CompatWrapper:
     """
-    Thin wrapper to maintain `.named_steps` access for compatibility with old code:
-    - Delegates fit/predict/predict_proba to `model` (CalibratedClassifierCV or Pipeline).
-    - Exposes `.named_steps` from the *inner* estimator pipeline (the one with scaler/smote).
-    - Exposes `.steps` similarly if available.
+    Wrapper سبک برای سازگاری با پیکل/جاب‌لیب و کد شبیه‌ساز.
+    - predict / predict_proba پاس می‌دهد.
+    - get_scaler() در حالت کالیبره هم اسکیلرِ fitted را برمی‌گرداند.
     """
-    def __init__(self, model, inner_estimator: Optional[ImbPipeline]) -> None:
-        self._model = model
-        self._inner = inner_estimator
-        self.named_steps = getattr(self._inner, "named_steps", {})
-        self.steps = getattr(self._inner, "steps", [])
-
-    def fit(self, X, y):
-        return self._model.fit(X, y)
+    def __init__(self, inner):
+        self._model = inner
+        self._inner = inner
+        # برای سازگاری با کدی که شاید به named_steps/steps نگاه کند:
+        self.named_steps = getattr(inner, "named_steps", {})
+        self.steps = getattr(inner, "steps", [])
 
     def predict(self, X):
         return self._model.predict(X)
@@ -50,123 +29,88 @@ class _CompatWrapper:
     def predict_proba(self, X):
         return self._model.predict_proba(X)
 
-    # Provide limited sklearn-like API passthrough if needed
-    def __getattr__(self, item):
-        return getattr(self._model, item)
+    def get_scaler(self):
+        """
+        تلاش برای پیدا کردن StandardScalerِ فیت‌شده:
+        - اگر CalibratedClassifierCV است: base_estimator_ معمولاً Pipeline است.
+        - اگر Pipeline است: مستقیماً از named_steps بردار.
+        """
+        base = getattr(self._model, "base_estimator_", None) or getattr(self._model, "base_estimator", None)
+        if isinstance(base, Pipeline):
+            sc = base.named_steps.get("scaler")
+            if sc is not None:
+                return sc
+
+        if isinstance(self._model, Pipeline):
+            return self._model.named_steps.get("scaler")
+
+        return None
 
 
 class ModelPipeline:
     """
-    Pipeline = (CalibratedClassifierCV | ImbPipeline[Scaler+SMOTE+LR]) with no leakage.
-
-    If `calibrate=True` (default), uses:
-        CalibratedClassifierCV(estimator=ImbPipeline([Scaler, SMOTE, LR]), cv=TimeSeriesSplit(5))
-
-    If `calibrate=False`, uses:
-        ImbPipeline([Scaler, SMOTE, LR])
-
-    In both cases, `self.pipeline` is a *compat wrapper* exposing:
-        - fit / predict / predict_proba
-        - named_steps (from the inner estimator, so .get("scaler") still works)
-        - steps (if available)
+    StandardScaler + LogisticRegression (+ optional calibration)
+    - سازگار با GA و شبیه‌ساز
+    - SMOTE فقط در مرحلهٔ fit و اختیاری (پیش‌فرض OFF)
     """
-
     def __init__(
         self,
-        hyperparams: Dict[str, Any] | None = None,
+        hyperparams: Dict[str, Any],
+        *,
         calibrate: bool = True,
         calib_method: str = "sigmoid",
-    ) -> None:
-        self.hyperparams  = hyperparams or {}
-        self.calibrate    = bool(calibrate)
-        self.calib_method = calib_method
-        self.is_calibrated = self.calibrate
+        use_smote_in_fit: bool = False,         # ← پیش‌فرض خاموش
+        random_state: Optional[int] = 2025
+    ):
+        self.hyperparams = dict(hyperparams or {})
+        self.calibrate = bool(calibrate)
+        self.calib_method = str(calib_method)
+        self.use_smote_in_fit = bool(use_smote_in_fit)
+        self.random_state = random_state
 
-        # ---- Extract hyperparameters with safe defaults ----
-        C             = self.hyperparams.get('C', 1.0)
-        max_iter      = self.hyperparams.get('max_iter', 300)
-        tol           = self.hyperparams.get('tol', 3e-4)
-        penalty       = self.hyperparams.get('penalty', 'l2')
-        solver        = self.hyperparams.get('solver', 'lbfgs')
-        fit_intercept = self.hyperparams.get('fit_intercept', True)
-        class_weight  = self.hyperparams.get('class_weight', None)
-        multi_class   = self.hyperparams.get('multi_class', 'auto')
-
-        # Safety: liblinear does not support multinomial
-        if solver == "liblinear" and multi_class == "multinomial":
-            multi_class = "auto"
-
-        # extra_multi = {}
-        # if multi_class != "auto":
-        #     extra_multi["multi_class"] = multi_class
-
-        base_lr = LogisticRegression(
-            C=C,
-            max_iter=max_iter,
-            tol=tol,
-            penalty=penalty,
-            solver=solver,
-            fit_intercept=fit_intercept,
-            class_weight=class_weight,
-            warm_start=True,
-            random_state=42,
-            n_jobs=-1,
-            # هیچ multi_classـی پاس نده
-        )
-        # --- Inner estimator with preprocessing INSIDE (no leakage) ---
-        inner_estimator = ImbPipeline([
-            ('scaler', StandardScaler()),
-            ('smote',  SMOTE(random_state=42)),
-            ('lr',     base_lr),
+        # پایپ‌لاین پایه
+        clf = LogisticRegression(**self.hyperparams)
+        base = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", clf),
         ])
 
+        # کالیبراسیون اختیاری
         if self.calibrate:
-            model = CalibratedClassifierCV(
-                estimator=inner_estimator,
-                method=self.calib_method,
-                cv=TimeSeriesSplit(n_splits=5),
-                n_jobs=-1
-            )
-            self._model = model
-            self._inner = inner_estimator
+            model = CalibratedClassifierCV(base, method=self.calib_method, cv=3)
         else:
-            self._model = inner_estimator
-            self._inner = inner_estimator
+            model = base
 
-        # ---- Public handle with backward-compatible attributes ----
-        self.pipeline = _CompatWrapper(self._model, self._inner)
+        # رَپر سازگار برای ذخیره و شبیه‌ساز
+        self.pipeline = _CompatWrapper(model)
 
-    # ------------------------------------------------------------------
-    # Proxy methods
-    # ------------------------------------------------------------------
-    def fit(self, X, y):
+    # ---------------- public API ----------------
+    def fit(self, X: pd.DataFrame | np.ndarray, y: pd.Series | np.ndarray):
         """
-        Fit the model. Kept minimal and robust (no touching internal CV iterator)
-        to avoid unexpected behavior across sklearn versions.
+        اگر use_smote_in_fit=True باشد فقط در این متد بازنمونه‌گیری انجام می‌شود
+        و خودِ pipeline ذخیره‌شده شامل SMOTE نمی‌شود ⇒ در لایو مشکلی نیست.
         """
-        logger = logging.getLogger(__name__)
-        logger.info("🚀 Training started with hyperparams: %s", self.hyperparams)
-        self.pipeline.fit(X, y)
-        logger.info("✅ Training finished.")
+        X_fit, y_fit = X, y
+
+        if self.use_smote_in_fit:
+            try:
+                from imblearn.over_sampling import SMOTE
+                # n_jobs=1 برای جلوگیری از oversubscription
+                sm = SMOTE(random_state=self.random_state, n_jobs=1)
+                X_fit, y_fit = sm.fit_resample(X, y)
+            except Exception:
+                # اگر imblearn در محیط نبود، بی‌سر و صدا ادامه بده
+                X_fit, y_fit = X, y
+
+        # آموزش مدل (اگر کالیبره باشد، روی داده‌های resampled/train انجام می‌شود)
+        self.pipeline._model.fit(X_fit, y_fit)
         return self
 
-    def predict_proba(self, X):
-        return self.pipeline.predict_proba(X)
-
-    def predict(self, X):
+    def predict(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
         return self.pipeline.predict(X)
 
-    # ------------------------------------------------------------------
-    # Optional helpers for compatibility/introspection
-    # ------------------------------------------------------------------
-    def get_scaler(self):
-        """Return the StandardScaler if present (None otherwise)."""
-        try:
-            return self._inner.named_steps.get("scaler")
-        except Exception:
-            return None
+    def predict_proba(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
+        return self.pipeline.predict_proba(X)
 
-    @property
-    def estimator_(self):
-        """Access the underlying trained estimator (CalibratedClassifierCV or Pipeline)."""
-        return self._model
+    def get_scaler(self):
+        return self.pipeline.get_scaler()

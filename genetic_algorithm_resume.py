@@ -223,10 +223,13 @@ PREP_SHARED: PREPARE_DATA_FOR_TRAIN | None = None
 
 def pool_init(data_train: pd.DataFrame,
               prep: PREPARE_DATA_FOR_TRAIN) -> None:
-    # خفه کردن هشدارها داخل این worker
     _suppress_warnings()
 
-    # به‌اشتراک‌گذاری داده‌‌ها
+    # جلوگیری از oversubscription در هر worker
+    for var in ("OMP_NUM_THREADS","MKL_NUM_THREADS","OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS","TBB_NUM_THREADS"):
+        os.environ[var] = "1"
+
     global DATA_TRAIN_SHARED, PREP_SHARED
     DATA_TRAIN_SHARED = data_train
     PREP_SHARED       = prep
@@ -309,8 +312,8 @@ def evaluate_cv(ind):
             raise RuntimeError("Shared globals not ready!")
 
         (C, max_iter, tol, penalty, solver,
-         fit_intercept, class_weight, multi_class,
-         window, calib_method) = ind
+        fit_intercept, class_weight, multi_class,
+        window, calib_method) = ind
 
         # ناسازگاری‌های سریع
         if penalty == "l1" and solver not in ["liblinear", "saga"]:
@@ -319,13 +322,14 @@ def evaluate_cv(ind):
             return (0.0,)
         if solver == "liblinear" and multi_class == "multinomial":
             return (0.0,)
+
         X, y, _, price_ser = PREP_SHARED.ready(
             DATA_TRAIN_SHARED,
             window=window,
             selected_features=[],
             mode="train",
             predict_drop_last=False,
-            train_drop_last=True
+            train_drop_last=False
         )
         if X.empty:
             return (0.0,)
@@ -336,15 +340,14 @@ def evaluate_cv(ind):
             "class_weight": class_weight, "multi_class": multi_class
         }
 
-
         tscv = TimeSeriesSplit(n_splits=3)
-        scores = Parallel(n_jobs=-1, backend="loky")(
-            delayed(_fit_and_score_fold)(tr, ts, X, y, price_ser, hyper, calib_method)
-            for tr, ts in tscv.split(X, y)
-        )
+        scores = []
+        for tr, ts in tscv.split(X, y):
+            s = _fit_and_score_fold(tr, ts, X, y, price_ser, hyper, calib_method)
+            scores.append(s)
 
+        return (float(np.mean(scores)) if scores else 0.0,)
 
-        return (float(np.mean(scores)),)
     except Exception as e:
         LOGGER.error("evaluate_cv failed: %s", e)
         return (0.0,)
@@ -534,7 +537,7 @@ class GeneticAlgorithmRunner:
             selected_features=None,
             mode="train",
             predict_drop_last=False,
-            train_drop_last=True
+            train_drop_last=False
         )
 
         if X.empty:
@@ -595,7 +598,7 @@ class GeneticAlgorithmRunner:
             selected_features=self.final_cols,
             mode="train",
             predict_drop_last=False,
-            train_drop_last=True
+            train_drop_last=False
         )
 
 
@@ -629,7 +632,7 @@ class GeneticAlgorithmRunner:
             selected_features=self.final_cols,
             mode="train",
             predict_drop_last=False,
-            train_drop_last=True
+            train_drop_last=False
         )
         
         X = X[self.final_cols]                # ستون‌های نهایی مدل

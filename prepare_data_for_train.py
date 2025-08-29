@@ -481,25 +481,32 @@ class PREPARE_DATA_FOR_TRAIN:
             mode: str = "train",
             with_times: bool = False,
             predict_drop_last: bool = False,
-            train_drop_last: bool = False,     # ← برای همراستاسازی TRAIN با SIM
+            train_drop_last: bool = False,     # همراستا با SIM: در TRAIN هم یک حذفِ محافظه‌کارانه
         ):
+        """
+        ساخت X/ y بدون لیک:
+        - فیچرها فقط از گذشته: diff روی shift(1)  ←  سطر t از (t-1) و (t-2) ساخته می‌شود (پایدار).
+        - y ابتدا برچسب t→t+1 است؛ سپس منطبق با طول X و پنجره هم‌تراز می‌شود.
+        - در TRAIN سطرهای با y=NaN حذف می‌شوند (اتوماتیکِ آخر دنباله) و در صورت نیاز drop-last اعمال می‌شود.
+        - در PREDICT، اگر predict_drop_last=True باشد، دقیقاً «بعد از ساخت فیچرها» یک سطر انتهایی حذف می‌شود.
+        """
 
         close_col = f"{self.main_timeframe}_close"
         if close_col not in data.columns:
             raise ValueError(f"{close_col} missing")
 
-        # y_next(t) = 1{ close(t+1) > close(t) }  → سپس یک پله شیفت می‌دهیم تا با X(t-1) تراز شود
+        # --- y(t) = 1{ close(t+1) > close(t) } ---
         y = (data[close_col].shift(-1) - data[close_col] > 0)
 
-        # در حالت predict فقط برای هم‌قدی با X یک سری صفر می‌سازیم (مقدار استفاده نمی‌شود)
+        # در حالت predict فقط برای هم‌قدی، y را بعداً صفر می‌کنیم
         if mode != "train":
             y = pd.Series(np.zeros(len(data), dtype=np.int8))
 
-        # ستون‌ها
-        time_cols = [c for c in data.columns if any(tok in c for tok in ["hour","day_of_week","is_weekend"])]
+        # --- انتخاب ستون‌های فیچر (تقویمی را کنار بگذار) ---
+        time_cols = [c for c in data.columns if any(tok in c for tok in ["hour", "day_of_week", "is_weekend"])]
         feat_cols = [c for c in data.columns if c not in time_cols + [close_col]]
 
-        # 🔑 فیچرها فقط از گذشته ساخته می‌شوند: diff روی shift(1)
+        # --- فیچرهای پایدار: diff روی shift(1) ---
         strict_cols = bool(selected_features)
         df_diff = self._compute_diff(data, feat_cols, strict_cols)
         df_diff.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -507,15 +514,10 @@ class PREPARE_DATA_FOR_TRAIN:
         df_diff.dropna(how="all", inplace=True)
         df_diff.reset_index(drop=True, inplace=True)
 
-        # y را با df_diff هم‌قد کن
+        # --- y را با df_diff هم‌قد کن ---
         y = y.iloc[:len(df_diff)].reset_index(drop=True)
 
-        # ⚠️ در PREDICT هیچ‌چیز را حذف نکن؛ ردیف آخر X از t−1 و t−2 ساخته شده و پایدار است.
-        # ❌ این بلوک را اگر داری حذف کن:
-        # if mode == "predict":
-        #     df_diff = df_diff.iloc[:-1]  # ← این باید حذف شود
-
-        # انتخاب فیچر (+ پشتیبانی از _tminus)
+        # --- انتخاب فیچر (+ پشتیبانی از _tminus در صورت وجود) ---
         import re as _re
         tminus_regex = _re.compile(r"_tminus\d+$")
         has_tminus = bool(selected_features and any(tminus_regex.search(f) for f in selected_features))
@@ -537,100 +539,79 @@ class PREPARE_DATA_FOR_TRAIN:
 
         X_f = df_diff[feats].copy()
 
-        # پنجره‌بندی
+        # --- پنجره‌بندی ---
         X_f, y, feats = self._apply_window(X_f, y, feats, window, selected_features, has_tminus)
 
-        # پاکسازی نهایی
+        # --- پاکسازی نهایی X ---
         X_f.replace([np.inf, -np.inf], np.nan, inplace=True)
         X_f = X_f.fillna(X_f.median())
-        # --- NEW: ensure no NaN/Inf at predict time ---
-        X_f.replace([np.inf, -np.inf], np.nan, inplace=True)
         if mode != "train":
-            X_f = X_f.fillna(0.0)   # برای پیش‌بینی، ورودی کاملاً بدون NaN
+            X_f = X_f.fillna(0.0)   # در پیش‌بینی، هیچ NaN ای عبور نکند
 
-        # زمان‌های هم‌تراز (اختیاری)
+        # --- ستون زمان (اختیاری) ---
         tcol = f"{self.main_timeframe}_time" if f"{self.main_timeframe}_time" in data.columns else "time"
         t_idx = pd.to_datetime(data[tcol]).reset_index(drop=True)
         if len(t_idx) > 0:
-            t_idx = t_idx.iloc[2:].reset_index(drop=True)  # چون shift(1).diff
-        if window > 1 and len(t_idx) >= window-1:
-            t_idx = t_idx.iloc[window-1:].reset_index(drop=True)
+            t_idx = t_idx.iloc[2:].reset_index(drop=True)  # به‌خاطر shift(1).diff
+        if window > 1 and len(t_idx) >= window - 1:
+            t_idx = t_idx.iloc[window - 1:].reset_index(drop=True)
 
-        # هم‌ترازی طول‌ها
+        # --- هم‌ترازسازی اولیه طول‌ها ---
         L = min(len(X_f), len(y), len(t_idx))
         X_f = X_f.iloc[:L].reset_index(drop=True)
         y   = y.iloc[:L].reset_index(drop=True)
         t_idx = t_idx.iloc[:L].reset_index(drop=True)
-        # --- Anchor: طول قبل از فیلتر TRAIN برای تشخیص حذفِ انتهای دنباله
-        L_before_tail = len(X_f)
 
-        # --- NEW: اگر در TRAIN منطق drop-last می‌خواهیم، برچسب را یک گام جلو ببریم
-        #    نتیجه: X(t) (از [t-1,t-2]) با y(t+1)=حرکت [t+1→t+2] جفت می‌شود.
-        if mode == "train" and train_drop_last:
-            if isinstance(y, pd.Series):
-                y = y.shift(-1)
-            else:
-                y = pd.Series(y, dtype="float64").shift(-1)
-
-
-        # ➋ فقط در TRAIN: حذف ردیف‌هایی که برچسب «بازهٔ بعدی» ندارند (close_{t+2} موجود نیست)
-        if mode == "train":
-            # بعد از window، خودِ y ممکن است NaN داشته باشد؛ همان را معیار می‌گیریم
-            valid = y.notna()
-
-            # هم‌طول‌سازی با X_f
-            L = min(len(valid), len(X_f))
-            valid = valid.iloc[:L].astype(bool)
-
-            # فیلتر نهایی
-            X_f = X_f.loc[valid].reset_index(drop=True)
-            y   = y.loc[valid].astype(int).reset_index(drop=True)
-            try:
-                t_idx = t_idx.loc[valid].reset_index(drop=True)  # اگر with_times=True
-            except NameError:
-                pass
-
-            self.train_columns_after_window = X_f.columns.tolist()
-
-        # --- SAFETY: اگر هنوز آخرین ردیف حذف نشده بود، یک ردیف انتهایی را حذف کن (فقط یک‌بار)
-        if train_drop_last and len(X_f) == L_before_tail and len(X_f) >= 1:
-            X_f = X_f.iloc[:-1].reset_index(drop=True)
-            y   = y.iloc[:-1].reset_index(drop=True)
-            try:
-                t_idx = t_idx.iloc[:-1].reset_index(drop=True)
-            except Exception:
-                pass
-            if price_raw is not None and len(price_raw) >= 1:
-                price_raw = price_raw.iloc[:-1].reset_index(drop=True)
-
-
+        # --- سری قیمت هم‌قد با X_f (قبل از هر drop نهایی) ---
         price_raw = data[close_col].iloc[:len(df_diff)].reset_index(drop=True)
         if window > 1:
-            price_raw = price_raw.iloc[window-1:].reset_index(drop=True)
+            price_raw = price_raw.iloc[window - 1:].reset_index(drop=True)
         price_raw = price_raw.iloc[:len(X_f)].reset_index(drop=True)
-        # --- Drop-last AFTER feature construction (for TRAIN and/or PREDICT) ---
-        _do_drop = (mode != "train" and predict_drop_last)
-        if _do_drop and len(X_f) >= 1:
-            X_f = X_f.iloc[:-1].reset_index(drop=True)
-            # y ممکن است Series یا ndarray باشد
-            if isinstance(y, pd.Series):
-                y = y.iloc[:-1].reset_index(drop=True)
-            else:
-                y = y[:-1]
-            if with_times and (t_idx is not None) and (len(t_idx) >= 1):
-                t_idx = t_idx.iloc[:-1].reset_index(drop=True)
-            if price_raw is not None and len(price_raw) >= 1:
+
+        # ------------------- شاخه TRAIN -------------------
+        if mode == "train":
+            # 1) حذف ردیف‌هایی که برچسب ندارند (معمولاً ردیف انتهایی)
+            valid = y.notna()
+            if not valid.all():
+                X_f = X_f.loc[valid].reset_index(drop=True)
+                y   = y.loc[valid].reset_index(drop=True)
+                try:
+                    t_idx = t_idx.loc[valid].reset_index(drop=True)
+                except Exception:
+                    pass
+                price_raw = price_raw.loc[valid].reset_index(drop=True)
+
+            # 2) اطمینان از نوع عددیِ برچسب‌ها
+            y = y.astype("int64")
+
+            # 3) در صورت نیاز: حذف محافظه‌کارانهٔ آخرین ردیف (drop-last)
+            if train_drop_last and len(X_f) >= 1:
+                X_f = X_f.iloc[:-1].reset_index(drop=True)
+                y   = y.iloc[:-1].reset_index(drop=True)
+                if with_times and (t_idx is not None) and (len(t_idx) >= 1):
+                    t_idx = t_idx.iloc[:-1].reset_index(drop=True)
                 price_raw = price_raw.iloc[:-1].reset_index(drop=True)
 
+            # ذخیرهٔ لیست ستون‌ها پس از پنجره‌بندی برای سازگاری
+            self.train_columns_after_window = X_f.columns.tolist()
 
-        # --- normalize y type just before return ---
-        if mode == "train":
-            # در Train لازم است Series باشد تا با TimeSeriesSplit/.iloc سازگار بماند
-            y = pd.Series(y, dtype="int64").reset_index(drop=True)
+        # ------------------- شاخه PREDICT -------------------
         else:
-            # در Predict از y استفاده نمی‌کنیم؛ فقط هم‌قد X_f باشد
+            # بعداً y را فقط برای هم‌قدی صفر می‌کنیم؛ فعلاً ساختارش حفظ شود
+            if predict_drop_last and len(X_f) >= 1:
+                X_f = X_f.iloc[:-1].reset_index(drop=True)
+                try:
+                    y = y.iloc[:-1].reset_index(drop=True)  # صرفاً هم‌قدی
+                except Exception:
+                    y = pd.Series(y).iloc[:-1].reset_index(drop=True)
+                if with_times and (t_idx is not None) and (len(t_idx) >= 1):
+                    t_idx = t_idx.iloc[:-1].reset_index(drop=True)
+                price_raw = price_raw.iloc[:-1].reset_index(drop=True)
+
+            # در نهایت: y در پیش‌بینی مصرف نمی‌شود
             y = np.zeros(len(X_f), dtype=np.int64)
 
+        # --- خروجی ---
         if with_times:
             return X_f, y, feats, price_raw, t_idx
         else:
@@ -703,19 +684,31 @@ class PREPARE_DATA_FOR_TRAIN:
 
         # ---------- 2) ادغام روی تایم‌فریم اصلی ----------
         main_tf  = self.main_timeframe
-        df0 = dfs[0]
-        main_tf = getattr(self, "main_timeframe", "30T")
+        tfs = list(self.filepaths.keys())
+
+        # پیدا کردن ایندکس تایم‌فریم اصلی
+        try:
+            idx_main = tfs.index(self.main_timeframe)
+        except ValueError:
+            raise KeyError(f"Main timeframe '{self.main_timeframe}' not in filepaths")
+
+        df0 = dfs[idx_main]
+        main_tf = self.main_timeframe
+
         if f"{main_tf}_time" not in df0.columns:
-            # اگر در این شاخه قبل‌تر rename نشده بود، از ستون time بساز
             if "time" in df0.columns:
                 df0[f"{main_tf}_time"] = pd.to_datetime(df0["time"], errors="coerce")
             else:
                 raise KeyError(f"Missing '{main_tf}_time' and 'time' columns in main timeframe dataframe.")
         main_df = df0.set_index(f"{main_tf}_time", drop=False)
 
-        for (tf, _), df in zip(list(self.filepaths.items())[1:], dfs[1:]):
+        # join بقیه‌ی تایم‌فریم‌ها
+        for j, tf in enumerate(tfs):
+            if j == idx_main:
+                continue
+            dfj = dfs[j]
             main_df = main_df.join(
-                df.set_index(f"{tf}_time", drop=False),
+                dfj.set_index(f"{tf}_time", drop=False),
                 how="outer",
                 rsuffix=f"_{tf}",
             )
