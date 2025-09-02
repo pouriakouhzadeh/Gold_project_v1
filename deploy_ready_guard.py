@@ -581,3 +581,9 @@ if __name__ == "__main__":
 #   --verbose
 # )
 # python3 -u /home/pouria/gold_project9/deploy_ready_guard.py "${ARGS[@]}"
+
+
+
+# deploy_baseline.csv
+# deploy_live.csv
+# deploy_guard.log
