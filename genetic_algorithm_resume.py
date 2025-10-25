@@ -120,7 +120,7 @@ def load_checkpoint() -> tuple[int, list, float] | None:
 # ---------------------------------------------------------------------------
 @dataclass
 class GAConfig:
-    population_size: int = 32
+    population_size: int = 16
     n_generations: int = 8
     cx_pb: float = 0.8
     mut_pb: float = 0.4
@@ -329,7 +329,7 @@ def evaluate_cv(ind):
             selected_features=[],
             mode="train",
             predict_drop_last=False,
-            train_drop_last=False
+            train_drop_last=True     # ← یکسان با لایو
         )
         if X.empty:
             return (0.0,)
@@ -537,7 +537,7 @@ class GeneticAlgorithmRunner:
             selected_features=None,
             mode="train",
             predict_drop_last=False,
-            train_drop_last=False
+            train_drop_last=True      # ← همرفتار با لایو
         )
 
         if X.empty:
@@ -602,7 +602,7 @@ class GeneticAlgorithmRunner:
             selected_features=self.final_cols,
             mode="train",
             predict_drop_last=False,
-            train_drop_last=False
+            train_drop_last=True      # ← با لایو یکسان
         )
 
 
@@ -636,7 +636,7 @@ class GeneticAlgorithmRunner:
             selected_features=self.final_cols,
             mode="train",
             predict_drop_last=False,
-            train_drop_last=False
+            train_drop_last=True       # ← هم‌تراز با لایو
         )
         
         X = X[self.final_cols]                # ستون‌های نهایی مدل
