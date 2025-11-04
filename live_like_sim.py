@@ -34,7 +34,7 @@ DATA_DIR     = "/home/pouria/gold_project9"   # ← مسیر همان دیتای
 SYMBOL       = "XAUUSD"
 MAIN_TF      = "30T"
 MODEL_PATH   = "best_model.pkl"               # ← خروجی ModelSaver
-N_STEPS      = 2000                           # ← تعداد گام‌های انتهایی
+N_STEPS      = 10000                           # ← تعداد گام‌های انتهایی
 PRINT_EVERY  = 1                              # ← هر چند گام یکبار گزارش کند (1 = هر گام)
 CSV_LOG_FILE = "live_like_log.csv"            # ← فایل خروجی لاگ
 VERBOSE      = True
