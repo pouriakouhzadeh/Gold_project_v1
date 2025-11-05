@@ -36,7 +36,7 @@ MAIN_TF      = "30T"
 MODEL_PATH   = "best_model.pkl"
 
 # چند سطر آخر که برای «همهٔ گزارش‌ها» تحلیل می‌کنیم (برای کنترل حجم)
-ANALYZE_LAST = 2000
+ANALYZE_LAST = 1000
 
 ATOL         = 1e-9
 RTOL         = 1e-9
