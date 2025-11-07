@@ -25,7 +25,6 @@ CSV_MAP_LIVE = {
     "1H":  "XAUUSD_H1_live.csv",
 }
 
-# ===== Flexible loader (best_model.pkl first) =====
 MODEL_PKL_CANDIDATES  = ["best_model.pkl", "model.pkl"]
 SCALER_CANDIDATES     = ["scaler.pkl", "best_scaler.pkl"]
 PAYLOAD_CANDIDATES    = ["payload.json", "best_payload.json"]
@@ -71,7 +70,6 @@ def load_bundle_flexible() -> Dict[str, Any]:
     bundle["neg_thr"] = float(bundle.get("neg_thr", 0.005))
     return bundle
 
-# ===== Data prep (use your existing pipeline) =====
 from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
 
 def decide_signal(prob: float, pos_thr: float, neg_thr: float) -> str:
@@ -95,6 +93,26 @@ def write_answer(ans: str):
     with open(ANSWER_FILE, "w") as f:
         f.write(ans)
 
+def merge_live_like(dfs: dict) -> pd.DataFrame:
+    """
+    ادغام 4 تایم‌فریم لایو به ساده‌ترین شکل (مشابه خروجی load_data):
+    - ایندکس زمانی را حفظ می‌کنیم.
+    - ستون‌های OHLCV هر TF را با suffix متمایز می‌کنیم.
+    - سپس با outer join روی index می‌چسبانیم و در انتها بر حسب 30T trim می‌کنیم.
+    """
+    # نام ستون‌ها را استاندارد می‌کنیم
+    rename_cols = lambda tf: {c: f"{c}_{tf}" for c in ["open","high","low","close","volume"] if c in dfs[tf].columns}
+    d5  = dfs["5T"].rename(columns=rename_cols("5T"))
+    d15 = dfs["15T"].rename(columns=rename_cols("15T"))
+    d30 = dfs["30T"].rename(columns=rename_cols("30T"))
+    d1h = dfs["1H"].rename(columns=rename_cols("1H"))
+
+    merged = d30.join(d15, how="outer").join(d5, how="outer").join(d1h, how="outer")
+    merged = merged.sort_index()
+    # برای جلوگیری از نشتی آینده احتمالی، به بازه‌ی موجود در 30T محدود می‌کنیم
+    merged = merged.loc[d30.index.min(): d30.index.max()]
+    return merged
+
 def main():
     logging.info("=== prediction_in_production started ===")
     bundle = load_bundle_flexible()
@@ -110,14 +128,12 @@ def main():
 
     prep = PREPARE_DATA_FOR_TRAIN(
         main_timeframe="30T",
-        csv_map=None,             # در این اسکریپت از فایل‌های _live می‌خوانیم
         drift_guard=False,
         remove_holidays=True,
-        log_progress=False
+        log_progress=False,
     )
 
     while True:
-        # شرط اجرا: answer.txt وجود نداشته باشد و هر ۴ CSV لایو وجود داشته باشد
         if os.path.exists(ANSWER_FILE) or not live_files_exist():
             time.sleep(1.0)
             continue
@@ -133,32 +149,39 @@ def main():
                 df = df.set_index("time").sort_index()
                 dfs[tf] = df
 
-            # 2) ادغام و ری‌سمپل مثل pipeline اصلی
-            raw = prep.merge_live_frames(dfs)     # <- باید در کلاس شما پیاده باشد (هم‌ارز merge/align قبلی)
-            raw = prep.drop_holidays(raw)         # اگر روز تعطیل بود None برگردان
+            # 2) ادغام شبیه خروجی load_data
+            raw = merge_live_like(dfs)
+
+            # 3) حذف تعطیلات
+            raw = prep.drop_holidays(raw)
             if raw is None or len(raw) == 0:
                 write_answer("NONE")
                 remove_live_files()
                 time.sleep(1.0)
                 continue
 
-            # 3) ساخت فیچرها
+            # 4) ساخت فیچرها دقیقاً با همان متُد
             feat_df = prep.build_features(raw)
+
             if feats:
                 missing = [c for c in feats if c not in feat_df.columns]
                 if missing:
                     logging.warning(f"Missing features in live batch: {missing}")
                 cols = [c for c in feats if c in feat_df.columns]
+                if not cols:  # اگر هیچ‌کدام موجود نبود، از همه‌ی فیچرها استفاده کن
+                    cols = [c for c in feat_df.columns if c != "target"]
                 feat_df = feat_df[cols].copy()
-            # در لایو هدف را نداریم
+            else:
+                # بدون لیست منتخب، همه‌ی فیچرها (غیر از target)
+                cols = [c for c in feat_df.columns if c != "target"]
+                feat_df = feat_df[cols].copy()
 
-            # 4) اسکِیل و پنجره‌ی آخر
+            # 5) اسکِیل
             X_all = feat_df.values
             if scaler is not None:
                 X_all = scaler.transform(X_all)
 
             if len(X_all) < window:
-                # با پنجره‌ی ناکافی نمی‌توان پیش‌بینی کرد
                 write_answer("NONE")
                 remove_live_files()
                 time.sleep(1.0)
@@ -167,21 +190,17 @@ def main():
             X_last = X_all[-window:].reshape(1, -1)
             prob = float(model.predict_proba(X_last)[:, 1])
             ans = decide_signal(prob, pos_thr, neg_thr)
-
             write_answer(ans)
             logging.info(f"[LIVE PRED] prob={prob:.6f} → {ans}")
 
         except Exception as e:
             logging.exception(f"Error in prediction loop: {e}")
-            # برای ایمن‌سازی، NONE خروجی بده تا ژنراتور متوقف نشود
             try:
                 write_answer("NONE")
             except Exception:
                 pass
 
-        # 5) پاک کردن CSVهای لایو (قدم تمام شد)
         remove_live_files()
-        # 6) اندکی تاخیر برای کاهش فشار CPU
         time.sleep(1.0)
 
 if __name__ == "__main__":
