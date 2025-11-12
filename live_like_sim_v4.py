@@ -12,7 +12,7 @@ from __future__ import annotations
 import os, sys, json, gzip, bz2, lzma, zipfile, pickle, logging, argparse
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-
+import re
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
@@ -38,6 +38,12 @@ def setup_logging(verbosity: int = 1):
     ch.setFormatter(fmt)
     logger.addHandler(ch)
     return logger
+
+
+
+def _normalize_freq(freq: str) -> str:
+    # 30T -> 30min
+    return re.sub(r'(?i)^(\d+)\s*T$', r'\1min', freq.strip())
 
 
 # ======================== Robust model loader ========================
@@ -371,7 +377,7 @@ class _FallbackPrep:
 
         resampled_rows = [
             self._safe_agg_group(key, grp, agg_dict)
-            for key, grp in df.groupby(pd.Grouper(freq=self.main_timeframe))
+            for key, grp in df.groupby(pd.Grouper(freq=_normalize_freq(self.main_timeframe)))
         ]
         out = (
             pd.concat([r for r in resampled_rows if r is not None], axis=0)
