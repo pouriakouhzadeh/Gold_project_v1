@@ -1,22 +1,23 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
 """
-pridiction_in_production.py
----------------------------
-اسکریپت پیش‌بینی لایو: فایل‌های *_live.csv را می‌خواند، با کلاس Production پردازش می‌کند
-و نتیجه را به صورت BUY/SELL/NONE در answer.txt می‌نویسد.
+prediction_in_production_v5.py
+- All files live in the SAME folder as this script.
+- Waits for XAUUSD_M30_live.csv (main), tolerates late arrivals (no crash).
+- Cut BEFORE resample using PREPARE_DATA_FOR_TRAIN_PRODUCTION, same pipeline.
+- Robust model loader (pickle/joblib/zip/gzip/bz2/lzma/json).
+- Align columns; write answer.txt atomically.
 """
 
 from __future__ import annotations
-import os, sys, time, json, gzip, bz2, lzma, zipfile, pickle, logging, argparse
+import os, sys, time, json, pickle, gzip, bz2, lzma, zipfile, logging, argparse
 from pathlib import Path
-from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
 from prepare_data_for_train_production import PREPARE_DATA_FOR_TRAIN_PRODUCTION
 
-LOG_FILE = "pridiction_in_production.log"
+LOG_FILE = "prediction_in_production_v5.log"
 
 # ---------------- Logging ----------------
 def setup_logging(verbosity:int=1):
@@ -93,7 +94,8 @@ def load_payload_best_model(pkl_path: str="best_model.pkl") -> dict:
     raw = None
     for loader in loaders:
         try:
-            raw = loader(pkl_path); break
+            raw = loader(pkl_path)
+            break
         except Exception as e:
             last_err = e
 
@@ -105,11 +107,14 @@ def load_payload_best_model(pkl_path: str="best_model.pkl") -> dict:
             pass
 
     if raw is None:
-        raise RuntimeError(f"Could not load best_model.pkl. First bytes: {head!r}. Last error: {repr(last_err)}")
+        raise RuntimeError(
+            f"Could not load best_model.pkl. First bytes: {head!r}. Last error: {repr(last_err)}"
+        )
 
     payload = {}
     if isinstance(raw, dict):
-        model = raw.get("pipeline") or raw.get("model") or raw.get("estimator") or raw.get("clf") or raw.get("best_estimator")
+        model = raw.get("pipeline") or raw.get("model") or raw.get("estimator") \
+                or raw.get("clf") or raw.get("best_estimator")
         if model is None:
             for k, v in raw.items():
                 if hasattr(v, "predict") or hasattr(v, "predict_proba"):
@@ -120,18 +125,16 @@ def load_payload_best_model(pkl_path: str="best_model.pkl") -> dict:
         payload["window_size"] = int(raw.get("window_size", 1))
         feats = raw.get("train_window_cols") or raw.get("feats") or []
         payload["train_window_cols"] = list(feats) if isinstance(feats,(list,tuple)) else []
-        payload["neg_thr"] = float(raw.get("neg_thr", 0.495))
-        payload["pos_thr"] = float(raw.get("pos_thr", 0.505))
-        if "scaler" in raw:
-            payload["scaler"] = raw["scaler"]
+        payload["neg_thr"] = float(raw.get("neg_thr", 0.005))
+        payload["pos_thr"] = float(raw.get("pos_thr", 0.995))
+        if "scaler" in raw: payload["scaler"] = raw["scaler"]
     else:
         payload["pipeline"] = raw
         payload["window_size"] = 1
         payload["train_window_cols"] = []
-        payload["neg_thr"] = 0.495
-        payload["pos_thr"] = 0.505
+        payload["neg_thr"] = 0.005
+        payload["pos_thr"] = 0.995
 
-    # override اختیاری
     if os.path.exists("train_distribution.json"):
         try:
             with open("train_distribution.json", "r", encoding="utf-8") as jf:
@@ -141,115 +144,173 @@ def load_payload_best_model(pkl_path: str="best_model.pkl") -> dict:
             logging.info("Train distribution loaded from train_distribution.json")
         except Exception:
             pass
+
     return payload
 
-# ---------------- سایر کمک‌متدها ----------------
-def resolve_live_paths(base_dir: Path, symbol: str) -> Dict[str, str]:
-    candidates = {
-        "30T": [f"{symbol}_30T_live.csv", f"{symbol}_M30_live.csv"],
-        "15T": [f"{symbol}_15T_live.csv", f"{symbol}_M15_live.csv"],
-        "5T" : [f"{symbol}_5T_live.csv",  f"{symbol}_M5_live.csv" ],
-        "1H" : [f"{symbol}_1H_live.csv",  f"{symbol}_H1_live.csv" ],
-    }
-    resolved = {}
-    for tf, names in candidates.items():
-        for nm in names:
-            p = base_dir / nm
-            if p.exists():
-                resolved[tf] = str(p); break
-    if "30T" not in resolved:
-        raise FileNotFoundError(f"Main timeframe '30T' live csv not found under {base_dir}")
-    return resolved
-
-def ensure_columns(X: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+# ---------------- helpers ----------------
+def ensure_columns(X: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     if not cols:
         return X
     X2 = X.copy()
     missing = [c for c in cols if c not in X2.columns]
     for c in missing:
         X2[c] = 0.0
-    # ترتیب دقیق
     return X2[cols]
 
-def prob_to_signal(p: float, lo: float, hi: float) -> str:
-    if np.isnan(p):
-        return "NONE"
-    if p <= lo:
-        return "SELL"
-    if p >= hi:
-        return "BUY"
-    return "NONE"
+def find_live_paths_here(symbol: str) -> dict[str,str]:
+    """
+    Looks for *_live.csv only in current folder.
+    """
+    here = Path(".").resolve()
+    mapping = {
+        "30T": f"{symbol}_M30_live.csv",
+        "15T": f"{symbol}_M15_live.csv",
+        "5T" : f"{symbol}_M5_live.csv",
+        "1H" : f"{symbol}_H1_live.csv",
+    }
+    res = {}
+    for tf, nm in mapping.items():
+        p = here / nm
+        if p.exists():
+            res[tf] = str(p)
+    return res
+
+def find_raw_paths_here(symbol: str) -> dict[str,str]:
+    here = Path(".").resolve()
+    candidates = {
+        "30T": [f"{symbol}_M30.csv", f"{symbol}_30T.csv"],
+        "15T": [f"{symbol}_M15.csv", f"{symbol}_15T.csv"],
+        "5T" : [f"{symbol}_M5.csv",  f"{symbol}_5T.csv" ],
+        "1H" : [f"{symbol}_H1.csv",  f"{symbol}_1H.csv" ],
+    }
+    out = {}
+    for tf, names in candidates.items():
+        for nm in names:
+            p = here / nm
+            if p.exists():
+                out[tf] = str(p); break
+    return out
+
+def atomic_write(path: Path, text: str):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 # ---------------- main ----------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--verbosity", type=int, default=1)
-    ap.add_argument("--base-dir", type=str, default=".")
     ap.add_argument("--symbol", type=str, default="XAUUSD")
-    ap.add_argument("--poll", type=float, default=0.15, help="seconds between polls")
     ap.add_argument("--best-model", type=str, default="best_model.pkl")
+    ap.add_argument("--poll-sec", type=float, default=2.0)
+    ap.add_argument("--verbosity", type=int, default=1)
     args = ap.parse_args()
 
     setup_logging(args.verbosity)
-    logging.info("=== pridiction_in_production started ===")
+    logging.info("=== prediction_in_production_v5 started ===")
 
+    # 1) model
     payload = load_payload_best_model(args.best_model)
     model   = payload["pipeline"]
     cols    = payload.get("train_window_cols") or []
-    lo_thr  = float(payload["neg_thr"])
-    hi_thr  = float(payload["pos_thr"])
-    logging.info(f"Model loaded | feats={len(cols)} | neg_thr={lo_thr:.3f} | pos_thr={hi_thr:.3f}")
+    window  = int(payload.get("window_size", 1))
+    neg_thr = float(payload.get("neg_thr", 0.005))
+    pos_thr = float(payload.get("pos_thr", 0.995))
+    logging.info("Model loaded | feats=%d | neg_thr=%.3f | pos_thr=%.3f", len(cols), neg_thr, pos_thr)
 
-    base_dir = Path(args.base_dir).resolve()
-    ans_path = base_dir / "answer.txt"
-    last_mtime: float = 0.0
+    # 2) wait for LIVE 30T in current folder
+    last_seen_ts = None
+    backoff = args.poll_sec
 
     while True:
+        live_paths = find_live_paths_here(args.symbol)
+        if "30T" not in live_paths:
+            logging.warning("[wait] 30T live CSV not found in current folder. Waiting...")
+            time.sleep(backoff)
+            backoff = min(backoff * 1.3, 8.0)
+            continue
+
+        # combine with any available others
+        filepaths = {**live_paths}
+        # (اختیاری) اگر M15/M5/H1 لایو نبودند، وجود خام را هم در همین پوشه چک کن (برای تکمیل فیچرها)
+        raw_paths = find_raw_paths_here(args.symbol)
+        for tf in ("15T","5T","1H"):
+            if tf not in filepaths and tf in raw_paths:
+                filepaths[tf] = raw_paths[tf]
+
+        # 3) prep
+        prep = PREPARE_DATA_FOR_TRAIN_PRODUCTION(filepaths=filepaths, main_timeframe="30T", verbose=False)
+        # لود دیتای تا انتهای فایل لایو اصلی:
         try:
-            filepaths = resolve_live_paths(base_dir, args.symbol)
-            # تشخیص آپدیت بر اساس mtime فایل 30T
-            main_live = None
-            for nm in (f"{args.symbol}_30T_live.csv", f"{args.symbol}_M30_live.csv"):
-                p = base_dir / nm
-                if p.exists():
-                    main_live = p; break
-            if main_live is None:
-                time.sleep(args.poll); continue
-            mt = main_live.stat().st_mtime
-            if mt <= last_mtime:
-                time.sleep(args.poll); continue
-            last_mtime = mt
-
-            # پردازش با کلاس Production (Cut-Before-Resample با خود فایل‌های live)
-            prep = PREPARE_DATA_FOR_TRAIN_PRODUCTION(
-                filepaths=filepaths, main_timeframe="30T",
-                verbose=False, fast_mode=True, strict_disk_feed=True, disable_drift=True
-            )
-            merged = prep.load_data_up_to(pd.Timestamp.max)
-            if merged.empty:
-                time.sleep(args.poll); continue
-
-            # فقط فیچرهایی که مدل انتظار دارد (Feature-Freeze)
-            X_all, _, _ = prep.ready(merged, selected_features=cols, make_labels=False)
-            if X_all.empty:
-                time.sleep(args.poll); continue
-
-            X_last = ensure_columns(X_all.tail(1).reset_index(drop=True), cols)
-            if hasattr(model, "predict_proba"):
-                p = float(model.predict_proba(X_last)[:, 1][0])
-                sig = prob_to_signal(p, lo_thr, hi_thr)
-            else:
-                yhat = int(model.predict(X_last)[0])
-                p = np.nan
-                sig = "BUY" if yhat == 1 else ("SELL" if yhat == 0 else "NONE")
-
-            ans_path.write_text(sig, encoding="utf-8")
-            logging.info(f"answer.txt -> {sig} (p={p:.4f})")
-        except KeyboardInterrupt:
-            break
+            m30 = pd.read_csv(filepaths["30T"])
+            if "time" not in m30.columns: raise ValueError("M30_live has no 'time' column")
+            m30["time"] = pd.to_datetime(m30["time"], errors="coerce")
+            m30 = m30.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+            if m30.empty:
+                time.sleep(backoff); continue
+            ts_now = m30["time"].iloc[-1]
         except Exception as e:
-            logging.exception(e)
-            time.sleep(max(0.25, args.poll))
+            logging.error("Failed reading main live CSV: %s", e)
+            time.sleep(backoff); continue
+
+        if last_seen_ts is not None and pd.Timestamp(ts_now) <= pd.Timestamp(last_seen_ts):
+            # nothing new
+            time.sleep(args.poll-sec if hasattr(args, 'poll-sec') else backoff)
+            continue
+
+        # 4) Build merged up to ts_now
+        try:
+            merged = prep.load_data_up_to(ts_now)
+            tcol = "30T_time"
+            merged[tcol] = pd.to_datetime(merged[tcol], errors="coerce")
+            merged = merged.dropna(subset=[tcol]).sort_values(tcol).reset_index(drop=True)
+            if merged.empty:
+                logging.warning("Merged is empty up to %s; retrying...", ts_now)
+                time.sleep(backoff); continue
+        except Exception as e:
+            logging.error("prep.load_data_up_to error: %s", e)
+            time.sleep(backoff); continue
+
+        # 5) Ready() to produce X/y (train-mode to keep labels rule)
+        try:
+            X, y, feats = prep.ready(merged, window=window, selected_features=cols, mode="train", with_times=False)
+            if X.empty:
+                logging.warning("X is empty at %s; retrying...", ts_now)
+                time.sleep(backoff); continue
+        except Exception as e:
+            logging.error("prep.ready error: %s", e)
+            time.sleep(backoff); continue
+
+        X_last = ensure_columns(X.tail(1).reset_index(drop=True), cols)
+
+        # 6) Predict → BUY/SELL/NONE
+        try:
+            if hasattr(model, "predict_proba"):
+                p = float(model.predict_proba(X_last)[:,1][0])
+                if p <= neg_thr:
+                    yhat = "SELL"
+                elif p >= pos_thr:
+                    yhat = "BUY"
+                else:
+                    yhat = "NONE"
+            else:
+                pred = int(model.predict(X_last)[0])
+                yhat = "BUY" if pred==1 else "SELL"
+                p = np.nan
+        except Exception as e:
+            logging.error("Model inference error: %s", e)
+            time.sleep(backoff); continue
+
+        # 7) Write answer.txt atomically
+        try:
+            out = Path("answer.txt")
+            atomic_write(out, yhat)
+            logging.info("answer=%s (p=%.6f) @ %s", yhat, p if not np.isnan(p) else -1, ts_now)
+        except Exception as e:
+            logging.error("answer.txt write error: %s", e)
+
+        last_seen_ts = ts_now
+        backoff = args.poll_sec
+        time.sleep(args.poll_sec)
 
 if __name__ == "__main__":
     main()
