@@ -1,305 +1,198 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
+"""
+prepare_data_for_train_production.py
+------------------------------------
+نسخه Production که تضمین می‌کند *Cut-Before-Resample* رعایت شود و
+دقیقاً همان پایپ‌لاین کلاس اصلی (PREPARE_DATA_FOR_TRAIN) در Train/Batch تکرار گردد.
+
+ایده‌ی کلیدی:
+- برای هر ts_end هر تایم‌فریم را تا <= ts_end کات می‌کنیم،
+- این کات‌ها را موقتاً داخل یک پوشه‌ی temp ذخیره می‌کنیم،
+- سپس یک نمونه از PREPARE_DATA_FOR_TRAIN با همین فایل‌های کات‌شده می‌سازیم
+  و همان متد load_data() خودِ کلاسِ اصلی را صدا می‌زنیم.
+=> به‌این‌ترتیب، هر اندیکاتور/ری‌سمپل/ادغام کاملاً مثل Train اجرا می‌شود.
+"""
+
 from __future__ import annotations
-import os, sys, json, time, pickle, logging, argparse, gzip, bz2, lzma, zipfile
+import os, shutil, tempfile, logging
 from pathlib import Path
-import numpy as np
+from typing import Dict, Optional, List, Tuple
 import pandas as pd
-from sklearn.metrics import accuracy_score, balanced_accuracy_score
+import numpy as np
 
-from prepare_data_for_train_production import PREPARE_DATA_FOR_TRAIN_PRODUCTION
+from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN  # کلاس اصلی شما
 
-LOG_FILE = "live_like_sim_v4.log"
+class PREPARE_DATA_FOR_TRAIN_PRODUCTION:
+    def __init__(
+        self,
+        filepaths: Optional[Dict[str, str]] = None,
+        main_timeframe: str = "30T",
+        verbose: bool = True,
+        fast_mode: bool = True,
+        strict_disk_feed: bool = True,
+        from_memory: Optional[Dict[str, pd.DataFrame]] = None,
+        disable_drift: bool = True,
+    ):
+        self.filepaths = {k: str(v) for k, v in (filepaths or {}).items()}
+        self.main_timeframe = main_timeframe
+        self.verbose = verbose
+        self.fast_mode = fast_mode
+        self.strict_disk_feed = strict_disk_feed
+        self._raw_memory = None
 
-# ---------------- Logging ----------------
-def setup_logging(verbosity:int=1):
-    logger = logging.getLogger()
-    logger.handlers.clear()
-    logger.setLevel(logging.INFO if verbosity<=1 else logging.DEBUG)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s",
-                            "%Y-%m-%d %H:%M:%S")
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    fh.setLevel(logging.INFO); fh.setFormatter(fmt); logger.addHandler(fh)
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO); ch.setFormatter(fmt); logger.addHandler(ch)
-    return logger
+        if from_memory is not None:
+            mem_norm: Dict[str, pd.DataFrame] = {}
+            for tf, df in from_memory.items():
+                d = df.copy()
+                if "time" not in d.columns:
+                    if d.columns.size > 0:
+                        d = d.rename(columns={d.columns[0]: "time"})
+                    else:
+                        raise ValueError(f"[from_memory:{tf}] empty dataframe without 'time'")
+                d["time"] = pd.to_datetime(d["time"], errors="coerce")
+                d = d.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+                mem_norm[tf] = d
+            self._raw_memory = mem_norm
 
-# ---------------- Robust model loader (مثل v3) ----------------
-def _try_pickle(fp: str):
-    with open(fp, "rb") as f:
-        return pickle.load(f)
+        self._raw_cache: Dict[str, pd.DataFrame] = {}
+        self._tmp_dir: Optional[Path] = None
 
-def _try_joblib(fp: str):
-    import joblib
-    return joblib.load(fp)
+        # drift در Production غیرفعال (Parity با لایو)
+        self._disable_drift = bool(disable_drift)
 
-def _try_gzip(fp: str):
-    with gzip.open(fp, "rb") as f:
-        return pickle.load(f)
+    # --------- کمک‌متدها ---------
+    def _log(self, msg: str):
+        if self.verbose:
+            print(msg)
 
-def _try_bz2(fp: str):
-    with bz2.open(fp, "rb") as f:
-        return pickle.load(f)
+    def load_all(self):
+        """خواندن کامل CSV خام یا حافظه‌ای و کش کردن آن‌ها."""
+        self._raw_cache.clear()
+        if self._raw_memory is not None:
+            self._raw_cache.update(self._raw_memory)
+            for tf, df in self._raw_cache.items():
+                self._log(f"[raw/mem] {tf}: {len(df)} rows")
+            return
 
-def _try_lzma(fp: str):
-    with lzma.open(fp, "rb") as f:
-        return pickle.load(f)
+        if not self.filepaths:
+            raise ValueError("[production] filepaths or from_memory is required")
+        for tf, fp in self.filepaths.items():
+            p = Path(fp)
+            if not p.exists():
+                raise FileNotFoundError(f"[production] missing file for '{tf}': {p}")
+            df = pd.read_csv(p)
+            if "time" not in df.columns:
+                raise ValueError(f"[{tf}] 'time' column missing in CSV")
+            df["time"] = pd.to_datetime(df["time"], errors="coerce")
+            df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+            self._raw_cache[tf] = df
+            self._log(f"[raw/disk] {tf}: {len(df)} rows -> {p.name}")
 
-def _try_zip(fp: str):
-    with zipfile.ZipFile(fp, "r") as zf:
-        for name in zf.namelist():
-            if name.endswith("/"):
-                continue
-            with zf.open(name, "r") as f:
-                data = f.read()
-                try:
-                    return pickle.loads(data)
-                except Exception:
+    def _ensure_loaded(self):
+        if not self._raw_cache:
+            self.load_all()
+
+    def _write_cut_csvs(self, ts_now: pd.Timestamp) -> Dict[str, str]:
+        """
+        برای هر TF تا ts_now کات می‌زند و فایل‌های موقتی می‌سازد.
+        خروجی: دیکشنری از مسیر فایل‌های موقت.
+        """
+        self._ensure_loaded()
+        tmp_dir = Path(tempfile.mkdtemp(prefix="prod_cut_"))
+        self._tmp_dir = tmp_dir
+
+        out_paths: Dict[str, str] = {}
+        for tf, df in self._raw_cache.items():
+            cut = df[df["time"] <= ts_now].copy()
+            if cut.empty:
+                # فایل خالی ولی با سرستون‌ها
+                cut = df.head(0).copy()
+            out_fp = tmp_dir / f"{tf}.csv"
+            cut.to_csv(out_fp, index=False)
+            out_paths[tf] = str(out_fp)
+        return out_paths
+
+    def _cleanup_tmp(self):
+        if self._tmp_dir and self._tmp_dir.exists():
+            shutil.rmtree(self._tmp_dir, ignore_errors=True)
+        self._tmp_dir = None
+
+    # --------- API اصلی Production ---------
+    def load_data_up_to(self, ts_now) -> pd.DataFrame:
+        """
+        1) روی هر TF تا ts_now کات می‌زند،
+        2) PREPARE_DATA_FOR_TRAIN را با همان فایل‌های کات‌شده instantiate می‌کند،
+        3) همان load_data() کلاس اصلی را فراخوانی می‌کند،
+        4) دیتافریم ادغام‌شده‌ی نهایی را برمی‌گرداند.
+        """
+        ts_now = pd.to_datetime(ts_now)
+        cut_paths = self._write_cut_csvs(ts_now)
+        try:
+            prep = PREPARE_DATA_FOR_TRAIN(
+                filepaths=cut_paths,
+                main_timeframe=self.main_timeframe,
+                verbose=self.verbose,
+                fast_mode=self.fast_mode,
+                strict_disk_feed=self.strict_disk_feed,
+            )
+            # drift را در Production حذف می‌کنیم تا parity با لایو باشد
+            if self._disable_drift:
+                if hasattr(prep, "shared_start_date"):
+                    setattr(prep, "shared_start_date", None)
+                if hasattr(prep, "drift_finder"):
                     try:
-                        return json.loads(data.decode("utf-8"))
+                        delattr(prep, "drift_finder")
                     except Exception:
                         pass
-    raise ValueError("No loadable member found in ZIP.")
 
-def _raw_head(fp: str, n=8) -> bytes:
-    with open(fp, "rb") as f:
-        return f.read(n)
+            merged = prep.load_data()
+            # پاک‌سازی‌های سبک
+            tcol = f"{self.main_timeframe}_time"
+            if tcol in merged.columns:
+                merged[tcol] = pd.to_datetime(merged[tcol], errors="coerce")
+                merged = merged.dropna(subset=[tcol]).sort_values(tcol).reset_index(drop=True)
+            merged.replace([np.inf, -np.inf], np.nan, inplace=True)
+            merged.ffill(inplace=True)
+            merged.dropna(how="all", inplace=True)
+            return merged
+        finally:
+            self._cleanup_tmp()
 
-def load_payload_best_model(pkl_path: str="best_model.pkl") -> dict:
-    p = Path(pkl_path)
-    if not p.exists():
-        raise FileNotFoundError(f"'best_model.pkl' not found at {p.resolve()}")
+    def ready(
+        self,
+        merged: pd.DataFrame,
+        selected_features: Optional[List[str]] = None,
+        make_labels: bool = True,
+    ) -> Tuple[pd.DataFrame, Optional[pd.Series], List[str]]:
+        """
+        هیچ فیچر جدیدی نمی‌سازد؛ فرض این است که همانند Train، اندیکاتورها/ستون‌ها
+        قبلاً توسط کلاس اصلی اضافه شده‌اند. فقط:
+          - ترتیب/زیرمجموعه ستون‌ها را مطابق selected_features فیکس می‌کند،
+          - در صورت نیاز y را طبق تعریف استاندارد می‌سازد: y(t)=1 اگر close_{t+1}>close_t.
+        """
+        df = merged.copy()
+        tmain = self.main_timeframe
+        close_col = f"{tmain}_close"
 
-    head = _raw_head(pkl_path, 8)
-    loaders = []
-    if head.startswith(b"\x80"):
-        loaders = [_try_pickle, _try_joblib, _try_gzip, _try_bz2, _try_lzma, _try_zip]
-    elif head.startswith(b"\x1f\x8b"):
-        loaders = [_try_gzip, _try_pickle, _try_joblib, _try_bz2, _try_lzma, _try_zip]
-    elif head.startswith(b"BZh"):
-        loaders = [_try_bz2, _try_pickle, _try_joblib, _try_gzip, _try_lzma, _try_zip]
-    elif head.startswith(b"\xfd7zXZ\x00"):
-        loaders = [_try_lzma, _try_pickle, _try_joblib, _try_gzip, _try_bz2, _try_zip]
-    elif head.startswith(b"PK\x03\x04"):
-        loaders = [_try_zip, _try_pickle, _try_joblib, _try_gzip, _try_bz2, _try_lzma]
-    else:
-        loaders = [_try_joblib, _try_pickle, _try_gzip, _try_bz2, _try_lzma, _try_zip]
-
-    last_err = None
-    raw = None
-    for loader in loaders:
-        try:
-            raw = loader(pkl_path)
-            break
-        except Exception as e:
-            last_err = e
-
-    if raw is None:
-        try:
-            with open(pkl_path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-        except Exception:
-            pass
-
-    if raw is None:
-        raise RuntimeError(
-            f"Could not load best_model.pkl. First bytes: {head!r}. Last error: {repr(last_err)}"
-        )
-
-    payload = {}
-    if isinstance(raw, dict):
-        model = raw.get("pipeline") or raw.get("model") or raw.get("estimator") \
-                or raw.get("clf") or raw.get("best_estimator")
-        if model is None:
-            for k, v in raw.items():
-                if hasattr(v, "predict") or hasattr(v, "predict_proba"):
-                    model = v; break
-        if model is None:
-            raise ValueError("Loaded dict but no estimator found.")
-        payload["pipeline"] = model
-        payload["window_size"] = int(raw.get("window_size", 1))
-        feats = raw.get("train_window_cols") or raw.get("feats") or []
-        payload["train_window_cols"] = list(feats) if isinstance(feats,(list,tuple)) else []
-        payload["neg_thr"] = float(raw.get("neg_thr", 0.005))
-        payload["pos_thr"] = float(raw.get("pos_thr", 0.995))
-        if "scaler" in raw: payload["scaler"] = raw["scaler"]
-    else:
-        payload["pipeline"] = raw
-        payload["window_size"] = 1
-        payload["train_window_cols"] = []
-        payload["neg_thr"] = 0.005
-        payload["pos_thr"] = 0.995
-
-    # thresholds override از train_distribution.json (اختیاری)
-    if os.path.exists("train_distribution.json"):
-        try:
-            with open("train_distribution.json", "r", encoding="utf-8") as jf:
-                td = json.load(jf)
-            if "neg_thr" in td: payload["neg_thr"] = float(td["neg_thr"])
-            if "pos_thr" in td: payload["pos_thr"] = float(td["pos_thr"])
-            logging.info("Train distribution loaded from train_distribution.json")
-        except Exception:
-            pass
-
-    return payload
-
-# ---------------- path resolver ----------------
-def resolve_timeframe_paths(base_dir: Path, symbol: str) -> dict:
-    candidates = {
-        "30T": [f"{symbol}_30T.csv", f"{symbol}_M30.csv"],
-        "15T": [f"{symbol}_15T.csv", f"{symbol}_M15.csv"],
-        "5T" : [f"{symbol}_5T.csv",  f"{symbol}_M5.csv" ],
-        "1H" : [f"{symbol}_1H.csv",  f"{symbol}_H1.csv" ],
-    }
-    resolved = {}
-    for tf, names in candidates.items():
-        for nm in names:
-            p = base_dir / nm
-            if p.exists():
-                resolved[tf] = str(p)
-                break
-    if "30T" not in resolved:
-        raise FileNotFoundError(f"Main timeframe '30T' not found under {base_dir}")
-    return resolved
-
-# ---------------- ensure columns order ----------------
-def ensure_columns(X: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    if not cols:
-        return X
-    X2 = X.copy()
-    missing = [c for c in cols if c not in X2.columns]
-    for c in missing:
-        X2[c] = 0.0
-    return X2[cols]
-
-# ---------------- main ----------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--last-n", type=int, default=2000)
-    ap.add_argument("--verbosity", type=int, default=1)
-    ap.add_argument("--base-dir", type=str, default=".")
-    ap.add_argument("--symbol", type=str, default="XAUUSD")
-    args = ap.parse_args()
-
-    setup_logging(args.verbosity)
-    logging.info("=== live_like_sim_v4 starting (cut BEFORE resample) ===")
-
-    # 1) مدل
-    payload = load_payload_best_model("best_model.pkl")
-    model   = payload["pipeline"]
-    cols    = payload.get("train_window_cols") or []
-    window  = int(payload["window_size"])
-    logging.info(f"Model loaded | window={window} | feats={len(cols)} | "
-                 f"neg_thr={payload['neg_thr']:.3f} | pos_thr={payload['pos_thr']:.3f}")
-
-    # 2) CSV paths
-    base_dir = Path(args.base_dir).resolve()
-    filepaths = resolve_timeframe_paths(base_dir, args.symbol)
-
-    # 3) PREP (Production)
-    prep = PREPARE_DATA_FOR_TRAIN_PRODUCTION(filepaths=filepaths, main_timeframe="30T", verbose=True)
-    prep.load_all()
-
-    # برای تعیین بازه‌ی tail و timestamps:
-    merged_full = prep.load_data_up_to(pd.Timestamp.max)  # تا انتهای دیتاست
-    main_t = f"{prep.main_timeframe}_time"
-    if main_t not in merged_full.columns or merged_full.empty:
-        logging.info("No data available after processing.")
-        return
-
-    merged_full[main_t] = pd.to_datetime(merged_full[main_t])
-    merged_full.sort_values(main_t, inplace=True)
-    merged_full.reset_index(drop=True, inplace=True)
-
-    total = len(merged_full)
-    start_idx = max(0, total - args.last_n)
-    logging.info(f"Main rows={total} | last_n={args.last_n} | start_idx={start_idx}")
-
-    timestamps = merged_full.loc[start_idx:, main_t].tolist()
-    records = []
-
-    # --- Live-like: تکرار روی هر timestamp (cut → resample → FE → predict) ---
-    for i, ts_end in enumerate(timestamps, start=1):
-        if i % 200 == 0:
-            logging.info(f"[Live] step {i}/{len(timestamps)} @ {ts_end}")
-
-        merged_end = prep.load_data_up_to(pd.Timestamp(ts_end))
-        if merged_end.empty:
-            continue
-
-        X, y, feats = prep.ready(merged_end, window=window, selected_features=cols, mode="train", with_times=False)
-        if X.empty:
-            continue
-
-        # آخرین رکورد برای پیش‌بینی لایو
-        X_last = ensure_columns(X.tail(1).reset_index(drop=True), cols)
-
-        if hasattr(model, "predict_proba"):
-            p = float(model.predict_proba(X_last)[:, 1][0])
-            # آستانه‌ی دوسویه
-            if p <= float(payload["neg_thr"]): yhat = 0
-            elif p >= float(payload["pos_thr"]): yhat = 1
-            else: yhat = -1
+        if selected_features and len(selected_features) > 0:
+            # ستون‌های جاافتاده را بعداً با صفر پر می‌کنیم (در predictor)
+            feat_list = list(selected_features)
+            X = df[[c for c in feat_list if c in df.columns]].copy()
         else:
-            yhat = int(model.predict(X_last)[0])
-            p = np.nan
+            # اگر کاربر feature list نداده، همه‌ی ستون‌های عددی را استفاده کن (اما زمان را حذف کن)
+            num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            feat_list = [c for c in num_cols if not c.endswith("_time")]
+            X = df[feat_list].copy()
 
-        # y_true = آخرین برچسب موجود
-        y_true = int(y.iloc[-1]) if len(y)>0 else -1
+        y = None
+        if make_labels:
+            if close_col not in df.columns:
+                raise ValueError(f"Missing '{close_col}' for label building.")
+            yy = (df[close_col].shift(-1) > df[close_col]).astype("Int64")
+            # سطر آخر لیبل ندارد
+            yy = yy.iloc[:-1].astype("Int64")
+            X = X.iloc[:-1, :].copy()
+            y = yy.astype(int)
 
-        records.append({
-            "timestamp": ts_end,
-            "pred_live": yhat,
-            "prob_live": p,
-            "y_true": y_true
-        })
-
-    live_df = pd.DataFrame.from_records(records)
-    if live_df.empty:
-        logging.info("No live records produced.")
-        return
-
-    # --- Chimney روی همان پنجره‌ی tail (جهت تطبیق) ---
-    # یک‌بار تا انتهای دیتاست:
-    block_tail = merged_full.iloc[start_idx:].copy()
-    Xc, yc, _ = prep.ready(block_tail, window=window, selected_features=cols, mode="train", with_times=False)
-    if not Xc.empty:
-        if hasattr(model, "predict_proba"):
-            prob = model.predict_proba(ensure_columns(Xc, cols))[:, 1]
-            yp = np.full(len(prob), -1, dtype=int)
-            yp[prob <= float(payload["neg_thr"])] = 0
-            yp[prob >= float(payload["pos_thr"])] = 1
-        else:
-            yp = model.predict(ensure_columns(Xc, cols))
-            prob = np.full(len(yp), np.nan)
-        chim_ts = block_tail[f"{prep.main_timeframe}_time"].iloc[-len(yp):].reset_index(drop=True)
-        chim_df = pd.DataFrame({"timestamp": chim_ts, "pred_chimney": yp})
-        live_df = live_df.merge(chim_df, on="timestamp", how="left")
-        live_df["agree_pred"] = (live_df["pred_live"] == live_df["pred_chimney"]).astype(int)
-    else:
-        live_df["pred_chimney"] = -1
-        live_df["agree_pred"] = 0
-
-    # --- متریک‌ها ---
-    def _metrics(df: pd.DataFrame, col: str):
-        sub = df[df[col] != -1]
-        if sub.empty:
-            return (np.nan, np.nan, 0.0)
-        acc = accuracy_score(sub["y_true"], sub[col])
-        bacc = balanced_accuracy_score(sub["y_true"], sub[col])
-        cover = len(sub) / len(df)
-        return (acc, bacc, cover)
-
-    acc_l, bacc_l, cov_l = _metrics(live_df, "pred_live")
-    acc_c, bacc_c, cov_c = _metrics(live_df, "pred_chimney")
-
-    logging.info(f"[Final] Live    : acc={acc_l:.3f} bAcc={bacc_l:.3f} cover={cov_l:.3f}")
-    logging.info(f"[Final] Chimney : acc={acc_c:.3f} bAcc={bacc_c:.3f} cover={cov_c:.3f}")
-    if "agree_pred" in live_df.columns:
-        logging.info(f"[Final] Pred agreement (chimney vs live): {live_df['agree_pred'].mean():.3f}")
-
-    live_df.to_csv("predictions_compare_v4.csv", index=False)
-    logging.info("=== live_like_sim_v4 completed ===")
-
-if __name__ == "__main__":
-    main()
+        return X, y, feat_list

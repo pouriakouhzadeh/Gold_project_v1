@@ -1,224 +1,255 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
-from __future__ import annotations
+"""
+pridiction_in_production.py
+---------------------------
+اسکریپت پیش‌بینی لایو: فایل‌های *_live.csv را می‌خواند، با کلاس Production پردازش می‌کند
+و نتیجه را به صورت BUY/SELL/NONE در answer.txt می‌نویسد.
+"""
 
-import os, sys, time, json, joblib, logging, argparse, hashlib
+from __future__ import annotations
+import os, sys, time, json, gzip, bz2, lzma, zipfile, pickle, logging, argparse
 from pathlib import Path
-from collections import deque
+from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
+from prepare_data_for_train_production import PREPARE_DATA_FOR_TRAIN_PRODUCTION
 
-LOG_FILE = "prediction_in_production_v2.log"
+LOG_FILE = "pridiction_in_production.log"
 
+# ---------------- Logging ----------------
 def setup_logging(verbosity:int=1):
     logger = logging.getLogger()
     logger.handlers.clear()
     logger.setLevel(logging.INFO if verbosity<=1 else logging.DEBUG)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s","%Y-%m-%d %H:%M:%S")
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8"); fh.setLevel(logging.INFO); fh.setFormatter(fmt); logger.addHandler(fh)
     ch = logging.StreamHandler(sys.stdout); ch.setLevel(logging.INFO); ch.setFormatter(fmt); logger.addHandler(ch)
     return logger
 
-def md5_list(xs:list[str]) -> str:
-    h = hashlib.md5()
-    for s in xs:
-        h.update(str(s).encode("utf-8"))
-    return h.hexdigest()
+# ---------------- Robust model loader ----------------
+def _try_pickle(fp: str):
+    with open(fp, "rb") as f:
+        return pickle.load(f)
+
+def _try_joblib(fp: str):
+    import joblib
+    return joblib.load(fp)
+
+def _try_gzip(fp: str):
+    with gzip.open(fp, "rb") as f:
+        return pickle.load(f)
+
+def _try_bz2(fp: str):
+    with bz2.open(fp, "rb") as f:
+        return pickle.load(f)
+
+def _try_lzma(fp: str):
+    with lzma.open(fp, "rb") as f:
+        return pickle.load(f)
+
+def _try_zip(fp: str):
+    with zipfile.ZipFile(fp, "r") as zf:
+        for name in zf.namelist():
+            if name.endswith("/"):
+                continue
+            with zf.open(name, "r") as f:
+                data = f.read()
+                try:
+                    return pickle.loads(data)
+                except Exception:
+                    try:
+                        return json.loads(data.decode("utf-8"))
+                    except Exception:
+                        pass
+    raise ValueError("No loadable member found in ZIP.")
+
+def _raw_head(fp: str, n=8) -> bytes:
+    with open(fp, "rb") as f:
+        return f.read(n)
 
 def load_payload_best_model(pkl_path: str="best_model.pkl") -> dict:
-    payload = joblib.load(pkl_path)
-    if isinstance(payload, dict):
-        model = payload.get("pipeline") or payload.get("model") or payload.get("estimator") or payload.get("clf") or payload.get("best_estimator")
-        if model is None:
-            raise ValueError("Could not find model inside best_model.pkl dictionary.")
-        out = {
-            "pipeline": model,
-            "window_size": int(payload.get("window_size", 1)),
-            "train_window_cols": list(payload.get("train_window_cols") or payload.get("feats") or []),
-            "neg_thr": float(payload.get("neg_thr", 0.005)),
-            "pos_thr": float(payload.get("pos_thr", 0.995)),
-        }
-        if "scaler" in payload: out["scaler"] = payload["scaler"]
-        return out
-    return {"pipeline": payload, "window_size": 1, "train_window_cols": [], "neg_thr": 0.005, "pos_thr": 0.995}
+    p = Path(pkl_path)
+    if not p.exists():
+        raise FileNotFoundError(f"'best_model.pkl' not found at {p.resolve()}")
 
-def resolve_live_paths(base_dir: Path, symbol: str) -> dict[str,str]:
-    patterns = {
+    head = _raw_head(pkl_path, 8)
+    loaders = []
+    if head.startswith(b"\x80"):
+        loaders = [_try_pickle, _try_joblib, _try_gzip, _try_bz2, _try_lzma, _try_zip]
+    elif head.startswith(b"\x1f\x8b"):
+        loaders = [_try_gzip, _try_pickle, _try_joblib, _try_bz2, _try_lzma, _try_zip]
+    elif head.startswith(b"BZh"):
+        loaders = [_try_bz2, _try_pickle, _try_joblib, _try_gzip, _try_lzma, _try_zip]
+    elif head.startswith(b"\xfd7zXZ\x00"):
+        loaders = [_try_lzma, _try_pickle, _try_joblib, _try_gzip, _try_bz2, _try_zip]
+    elif head.startswith(b"PK\x03\x04"):
+        loaders = [_try_zip, _try_pickle, _try_joblib, _try_gzip, _try_bz2, _try_lzma]
+    else:
+        loaders = [_try_joblib, _try_pickle, _try_gzip, _try_bz2, _try_lzma, _try_zip]
+
+    last_err = None
+    raw = None
+    for loader in loaders:
+        try:
+            raw = loader(pkl_path); break
+        except Exception as e:
+            last_err = e
+
+    if raw is None:
+        try:
+            with open(pkl_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            pass
+
+    if raw is None:
+        raise RuntimeError(f"Could not load best_model.pkl. First bytes: {head!r}. Last error: {repr(last_err)}")
+
+    payload = {}
+    if isinstance(raw, dict):
+        model = raw.get("pipeline") or raw.get("model") or raw.get("estimator") or raw.get("clf") or raw.get("best_estimator")
+        if model is None:
+            for k, v in raw.items():
+                if hasattr(v, "predict") or hasattr(v, "predict_proba"):
+                    model = v; break
+        if model is None:
+            raise ValueError("Loaded dict but no estimator found.")
+        payload["pipeline"] = model
+        payload["window_size"] = int(raw.get("window_size", 1))
+        feats = raw.get("train_window_cols") or raw.get("feats") or []
+        payload["train_window_cols"] = list(feats) if isinstance(feats,(list,tuple)) else []
+        payload["neg_thr"] = float(raw.get("neg_thr", 0.495))
+        payload["pos_thr"] = float(raw.get("pos_thr", 0.505))
+        if "scaler" in raw:
+            payload["scaler"] = raw["scaler"]
+    else:
+        payload["pipeline"] = raw
+        payload["window_size"] = 1
+        payload["train_window_cols"] = []
+        payload["neg_thr"] = 0.495
+        payload["pos_thr"] = 0.505
+
+    # override اختیاری
+    if os.path.exists("train_distribution.json"):
+        try:
+            with open("train_distribution.json", "r", encoding="utf-8") as jf:
+                td = json.load(jf)
+            if "neg_thr" in td: payload["neg_thr"] = float(td["neg_thr"])
+            if "pos_thr" in td: payload["pos_thr"] = float(td["pos_thr"])
+            logging.info("Train distribution loaded from train_distribution.json")
+        except Exception:
+            pass
+    return payload
+
+# ---------------- سایر کمک‌متدها ----------------
+def resolve_live_paths(base_dir: Path, symbol: str) -> Dict[str, str]:
+    candidates = {
         "30T": [f"{symbol}_30T_live.csv", f"{symbol}_M30_live.csv"],
         "15T": [f"{symbol}_15T_live.csv", f"{symbol}_M15_live.csv"],
         "5T" : [f"{symbol}_5T_live.csv",  f"{symbol}_M5_live.csv" ],
         "1H" : [f"{symbol}_1H_live.csv",  f"{symbol}_H1_live.csv" ],
     }
     resolved = {}
-    for tf, names in patterns.items():
-        found = None
+    for tf, names in candidates.items():
         for nm in names:
             p = base_dir / nm
             if p.exists():
-                found = str(p); break
-        if not found:
-            for ch in base_dir.iterdir():
-                if ch.is_file() and any(ch.name.lower()==nm.lower() for nm in names):
-                    found = str(ch); break
-        if found:
-            resolved[tf] = found
+                resolved[tf] = str(p); break
+    if "30T" not in resolved:
+        raise FileNotFoundError(f"Main timeframe '30T' live csv not found under {base_dir}")
     return resolved
 
-def ensure_columns(X:pd.DataFrame, cols:list[str]) -> pd.DataFrame:
-    if not cols: return X
+def ensure_columns(X: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    if not cols:
+        return X
     X2 = X.copy()
-    miss = [c for c in cols if c not in X2.columns]
-    for c in miss: X2[c] = 0.0
+    missing = [c for c in cols if c not in X2.columns]
+    for c in missing:
+        X2[c] = 0.0
+    # ترتیب دقیق
     return X2[cols]
 
-def should_skip_weekend(df_main: pd.DataFrame, main_tf="30T") -> bool:
-    tcol = f"{main_tf}_time" if f"{main_tf}_time" in df_main.columns else ("time" if "time" in df_main.columns else None)
-    if not tcol: return False
-    idx = pd.to_datetime(df_main[tcol], errors="coerce")
-    if idx.empty or idx.isna().all(): return False
-    last = idx.iloc[-1]
-    return last.dayofweek in (5,6)
+def prob_to_signal(p: float, lo: float, hi: float) -> str:
+    if np.isnan(p):
+        return "NONE"
+    if p <= lo:
+        return "SELL"
+    if p >= hi:
+        return "BUY"
+    return "NONE"
 
-class AdaptiveThresholds:
-    def __init__(self, base_neg: float, base_pos: float, buf_len:int=1000, q_low=0.10, q_high=0.90, warm_min:int=500, fallback_soft=(0.30, 0.70)):
-        self.base_neg = float(base_neg)
-        self.base_pos = float(base_pos)
-        self.buf = deque(maxlen=buf_len)
-        self.q_low = float(q_low)
-        self.q_high = float(q_high)
-        self.warm_min = int(warm_min)
-        self.fallback_soft = (float(fallback_soft[0]), float(fallback_soft[1]))
-
-    def update_and_get(self, p: float) -> tuple[float,float,str]:
-        self.buf.append(float(p))
-        if len(self.buf) >= self.warm_min:
-            arr = np.asarray(self.buf, dtype=float)
-            ql = float(np.nanquantile(arr, self.q_low))
-            qh = float(np.nanquantile(arr, self.q_high))
-            return ql, qh, "adaptive"
-        if (self.base_neg <= 0.01 and self.base_pos >= 0.99):
-            return self.fallback_soft[0], self.fallback_soft[1], "soft-fallback"
-        return self.base_neg, self.base_pos, "model"
-
+# ---------------- main ----------------
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--verbosity", type=int, default=1)
     ap.add_argument("--base-dir", type=str, default=".")
     ap.add_argument("--symbol", type=str, default="XAUUSD")
-    ap.add_argument("--sleep", type=float, default=0.5)
-    ap.add_argument("--verbosity", type=int, default=1)
-    ap.add_argument("--adaptive-thr", action="store_true", help="اگر ست شود آستانه‌های تطبیقی فعال می‌شوند (پیش‌فرض خاموش).")
+    ap.add_argument("--poll", type=float, default=0.15, help="seconds between polls")
+    ap.add_argument("--best-model", type=str, default="best_model.pkl")
     args = ap.parse_args()
 
     setup_logging(args.verbosity)
-    logging.info("=== prediction_in_production v2 started ===")
+    logging.info("=== pridiction_in_production started ===")
 
-    # 1) Load model bundle (strictly the same thresholds/feats as training)
-    payload = load_payload_best_model("best_model.pkl")
+    payload = load_payload_best_model(args.best_model)
     model   = payload["pipeline"]
-    window  = int(payload["window_size"])
     cols    = payload.get("train_window_cols") or []
-    neg0    = float(payload["neg_thr"]); pos0 = float(payload["pos_thr"])
-    if not hasattr(model, "predict_proba"):
-        raise TypeError("Loaded model does not support predict_proba().")
+    lo_thr  = float(payload["neg_thr"])
+    hi_thr  = float(payload["pos_thr"])
+    logging.info(f"Model loaded | feats={len(cols)} | neg_thr={lo_thr:.3f} | pos_thr={hi_thr:.3f}")
 
-    logging.info(f"Model loaded | window={window} | feats={len(cols)} | neg_thr0={neg0:.3f} | pos_thr0={pos0:.3f}")
-
-    base = Path(args.base_dir).resolve()
-    ans_path = base / "answer.txt"
-
-    # 2) Threshold policy
-    ath = AdaptiveThresholds(neg0, pos0)
-    use_adaptive = bool(args.adaptive_thr)
-
-    # 3) Monitor for probability distribution
-    bucket_edges = np.linspace(0,1,11)
-    bucket_cnts = np.zeros(len(bucket_edges)-1, dtype=int)
-    step = 0
+    base_dir = Path(args.base_dir).resolve()
+    ans_path = base_dir / "answer.txt"
+    last_mtime: float = 0.0
 
     while True:
-        if ans_path.exists():
-            time.sleep(args.sleep); continue
-
-        live_paths = resolve_live_paths(base, args.symbol)
-        if "30T" not in live_paths:  # main TF is mandatory
-            time.sleep(args.sleep); continue
-
-        filepaths = {tf: live_paths[tf] for tf in live_paths.keys()}
-
         try:
-            # === کاملاً مشابه شبیه‌ساز: strict_disk_feed=True, fast_mode=True ===
-            prep = PREPARE_DATA_FOR_TRAIN(
+            filepaths = resolve_live_paths(base_dir, args.symbol)
+            # تشخیص آپدیت بر اساس mtime فایل 30T
+            main_live = None
+            for nm in (f"{args.symbol}_30T_live.csv", f"{args.symbol}_M30_live.csv"):
+                p = base_dir / nm
+                if p.exists():
+                    main_live = p; break
+            if main_live is None:
+                time.sleep(args.poll); continue
+            mt = main_live.stat().st_mtime
+            if mt <= last_mtime:
+                time.sleep(args.poll); continue
+            last_mtime = mt
+
+            # پردازش با کلاس Production (Cut-Before-Resample با خود فایل‌های live)
+            prep = PREPARE_DATA_FOR_TRAIN_PRODUCTION(
                 filepaths=filepaths, main_timeframe="30T",
-                verbose=False, fast_mode=True, strict_disk_feed=True
+                verbose=False, fast_mode=True, strict_disk_feed=True, disable_drift=True
             )
-            merged = prep.load_data()
+            merged = prep.load_data_up_to(pd.Timestamp.max)
+            if merged.empty:
+                time.sleep(args.poll); continue
 
-            # Skip weekends (مثل قبل)
-            if should_skip_weekend(merged, "30T"):
-                ans_path.write_text("NONE", encoding="utf-8")
-                logging.info("[Skip] Weekend detected → answer=NONE")
-                # cleanup
-                for p in list(live_paths.values()):
-                    try: Path(p).unlink(missing_ok=True)
-                    except Exception: pass
-                time.sleep(args.sleep)
-                continue
+            # فقط فیچرهایی که مدل انتظار دارد (Feature-Freeze)
+            X_all, _, _ = prep.ready(merged, selected_features=cols, make_labels=False)
+            if X_all.empty:
+                time.sleep(args.poll); continue
 
-            # === مسیر «TRAIN» برای مطابقت کامل با live_like_sim_v3 ===
-            X, y_dummy, _, _ = prep.ready(
-                merged,
-                window=window,
-                selected_features=cols,  # enforce exact train columns
-                mode="train",
-                with_times=False,
-                predict_drop_last=False,
-                train_drop_last=True     # حذف محافظه‌کارانه‌ی ردیف انتهایی
-            )
-
-            if X.empty:
-                ans_path.write_text("NONE", encoding="utf-8")
-                logging.info("[Predict] X empty → answer=NONE")
+            X_last = ensure_columns(X_all.tail(1).reset_index(drop=True), cols)
+            if hasattr(model, "predict_proba"):
+                p = float(model.predict_proba(X_last)[:, 1][0])
+                sig = prob_to_signal(p, lo_thr, hi_thr)
             else:
-                X = ensure_columns(X, cols)
-                x1 = X.tail(1)
-                prob = float(model.predict_proba(x1)[:, 1][0])
+                yhat = int(model.predict(X_last)[0])
+                p = np.nan
+                sig = "BUY" if yhat == 1 else ("SELL" if yhat == 0 else "NONE")
 
-                # thresholds: پیش‌فرض همان آستانه‌های ذخیره‌شده (مثل شبیه‌ساز)
-                if use_adaptive:
-                    neg_thr, pos_thr, tmode = ath.update_and_get(prob)
-                else:
-                    neg_thr, pos_thr, tmode = (neg0, pos0, "fixed")
-
-                # monitor
-                hist_idx = np.digitize([prob], bucket_edges) - 1
-                if 0 <= hist_idx[0] < len(bucket_cnts): bucket_cnts[hist_idx[0]] += 1
-                step += 1
-
-                if   prob >= pos_thr: ans="BUY"
-                elif prob <= neg_thr: ans="SELL"
-                else:                 ans="NONE"
-
-                ans_path.write_text(ans, encoding="utf-8")
-
-                if step % 50 == 1:
-                    col_hash = md5_list(list(X.columns))
-                    hist_txt = ",".join(str(int(c)) for c in bucket_cnts.tolist())
-                    logging.info(f"[Predict] prob={prob:.6f} → {ans} | thr=({neg_thr:.4f},{pos_thr:.4f})[{tmode}] | "
-                                 f"cols={len(cols)} md5={col_hash} | hist(0..1,10bins)={hist_txt} | Xlen={len(X)}")
-
-            # cleanup live CSVs (handshake با ژنراتور)
-            for p in list(live_paths.values()):
-                try: Path(p).unlink(missing_ok=True)
-                except Exception: pass
-
+            ans_path.write_text(sig, encoding="utf-8")
+            logging.info(f"answer.txt -> {sig} (p={p:.4f})")
+        except KeyboardInterrupt:
+            break
         except Exception as e:
-            logging.exception(f"[ERROR] {e}")
-            try: ans_path.write_text("NONE", encoding="utf-8")
-            except Exception: pass
-
-        time.sleep(args.sleep)
+            logging.exception(e)
+            time.sleep(max(0.25, args.poll))
 
 if __name__ == "__main__":
     main()
