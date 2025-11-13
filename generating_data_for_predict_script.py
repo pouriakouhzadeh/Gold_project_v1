@@ -2,93 +2,92 @@
 # -*- coding: utf-8 -*-
 """
 generating_data_for_predict_script.py
-Author: Pouria + Assistant
+Author: Pouria + Assistant (final handshake)
 
 وظایف:
-  - از CSVهای اصلی (M5,M15,M30,H1) می‌خواند.
-  - با PREPARE_DATA_FOR_TRAIN داده خام ادغام‌شده می‌سازد و مرتب می‌کند.
-  - برای steps قدم آخر سری، در هر قدم ۴ فایل *_live.csv تا زمان t می‌نویسد.
-  - منتظر answer.txt از اسکریپت دپلوی می‌ماند (حداکثر timeout-sec).
-  - تارگت را با prep.ready(...) روی همان برش تا t استخراج و با answer مقایسه می‌کند.
-  - آمار لحظه‌ای را روی کنسول چاپ می‌کند.
-  - سپس answer.txt را حذف می‌کند و به قدم بعدی می‌رود.
+  - از CSVهای خام (M5/M15/M30/H1) دیتافریم ادغام‌شده آموزش را با PREP می‌سازد.
+  - ۲۰۰ قدم آخر (قابل تغییر با --steps) را روی تایم‌استَمپ‌های ۳۰ دقیقه‌ای پیمایش می‌کند.
+  - در هر قدم ۴ فایل *_live.csv را تا آن لحظه می‌نویسد، سپس منتظر answer.txt می‌ماند.
+  - answer را با تارگت واقعی همان لحظه مقایسه می‌کند و آمار لحظه‌ای و تجمعی را روی کنسول چاپ می‌کند.
+  - طبق سناریو شما، **پس از خواندن** answer.txt آن را حذف می‌کند (تا قدم بعدی آغاز شود).
+  - اگر تا timeout پاسخی نیاید، نتیجه‌ی آن قدم TIMEOUT ثبت می‌شود.
 
-پارامترها:
-  --raw-dir
-  --watch-dir
-  --steps (default: 200)
-  --timeout-sec (default: 40)
-  --positive-class (default: 1)  => BUY ↔️ این کلاس
-  --cleanup-answer               => اگر از قبل answer.txt هست، قبل از شروع قدم حذف کند
-  --log-path
+نیازمندی‌ها:
+  - pandas, numpy
+  - PREPARE_DATA_FOR_TRAIN از پروژه
 """
 
 from __future__ import annotations
 import os, sys, time, argparse, logging
-from pathlib import Path
-from typing import Dict, Optional, List
+from logging import Formatter, StreamHandler
+from datetime import datetime
 import pandas as pd
 import numpy as np
 
-from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
+try:
+    from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
+except Exception as e:
+    PREPARE_DATA_FOR_TRAIN = None
+    raise ImportError("Cannot import PREPARE_DATA_FOR_TRAIN. Put it on PYTHONPATH.") from e
 
+APP = "generator_parity"
 LOG_FILE = "generator_parity.log"
 
-def setup_logger(log_path: str) -> logging.Logger:
-    logger = logging.getLogger("generator_parity")
-    logger.handlers.clear(); logger.propagate = False
-    logger.setLevel(logging.INFO)
-    fh = logging.FileHandler(log_path, encoding="utf-8")
-    ch = logging.StreamHandler(sys.stdout)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s","%Y-%m-%d %H:%M:%S")
-    fh.setFormatter(fmt); ch.setFormatter(fmt)
-    logger.addHandler(fh); logger.addHandler(ch)
-    return logger
+def setup_logger(path: str) -> logging.Logger:
+    log = logging.getLogger(APP)
+    log.setLevel(logging.INFO)
+    log.handlers.clear()
+    fmt = Formatter("%(asctime)s INFO: %(message)s","%Y-%m-%d %H:%M:%S")
+    fh = logging.FileHandler(path, encoding="utf-8")
+    fh.setFormatter(fmt); log.addHandler(fh)
+    ch = StreamHandler(sys.stdout); ch.setFormatter(fmt); log.addHandler(ch)
+    return log
 
-def resolve_timeframe_paths(base_dir: Path, symbol: str="XAUUSD") -> Dict[str, Path]:
-    cands = {
-        "30T": [f"{symbol}_M30.csv", f"{symbol}_30T.csv"],
-        "15T": [f"{symbol}_M15.csv", f"{symbol}_15T.csv"],
-        "5T" : [f"{symbol}_M5.csv",  f"{symbol}_5T.csv" ],
-        "1H" : [f"{symbol}_H1.csv",  f"{symbol}_1H.csv" ],
+def resolve_timeframe_paths(base_dir: str, symbol: str="XAUUSD"):
+    cand = {
+        "30T": [f"{symbol}_30T.csv", f"{symbol}_M30.csv"],
+        "15T": [f"{symbol}_15T.csv", f"{symbol}_M15.csv"],
+        "5T" : [f"{symbol}_5T.csv",  f"{symbol}_M5.csv" ],
+        "1H" : [f"{symbol}_1H.csv",  f"{symbol}_H1.csv" ],
     }
-    out: Dict[str, Path] = {}
-    for tf, names in cands.items():
+    resolved = {}
+    for tf, names in cand.items():
         found = None
         for nm in names:
-            p = base_dir / nm
-            if p.exists(): found = p; break
+            p = os.path.join(base_dir, nm)
+            if os.path.exists(p): found = p; break
         if not found:
-            for child in base_dir.iterdir():
-                if child.is_file() and any(child.name.lower()==nm.lower() for nm in names):
-                    found = child; break
-        if found:
-            out[tf] = found
-    if "30T" not in out:
-        raise FileNotFoundError("Main timeframe file (M30/30T) not found.")
-    return out
+            low = [n.lower() for n in names]
+            for fn in os.listdir(base_dir):
+                if fn.lower() in low:
+                    found = os.path.join(base_dir, fn); break
+        if found: resolved[tf] = found
+    if "30T" not in resolved:
+        raise FileNotFoundError("Main timeframe '30T' CSV not found in raw-dir.")
+    return resolved
 
-def read_csv_mql4(path: Path) -> pd.DataFrame:
+def read_tf_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
+    # normalize
     cols = {c.lower(): c for c in df.columns}
-    def pick(*names):
-        for n in names:
-            if n in cols: return cols[n]
-        return None
-    tc = pick("time","datetime","date")
-    oc = pick("open"); hc = pick("high"); lc = pick("low"); cc = pick("close")
-    vc = pick("volume","tick_volume","tickvolume")
-    df = df.rename(columns={tc:"time", oc:"open", hc:"high", lc:"low", cc:"close", vc:"volume"})
-    df["time"] = pd.to_datetime(df["time"], utc=False)
-    df = df.sort_values("time").drop_duplicates("time").set_index("time")
+    tcol = cols.get("time") or cols.get("datetime") or cols.get("date")
+    if not tcol: raise ValueError(f"{path}: cannot find time column")
+    df = df.rename(columns={
+        tcol: "time",
+        cols.get("open","open"): "open",
+        cols.get("high","high"): "high",
+        cols.get("low","low"): "low",
+        cols.get("close","close"): "close",
+        cols.get("volume", cols.get("tick_volume","volume")): "volume",
+    })
+    df["time"] = pd.to_datetime(df["time"], utc=False, errors="coerce")
     for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna()
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna().sort_values("time").drop_duplicates("time").reset_index(drop=True)
+    return df
 
-def write_live_subset(df: pd.DataFrame, ts: pd.Timestamp, out_path: Path):
-    sub = df.loc[:ts].copy()
-    sub = sub.reset_index().rename(columns={"time":"time"})
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+def write_live_csv(df: pd.DataFrame, upto_ts: pd.Timestamp, out_path: str):
+    sub = df[df["time"] <= pd.to_datetime(upto_ts)].copy()
     sub.to_csv(out_path, index=False)
 
 def main():
@@ -97,142 +96,115 @@ def main():
     ap.add_argument("--watch-dir", required=True)
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--timeout-sec", type=int, default=40)
-    ap.add_argument("--positive-class", type=int, default=1)
-    ap.add_argument("--cleanup-answer", action="store_true")
-    ap.add_argument("--log-path", default=str(Path.home() / "generator_parity.log"))
+    ap.add_argument("--symbol", default="XAUUSD")
+    ap.add_argument("--log-path", default=LOG_FILE)
+    ap.add_argument("--cleanup-answer", action="store_true", help="delete answer.txt after reading")
     args = ap.parse_args()
 
-    logger = setup_logger(args.log_path)
-    logger.info("=== generator_parity started ===")
+    log = setup_logger(args.log_path)
+    log.info("=== generator_parity started ===")
 
-    raw_dir = Path(args.raw_dir).resolve()
-    watch_dir = Path(args.watch_dir).resolve()
-    files = resolve_timeframe_paths(raw_dir, "XAUUSD")
-    for tf in ("30T","15T","5T","1H"):
-        if tf in files:
-            logger.info("[raw] %s  -> %s", tf, files[tf])
+    # 1) مسیر فایل‌های خام و بارگذاری
+    files = resolve_timeframe_paths(args.raw_dir, args.symbol)
+    for k in ("30T","15T","5T","1H"):
+        if k in files: log.info("[raw] %s  -> %s", k, files[k])
 
-    # Load raw timeframe dfs once
-    df_30 = read_csv_mql4(files["30T"])
-    df_15 = read_csv_mql4(files["15T"])
-    df_05 = read_csv_mql4(files["5T"])
-    df_1H = read_csv_mql4(files["1H"])
-
-    # PREP for targets
-    prep = PREPARE_DATA_FOR_TRAIN(filepaths={k:str(v) for k,v in files.items()},
-                                  main_timeframe="30T", verbose=True,
-                                  fast_mode=False, strict_disk_feed=False)
-    raw_merged = prep.load_data()
+    # برای تولید تارگت و همسان سازی ویژگی‌ها
+    prep = PREPARE_DATA_FOR_TRAIN(filepaths=files, main_timeframe="30T",
+                                  verbose=True, fast_mode=False, strict_disk_feed=False)
+    merged = prep.load_data()
     tcol = f"{prep.main_timeframe}_time"
-    raw_merged[tcol] = pd.to_datetime(raw_merged[tcol], utc=False)
-    raw_merged.sort_values(tcol, inplace=True)
-    raw_merged.reset_index(drop=True, inplace=True)
-    total = len(raw_merged)
+    merged[tcol] = pd.to_datetime(merged[tcol], utc=False)
+    merged = merged.sort_values(tcol).reset_index(drop=True)
+    log.info("[INIT] main_timeframe=%s", prep.main_timeframe)
 
-    # انتخاب بازه: 200 ردیف آخر 30T (با کمی حاشیه)
-    last_n = max(200, args.steps)
-    start_idx = max(0, total - last_n)
-    times = list(raw_merged[tcol].iloc[start_idx : start_idx + args.steps])
+    # داده‌های تایم‌فریم‌ها برای نوشتن live
+    df30 = read_tf_csv(files["30T"])
+    df15 = read_tf_csv(files["15T"])
+    df5  = read_tf_csv(files["5T"])
+    df1h = read_tf_csv(files["1H"])
 
-    # مسیر فایل‌های live
-    m5_live  = watch_dir / "XAUUSD_M5_live.csv"
-    m15_live = watch_dir / "XAUUSD_M15_live.csv"
-    m30_live = watch_dir / "XAUUSD_M30_live.csv"
-    h1_live  = watch_dir / "XAUUSD_H1_live.csv"
-    answer_fp = watch_dir / "answer.txt"
+    # ناحیه آخر برای شبیه‌سازی
+    total = len(merged)
+    if total < args.steps + 10:
+        start = 10
+    else:
+        start = total - args.steps
+    stamps = merged[tcol].iloc[start : start + args.steps].tolist()
 
-    # اگر پاسخ از قبل مانده، حذف کنیم
-    if args.cleanup_answer and answer_fp.exists():
-        try: answer_fp.unlink()
-        except Exception: pass
+    # مسیر فایل‌های live و answer
+    m5_live  = os.path.join(args.watch_dir, "XAUUSD_M5_live.csv")
+    m15_live = os.path.join(args.watch_dir, "XAUUSD_M15_live.csv")
+    m30_live = os.path.join(args.watch_dir, "XAUUSD_M30_live.csv")
+    h1_live  = os.path.join(args.watch_dir, "XAUUSD_H1_live.csv")
+    answer_fp = os.path.join(args.watch_dir, "answer.txt")
 
+    # شمارنده‌ها
     decided = correct = incorrect = none = timeout = 0
 
-    logger.info("[INIT] main_timeframe=30T")
+    for i, ts in enumerate(stamps, start=1):
+        # 2) نوشتن ۴ فایل live تا لحظه ts
+        write_live_csv(df5,  ts, m5_live)
+        write_live_csv(df15, ts, m15_live)
+        write_live_csv(df30, ts, m30_live)
+        write_live_csv(df1h, ts, h1_live)
+        log.info(f"[Step {i}/{args.steps}] wrote *_live.csv @ {ts} — waiting for answer.txt ...")
 
-    for i, ts in enumerate(times, start=1):
-        # ۱) ۴ فایل live تا لحظه ts
-        write_live_subset(df_30, ts, m30_live)
-        write_live_subset(df_15, ts, m15_live)
-        write_live_subset(df_05, ts, m5_live)
-        write_live_subset(df_1H, ts, h1_live)
-        logger.info("[Step %d/%d] wrote *_live.csv @ %s — waiting for answer.txt ...",
-                    i, args.steps, ts)
-
-        # ۲) منتظر answer از دپلوی
+        # 3) انتظار برای answer
         t0 = time.time()
         got = False
         while time.time() - t0 < args.timeout_sec:
-            if answer_fp.exists():
-                got = True; break
-            time.sleep(1.0)
+            if os.path.exists(answer_fp):
+                # برای جلوگیری از خواندن ناقص، کمی صبر کن
+                time.sleep(0.1)
+                with open(answer_fp, "r", encoding="utf-8") as f:
+                    ans = f.read().strip().upper()
+                got = True
+                break
+            time.sleep(0.5)
 
         if not got:
             timeout += 1
-            logger.info("[Result %d] ts=%s answer=TIMEOUT | target=? | —", i, ts)
-            logger.info("[Running] decided=%d correct=%d incorrect=%d none=%d timeout=%d | acc(decidable)=%.2f%% | coverage=%.2f%%",
-                        decided, correct, incorrect, none, timeout,
-                        (100.0*correct/decided if decided else 0.0),
-                        (100.0*decided/(decided+none+timeout) if (decided+none+timeout)>0 else 0.0))
-            # فایل‌های live را دست نمی‌زنیم؛ دپلوی خودش در صورت پاسخ پاک می‌کند.
+            log.info(f"[Result {i}] ts={ts} answer=TIMEOUT | target=? | —")
             continue
 
-        # ۳) پاسخ را بخوانیم
-        try:
-            ans_text = (answer_fp.read_text(encoding="utf-8").strip() or "NONE").upper()
-        except Exception:
-            ans_text = "NONE"
-
-        # ۴) تارگت را با همان مسیر آماده‌سازی آموزش از برش تا ts بسازیم
-        df_cut = raw_merged.loc[raw_merged[tcol] <= ts].copy()
-        Xc, yc, _, _ = prep.ready(
-            df_cut,
-            window=2,  # window از متادیتا شما 2 است؛ اگر نیاز داشتید پارامتریک کنید.
-            selected_features=[],  # برای استخراج y نیازی به ستون انتخابی نیست
+        # 4) محاسبه تارگت واقعی همان لحظه
+        cut = merged[merged[tcol] <= pd.to_datetime(ts)].copy()
+        X, y, _, _ = prep.ready(
+            cut,
+            window=2,  # window در متا 2 است؛ اگر در پروژه شما متغیر است، می‌توانید هم از meta بخوانید.
+            selected_features=[],  # برای هدف نیازی به ستون‌ها نداریم
             mode="train",
             predict_drop_last=False,
             train_drop_last=False
         )
-        # y ممکن است لیست/ndarray باشد
-        y_series = pd.Series(yc).reset_index(drop=True) if yc is not None else pd.Series(dtype=int)
-        y_true = int(y_series.iloc[-1]) if len(y_series)>0 else -1  # -1=نامشخص
+        # y آخرین مقدار، تارگت لحظه ts
+        y_true = int(np.ravel(y)[-1]) if len(y) else -1
+        target_label = "BUY" if y_true == 1 else ("SELL" if y_true == 0 else "NONE")
 
-        # ۵) مقایسه پاسخ با تارگت
-        # نگاشت: کلاس مثبت (مثلاً 1) ↔ BUY ؛ کلاس منفی (0) ↔ SELL
-        if ans_text == "NONE":
+        # 5) ارزیابی و گزارش
+        if ans == "NONE":
             none += 1
-            decided_now = False
         else:
             decided += 1
-            decided_now = True
-
-        correct_now = False
-        if decided_now and y_true in (0,1):
-            if (ans_text == "BUY"  and y_true == args.positive_class) or \
-               (ans_text == "SELL" and y_true != args.positive_class):
-                correct += 1; correct_now = True
+            if ans == target_label:
+                correct += 1
             else:
                 incorrect += 1
 
-        logger.info("[Result %d] ts=%s answer=%s | target=%s | %s",
-                    i, ts, ans_text, ("BUY" if y_true==args.positive_class else "SELL" if y_true in (0,1) else "?"),
-                    "OK" if correct_now else ("—" if not decided_now else "WRONG"))
-        logger.info("[Running] decided=%d correct=%d incorrect=%d none=%d timeout=%d | acc(decidable)=%.2f%% | coverage=%.2f%%",
-                    decided, correct, incorrect, none, timeout,
-                    (100.0*correct/decided if decided else 0.0),
-                    (100.0*decided/(decided+none+timeout) if (decided+none+timeout)>0 else 0.0))
+        acc = (correct / decided)*100.0 if decided > 0 else 0.0
+        cover = (decided / (i - timeout))*100.0 if (i - timeout) > 0 else 0.0
+        log.info(f"[Result {i}] ts={ts} answer={ans} | target={target_label} | —")
+        log.info(f"[Running] decided={decided} correct={correct} incorrect={incorrect} none={none} timeout={timeout} | acc(decidable)={acc:.2f}% | coverage={cover:.2f}%")
 
-        # ۶) answer.txt را حذف کنیم تا قدم بعدی آزاد شود
-        try: answer_fp.unlink()
-        except Exception: pass
+        # 6) پاک کردن answer و ادامه
+        if args.cleanup_answer and os.path.exists(answer_fp):
+            try: os.remove(answer_fp)
+            except Exception: pass
 
-        # نوبت بعدی...
-        time.sleep(1.0)
-
-    logger.info("[Final] decided=%d correct=%d incorrect=%d none=%d timeout=%d | acc(decidable)=%.2f%% | coverage=%.2f%%",
-                decided, correct, incorrect, none, timeout,
-                (100.0*correct/decided if decided else 0.0),
-                (100.0*decided/(decided+none+timeout) if (decided+none+timeout)>0 else 0.0))
+    log.info("[Final] decided=%d correct=%d incorrect=%d none=%d timeout=%d", decided, correct, incorrect, none, timeout)
+    acc = (correct / decided)*100.0 if decided>0 else 0.0
+    log.info(f"[Final] acc(decidable)={acc:.2f}% | steps={args.steps}")
 
 if __name__ == "__main__":
     main()
