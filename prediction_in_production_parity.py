@@ -1,435 +1,297 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 """
 prediction_in_production_parity.py
-Author: Pouria + Assistant (final, parity-safe)
+----------------------------------
+Exact-parity online predictor for 30-minute timeframe.
 
-وظایف:
-  - هر 1 ثانیه پوشه watch را چک می‌کند: اگر چهار فایل XAUUSD_M5_live.csv,
-    XAUUSD_M15_live.csv, XAUUSD_M30_live.csv, XAUUSD_H1_live.csv موجود باشند
-    و answer.txt وجود نداشته باشد، پیش‌بینی می‌سازد.
-  - ویژگی‌ها را دقیقاً با همان مسیر آموزش می‌سازد (PREPARE_DATA_FOR_TRAIN.ready)
-    و با لیست ستون‌های train_window_cols از best_model.meta.json هم‌راستا می‌کند.
-  - از payload واقعی مدل (pipeline) استفاده می‌کند (robust loader)، کلاس مثبت را کشف می‌کند
-    و خروجی proba را با آستانه‌ها به BUY/SELL/NONE نگاشت می‌کند.
-  - کش Parquet از دیتافریم «ادغام‌شده» می‌سازد (بار اول کمی زمان‌بر، دفعات بعد سریع).
-  - پس از نوشتن answer.txt چهار فایل *_live.csv را حذف می‌کند (هندشیک با ژنراتور/MQL4).
-
-نیازمندی‌ها:
-  - Python 3.9+
-  - pandas, numpy, scikit-learn, joblib
-  - ماژول پروژه: prepare_data_for_train.PREPARE_DATA_FOR_TRAIN
-  - فایل‌ها: best_model.pkl , best_model.meta.json (کنار هم)
-
-مثال اجرا:
-  python3 prediction_in_production_parity.py \
-    --watch-dir /home/pouria/gold_project9 \
-    --raw-dir   /home/pouria/gold_project9 \
-    --model-path /home/pouria/gold_project9/best_model.pkl \
-    --meta-path  /home/pouria/gold_project9/best_model.meta.json \
-    --answer-path answer.txt \
-    --cache-dir  /home/pouria/cache_parity \
-    --poll-sec 1 \
-    --main-tf 30T \
-    --positive-class 1 \
-    --thr-low 0.45 --thr-high 0.55 \
-    --log-path /home/pouria/prediction_in_production_parity.log
+- Trigger: the presence/update of XAUUSD_M30_live.csv (or XAUUSD_30T_live.csv / XAUUSD.F_M30_live.csv).
+- Build features from the SAME full raw CSVs used in training (M5/M15/M30/H1).
+- Resample/feature → THEN cut up to ts_now (identical to simulator).
+- Use thresholds saved with the model; optionally override from train_distribution.json (like v3).
+- Write BUY/SELL/NONE to ./answer.txt for MT4 to consume.
 """
 
 from __future__ import annotations
-import os, sys, time, json, gc, hashlib, signal, argparse, logging
-from logging.handlers import RotatingFileHandler
-from typing import Dict, Tuple, List, Optional
-from datetime import datetime
-
-# Optional acceleration
-try:
-    from sklearnex import patch_sklearn  # type: ignore
-    patch_sklearn()
-except Exception:
-    pass
-
+import os, sys, time, json, pickle, gzip, bz2, lzma, zipfile, logging, argparse, hashlib
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
-try:
-    import joblib
-except Exception:
-    joblib = None
+from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN  # same pipeline as trainer/simulator
 
-# ------------------------- Project modules -------------------------
-try:
-    from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN
-except Exception as e:
-    PREPARE_DATA_FOR_TRAIN = None
-    raise ImportError("Cannot import PREPARE_DATA_FOR_TRAIN. Make sure it is on PYTHONPATH.") from e
+LOG_FILE = "prediction_in_production_parity.log"
 
-APP = "prediction_in_production_parity"
-
-# --------------------------- Logging ---------------------------
-def setup_logger(log_path: str) -> logging.Logger:
-    logger = logging.getLogger(APP)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    for h in list(logger.handlers): logger.removeHandler(h)
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    fh = RotatingFileHandler(log_path, maxBytes=20_000_000, backupCount=3, encoding="utf-8")
+# ---------------- Logging ----------------
+def setup_logging(verbosity:int=1):
+    logger = logging.getLogger()
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO if verbosity<=1 else logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s","%Y-%m-%d %H:%M:%S")
-    fh.setFormatter(fmt); logger.addHandler(fh)
-    ch = logging.StreamHandler(sys.stdout); ch.setFormatter(fmt); logger.addHandler(ch)
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8"); fh.setLevel(logging.INFO); fh.setFormatter(fmt); logger.addHandler(fh)
+    ch = logging.StreamHandler(sys.stdout); ch.setLevel(logging.INFO); ch.setFormatter(fmt); logger.addHandler(ch)
     return logger
 
-def atomic_write_text(path: str, text: str) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text.strip() + "\n")
-        f.flush(); os.fsync(f.fileno())
-    os.replace(tmp, path)
+# ---------------- Robust model loader (pickle/joblib/gzip/bz2/xz/zip/json) ----------------
+def _try_pickle(fp: str):
+    with open(fp, "rb") as f: return pickle.load(f)
+def _try_joblib(fp: str):
+    import joblib; return joblib.load(fp)
+def _try_gzip(fp: str):
+    with gzip.open(fp, "rb") as f: return pickle.load(f)
+def _try_bz2(fp: str):
+    with bz2.open(fp, "rb") as f: return pickle.load(f)
+def _try_lzma(fp: str):
+    with lzma.open(fp, "rb") as f: return pickle.load(f)
+def _try_zip(fp: str):
+    with zipfile.ZipFile(fp, "r") as zf:
+        for name in zf.namelist():
+            if name.endswith("/"): continue
+            with zf.open(name, "r") as f:
+                data = f.read()
+                try: return pickle.loads(data)
+                except Exception:
+                    try: return json.loads(data.decode("utf-8"))
+                    except Exception: pass
+    raise ValueError("No loadable member found in ZIP.")
 
-def stable_file(path: str, stable_ms: int = 150) -> bool:
-    if not os.path.exists(path): return False
-    m1 = os.path.getmtime(path)
-    time.sleep(stable_ms/1000.0)
-    if not os.path.exists(path): return False
-    m2 = os.path.getmtime(path)
-    return m1 == m2
+def _raw_head(fp: str, n=8) -> bytes:
+    with open(fp, "rb") as f: return f.read(n)
 
-# ------------------------- File paths resolver -------------------------
-def resolve_timeframe_paths(base_dir: str, symbol: str="XAUUSD") -> Dict[str, str]:
-    """Find raw CSVs for 5T, 15T, 30T, 1H similar to live_like_sim."""
-    cand = {
-        "30T": [f"{symbol}_30T.csv", f"{symbol}_M30.csv"],
-        "15T": [f"{symbol}_15T.csv", f"{symbol}_M15.csv"],
-        "5T" : [f"{symbol}_5T.csv",  f"{symbol}_M5.csv" ],
-        "1H" : [f"{symbol}_1H.csv",  f"{symbol}_H1.csv" ],
-    }
-    resolved: Dict[str,str] = {}
-    for tf, names in cand.items():
-        found = None
-        for nm in names:
-            p = os.path.join(base_dir, nm)
-            if os.path.exists(p): found = p; break
-        if not found:
-            # case-insensitive scan
-            lower = [n.lower() for n in names]
-            for fn in os.listdir(base_dir):
-                if fn.lower() in lower:
-                    found = os.path.join(base_dir, fn); break
-        if found:
-            resolved[tf] = found
-    if "30T" not in resolved:
-        raise FileNotFoundError("Main timeframe '30T' CSV not found in raw-dir.")
-    return resolved
+def load_payload_best_model(pkl_path: str="best_model.pkl") -> dict:
+    p = Path(pkl_path)
+    if not p.exists():
+        raise FileNotFoundError(f"'best_model.pkl' not found at {p.resolve()}")
 
-# --------------------------- Model loader ---------------------------
-def load_payload(model_path: str, meta_path: Optional[str], logger: logging.Logger) -> dict:
-    """
-    Robust loader. Returns dict with keys:
-      pipeline, window_size, train_window_cols, neg_thr, pos_thr, positive_class
-    """
-    obj = None
-    last_err = None
+    head = _raw_head(pkl_path, 8)
+    loaders = []
+    if head.startswith(b"\x80"):
+        loaders = [_try_pickle, _try_joblib, _try_gzip, _try_bz2, _try_lzma, _try_zip]
+    elif head.startswith(b"\x1f\x8b"):
+        loaders = [_try_gzip, _try_pickle, _try_joblib, _try_bz2, _try_lzma, _try_zip]
+    elif head.startswith(b"BZh"):
+        loaders = [_try_bz2, _try_pickle, _try_joblib, _try_gzip, _try_lzma, _try_zip]
+    elif head.startswith(b"\xfd7zXZ\x00"):
+        loaders = [_try_lzma, _try_pickle, _try_joblib, _try_gzip, _try_bz2, _try_zip]
+    elif head.startswith(b"PK\x03\x04"):
+        loaders = [_try_zip, _try_pickle, _try_joblib, _try_gzip, _try_bz2, _try_lzma]
+    else:
+        loaders = [_try_joblib, _try_pickle, _try_gzip, _try_bz2, _try_lzma, _try_zip]
 
-    # 1) try joblib
-    if joblib is not None:
+    last_err = None; raw = None
+    for loader in loaders:
         try:
-            obj = joblib.load(model_path)
+            raw = loader(pkl_path); break
         except Exception as e:
             last_err = e
-    # 2) fallback pickle
-    if obj is None:
-        import pickle
+    if raw is None:
         try:
-            with open(model_path, "rb") as f:
-                obj = pickle.load(f)
-        except Exception as e:
-            last_err = e
-
-    if obj is None:
-        raise RuntimeError(f"Could not load model from {model_path}. Last error: {repr(last_err)}")
+            with open(pkl_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            pass
+    if raw is None:
+        raise RuntimeError(f"Could not load best_model.pkl; first bytes: {head!r}; last err: {repr(last_err)}")
 
     payload: dict = {}
-    if isinstance(obj, dict):
-        # try common keys
-        model = obj.get("pipeline") or obj.get("model") or obj.get("estimator") or obj.get("clf") or obj.get("best_estimator")
+    if isinstance(raw, dict):
+        model = raw.get("pipeline") or raw.get("model") or raw.get("estimator") \
+                or raw.get("clf") or raw.get("best_estimator")
         if model is None:
-            # maybe nested under unknown key
-            for k, v in obj.items():
+            for k, v in raw.items():
                 if hasattr(v, "predict") or hasattr(v, "predict_proba"):
                     model = v; break
         if model is None:
-            raise ValueError("Loaded dict but pipeline estimator not found.")
+            raise ValueError("Loaded dict but no estimator found (keys tried: pipeline/model/estimator/clf/best_estimator).")
         payload["pipeline"] = model
-        payload["window_size"] = int(obj.get("window_size", 1))
-        feats = obj.get("train_window_cols") or obj.get("feats") or []
+        payload["window_size"] = int(raw.get("window_size", 1))
+        feats = raw.get("train_window_cols") or raw.get("feats") or []
         payload["train_window_cols"] = list(feats) if isinstance(feats, (list,tuple)) else []
-        payload["neg_thr"] = float(obj.get("neg_thr", 0.005))
-        payload["pos_thr"] = float(obj.get("pos_thr", 0.995))
+        payload["neg_thr"] = float(raw.get("neg_thr", 0.005))
+        payload["pos_thr"] = float(raw.get("pos_thr", 0.995))
+        if "scaler" in raw: payload["scaler"] = raw["scaler"]
     else:
-        # obj is an estimator
-        payload["pipeline"] = obj
+        payload["pipeline"] = raw
         payload["window_size"] = 1
         payload["train_window_cols"] = []
         payload["neg_thr"] = 0.005
         payload["pos_thr"] = 0.995
 
-    # Merge meta JSON if provided (preferred / authoritative)
-    if meta_path and os.path.exists(meta_path):
+    # Optional override to mirror live_like_sim_v3 behavior
+    td_path = "train_distribution.json"
+    if os.path.exists(td_path):
         try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            # window/cols/thr from meta override everything
-            if "window_size" in meta: payload["window_size"] = int(meta["window_size"])
-            if "train_window_cols" in meta: payload["train_window_cols"] = list(meta["train_window_cols"])
-            if "neg_thr" in meta: payload["neg_thr"] = float(meta["neg_thr"])
-            if "pos_thr" in meta: payload["pos_thr"] = float(meta["pos_thr"])
-        except Exception as e:
-            logger.warning(f"Could not read meta json {meta_path}: {e}")
-
-    # positive_class: discover from estimator.classes_ if available; default 1
-    pos_class = 1
-    pipe = payload["pipeline"]
-    if hasattr(pipe, "classes_"):
-        # classes_ present at top-level (e.g., LogisticRegression)
-        if 1 in list(pipe.classes_): pos_class = 1
-        else: pos_class = list(pipe.classes_)[-1]  # fallback to last
-    payload["positive_class"] = pos_class
+            with open(td_path, "r", encoding="utf-8") as jf:
+                td = json.load(jf)
+            if "neg_thr" in td: payload["neg_thr"] = float(td["neg_thr"])
+            if "pos_thr" in td: payload["pos_thr"] = float(td["pos_thr"])
+            logging.info("Train distribution loaded: train_distribution.json")
+        except Exception:
+            pass
 
     return payload
 
-def ensure_columns(X: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+# ---------------- path helpers ----------------
+def resolve_timeframe_paths(base_dir: Path, symbol: str) -> dict[str, str]:
+    candidates = {
+        "30T": [f"{symbol}_30T.csv", f"{symbol}_M30.csv"],
+        "15T": [f"{symbol}_15T.csv", f"{symbol}_M15.csv"],
+        "5T" : [f"{symbol}_5T.csv",  f"{symbol}_M5.csv" ],
+        "1H" : [f"{symbol}_1H.csv",  f"{symbol}_H1.csv" ],
+    }
+    resolved: dict[str,str] = {}
+    for tf, names in candidates.items():
+        found = None
+        for nm in names:
+            p = base_dir / nm
+            if p.exists(): found = str(p); break
+        if found is None:
+            # case-insensitive scan
+            for child in base_dir.iterdir():
+                if child.is_file() and any(child.name.lower()==nm.lower() for nm in names):
+                    found = str(child); break
+        if found:
+            logging.info(f"[raw] {tf} -> {found}")
+            resolved[tf] = found
+    if "30T" not in resolved:
+        raise FileNotFoundError(f"Main timeframe '30T' not found under {base_dir}.")
+    return resolved
+
+def find_m30_live_path(here: Path, symbol: str) -> Path | None:
+    for nm in (f"{symbol}_M30_live.csv", f"{symbol}_30T_live.csv", f"{symbol}.F_M30_live.csv", f"{symbol}_F_M30_live.csv"):
+        p = here / nm
+        if p.exists(): return p
+    return None
+
+def ensure_columns(X: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     if not cols: return X
     X2 = X.copy()
     miss = [c for c in cols if c not in X2.columns]
     for c in miss: X2[c] = 0.0
-    return X2[cols]
+    return X2[cols].astype(float)
 
-# --------------------------- CSV utils ---------------------------
-def read_csv_mql4(path: str) -> pd.DataFrame:
-    """Expect columns: time, open, high, low, close, volume/tick_volume."""
-    df = pd.read_csv(path)
-    cols = {c.lower(): c for c in df.columns}
-    # normalize
-    def pick(*names):
-        for n in names:
-            if n in cols: return cols[n]
-        return None
+def md5_of_list(xs:list[str]) -> str:
+    h = hashlib.md5()
+    for s in xs: h.update(str(s).encode("utf-8"))
+    return h.hexdigest()
 
-    time_col = pick("time","datetime","date")
-    if not time_col: raise ValueError(f"{path}: cannot find time column")
-    df = df.rename(columns={
-        time_col: "time",
-        pick("open"): "open",
-        pick("high"): "high",
-        pick("low"):  "low",
-        pick("close"): "close",
-        pick("volume","tick_volume"): "volume",
-    })
-    df["time"] = pd.to_datetime(df["time"], utc=False, errors="coerce")
-    df = df.dropna(subset=["time"])
-    for c in ["open","high","low","close","volume"]:
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna().sort_values("time").drop_duplicates("time")
-    df = df.set_index("time")
-    return df
-
-# --------------------------- Main ---------------------------
+# ---------------- main ----------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--watch-dir", required=True)
-    ap.add_argument("--raw-dir", required=True)
-    ap.add_argument("--model-path", required=True)
-    ap.add_argument("--meta-path", default=None)
-    ap.add_argument("--answer-path", default="answer.txt")
-    ap.add_argument("--cache-dir", default="./cache_parity")
-    ap.add_argument("--poll-sec", type=float, default=1.0)
-    ap.add_argument("--main-tf", default="30T")
-    ap.add_argument("--symbol", default="XAUUSD")
-    ap.add_argument("--min-context-bars", type=int, default=3)
-    ap.add_argument("--thr-low", type=float, default=None)
-    ap.add_argument("--thr-high", type=float, default=None)
-    ap.add_argument("--positive-class", type=int, default=None)
-    ap.add_argument("--log-path", default=os.path.expanduser("~/prediction_in_production_parity.log"))
+    ap.add_argument("--base-dir", type=str, default=".")
+    ap.add_argument("--symbol", type=str, default="XAUUSD")
+    ap.add_argument("--best-model", type=str, default="best_model.pkl")
+    ap.add_argument("--poll-sec", type=float, default=0.25)
+    ap.add_argument("--verbosity", type=int, default=1)
     args = ap.parse_args()
 
-    log = setup_logger(args.log_path)
-    log.info("=== %s started ===", APP)
+    setup_logging(args.verbosity)
+    logging.info("=== prediction_in_production_parity started ===")
 
-    # 1) Load model payload (+meta)
-    payload = load_payload(args.model_path, args.meta_path, log)
+    # 1) model
+    payload = load_payload_best_model(args.best_model)
     model   = payload["pipeline"]
-    window  = int(payload["window_size"])
-    feats   = payload.get("train_window_cols") or []
-    neg_thr = float(args.thr_low if args.thr_low is not None else payload["neg_thr"])
-    pos_thr = float(args.thr_high if args.thr_high is not None else payload["pos_thr"])
-    pos_class = int(args.positive_class if args.positive_class is not None else payload["positive_class"])
+    cols    = payload.get("train_window_cols") or []
+    window  = int(payload.get("window_size", 1))
+    neg_thr = float(payload.get("neg_thr", 0.005))
+    pos_thr = float(payload.get("pos_thr", 0.995))
+    if not hasattr(model, "predict_proba"):
+        raise TypeError("Loaded model does not support predict_proba().")
+    logging.info(
+        "Model loaded | window=%d | feats=%d | thr=(%.3f, %.3f) | cols_md5=%s",
+        window, len(cols), neg_thr, pos_thr, md5_of_list(cols)
+    )
 
-    # positive class index for predict_proba
-    pos_idx = None
-    if hasattr(model, "classes_"):
-        classes = list(model.classes_)
-        if pos_class in classes:
-            pos_idx = classes.index(pos_class)
-    # If model is a Pipeline, try to find final estimator's classes_
-    if pos_idx is None and hasattr(model, "steps"):
-        try:
-            final_est = model.steps[-1][1]
-            if hasattr(final_est, "classes_"):
-                classes = list(final_est.classes_)
-                if pos_class in classes:
-                    pos_idx = classes.index(pos_class)
-        except Exception:
-            pass
-    if pos_idx is None:
-        pos_idx = 1  # a safe default
-
-    log.info("Model loaded | window=%d | feats=%d | thr=(%.3f, %.3f) | task=classifier", window, len(feats), neg_thr, pos_thr)
-    # MD5 برای کنترل پاریتی
-    try:
-        md5_cols = hashlib.md5((",".join(feats)).encode("utf-8")).hexdigest() if feats else "-"
-        log.info("Train columns md5=%s", md5_cols)
-    except Exception:
-        md5_cols = "-"
-
-    # 2) Resolve raw CSVs & build/load cache with PREPARE_DATA_FOR_TRAIN
-    filepaths = resolve_timeframe_paths(args.raw_dir, args.symbol)
-    for tf in ("15T","1H","30T","5T"):
-        if tf in filepaths:
-            log.info("[raw] %s -> %s", tf, filepaths[tf])
-
-    os.makedirs(args.cache_dir, exist_ok=True)
-    cache_path = os.path.join(args.cache_dir, "merged_full.parquet")
-
-    # Build cache if missing
-    if not os.path.exists(cache_path):
-        log.info("[cache] building merged_full at first run ...")
-        prep = PREPARE_DATA_FOR_TRAIN(filepaths=filepaths, main_timeframe=args.main_tf,
-                                      verbose=True, fast_mode=False, strict_disk_feed=False)
-        merged = prep.load_data()
-        tcol = f"{prep.main_timeframe}_time"
-        if tcol not in merged.columns:
-            raise KeyError(f"Time column '{tcol}' not found in merged dataframe from PREPARE_DATA_FOR_TRAIN.")
-        merged[tcol] = pd.to_datetime(merged[tcol], utc=False)
-        merged.sort_values(tcol, inplace=True)
-        merged.reset_index(drop=True, inplace=True)
-        merged.to_parquet(cache_path, index=False)
-        log.info("[cache] merged_full saved to %s | shape=%s | first=%s | last=%s",
-                 cache_path, merged.shape, merged[tcol].min(), merged[tcol].max())
-    else:
-        log.info("[cache] loading merged_full from %s", cache_path)
-        merged = pd.read_parquet(cache_path)
-
-    # cached prep used for ready(...)
-    prep = PREPARE_DATA_FOR_TRAIN(filepaths=filepaths, main_timeframe=args.main_tf,
-                                  verbose=False, fast_mode=True, strict_disk_feed=False)
+    # 2) full raw → merged exactly like simulator
+    base_dir = Path(args.base_dir).resolve()
+    raw_paths = resolve_timeframe_paths(base_dir, args.symbol)
+    prep = PREPARE_DATA_FOR_TRAIN(filepaths=raw_paths, main_timeframe="30T",
+                                  verbose=False, fast_mode=False, strict_disk_feed=False)
+    merged_full = prep.load_data()
     tcol = f"{prep.main_timeframe}_time"
-    if tcol not in merged.columns:
-        raise KeyError(f"'{tcol}' is missing in cached merged_full. Delete cache and rerun to rebuild.")
+    merged_full[tcol] = pd.to_datetime(merged_full[tcol])
+    merged_full.sort_values(tcol, inplace=True)
+    merged_full.reset_index(drop=True, inplace=True)
+    logging.info("[init] merged_full shape=%s | first=%s | last=%s",
+                 merged_full.shape,
+                 str(merged_full[tcol].iloc[0]) if len(merged_full) else None,
+                 str(merged_full[tcol].iloc[-1]) if len(merged_full) else None)
 
-    # 3) Watch loop (handshake with generator/MQL4)
-    def read_ts_from_live(m30_live: str) -> Optional[pd.Timestamp]:
-        df = read_csv_mql4(m30_live)
-        if df.empty: return None
-        return df.index.max()
+    # 3) loop: wait for 30T trigger, then Resample→Cut parity
+    here = Path(".").resolve()
+    last_ts = None
+    ans_path = here / "answer.txt"
 
-    m5_live  = os.path.join(args.watch_dir, "XAUUSD_M5_live.csv")
-    m15_live = os.path.join(args.watch_dir, "XAUUSD_M15_live.csv")
-    m30_live = os.path.join(args.watch_dir, "XAUUSD_M30_live.csv")
-    h1_live  = os.path.join(args.watch_dir, "XAUUSD_H1_live.csv")
-    answer_fp = os.path.join(args.watch_dir, args.answer_path)
+    while True:
+        # MT4/Generator will remove answer.txt after reading; اگر هنوز هست یعنی نوبت جدیدی نیامده
+        if ans_path.exists():
+            time.sleep(args.poll_sec)
+            continue
 
-    last_ts_done: Optional[pd.Timestamp] = None
+        p_m30 = find_m30_live_path(here, args.symbol)
+        if p_m30 is None:
+            time.sleep(args.poll_sec)
+            continue
 
-    def predict_one(ts_now: pd.Timestamp) -> Tuple[str,float]:
-        # اگر ts_now فراتر از کش است، کش را از نو بساز (سناریوی لایو واقعی)
-        nonlocal merged
-        if pd.to_datetime(ts_now) > pd.to_datetime(merged[tcol].max()):
-            log.info("[cache] ts_now beyond cache; rebuilding merged_full from raw ...")
-            merged = PREPARE_DATA_FOR_TRAIN(filepaths=filepaths, main_timeframe=args.main_tf,
-                                            verbose=False, fast_mode=True, strict_disk_feed=False).load_data()
-            merged[tcol] = pd.to_datetime(merged[tcol], utc=False)
-            merged.sort_values(tcol, inplace=True)
-            merged.reset_index(drop=True, inplace=True)
-            merged.to_parquet(cache_path, index=False)
-            log.info("[cache] rebuilt | new last=%s", merged[tcol].max())
+        # read trigger to extract ts_now
+        try:
+            df = pd.read_csv(p_m30)
+            if "time" not in df.columns:
+                time.sleep(args.poll_sec); continue
+            df["time"] = pd.to_datetime(df["time"], errors="coerce")
+            df.dropna(subset=["time"], inplace=True)
+            if df.empty:
+                time.sleep(args.poll_sec); continue
+            ts_now = pd.to_datetime(df["time"].iloc[-1])
+        except Exception as e:
+            logging.error("[read live] %s", e)
+            time.sleep(args.poll_sec)
+            continue
 
-        # برش تا لحظه ts_now
-        cut = merged[merged[tcol] <= pd.to_datetime(ts_now)].copy()
-        if len(cut) < max(args.min_context_bars, window+1):
-            raise RuntimeError(f"Not enough context rows before {ts_now} (have {len(cut)})")
+        if (last_ts is not None) and (ts_now <= last_ts):
+            time.sleep(args.poll_sec)
+            continue
 
-        # ساخت X,y با همان مسیر آموزش
+        # Resample already done on merged_full → now Cut up to ts_now
+        df_cut = merged_full[merged_full[tcol] <= ts_now].copy()
+        if df_cut.empty:
+            logging.warning("df_cut empty at %s", ts_now)
+            time.sleep(args.poll_sec); continue
+
+        # same path as simulator (mode='train', no drop_last)
         X, y, _, _ = prep.ready(
-            cut,
+            df_cut,
             window=window,
-            selected_features=feats,
+            selected_features=cols,
             mode="train",
             predict_drop_last=False,
             train_drop_last=False
         )
-        if X is None or len(X)==0:
-            raise RuntimeError(f"Empty feature frame at ts={ts_now}")
-        # انتخاب آخرین ردیف
-        X_last = X.iloc[[-1]].reset_index(drop=True)
-        if feats: X_last = ensure_columns(X_last, feats)
+        if X.empty:
+            logging.warning("Empty X after ready() at %s", ts_now)
+            time.sleep(args.poll_sec); continue
 
-        # proba/decision → score
-        score = None
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba(X_last)
-            if proba.ndim==2 and proba.shape[1]>=2:
-                score = float(proba[0, pos_idx])
-        if score is None and hasattr(model, "decision_function"):
-            d = float(np.ravel(model.decision_function(X_last))[-1])
-            score = 1.0/(1.0+np.exp(-d))
-        if score is None and hasattr(model, "predict"):
-            yhat = int(np.ravel(model.predict(X_last))[-1])
-            score = 1.0 if yhat==pos_class else 0.0
+        L = min(len(X), len(y))
+        X = ensure_columns(X.iloc[:L].reset_index(drop=True), cols)
+        y = pd.Series(y).iloc[:L].reset_index(drop=True)
 
-        # آستانه‌ها → برچسب
-        if score <= neg_thr:
-            label = "SELL"
-        elif score >= pos_thr:
-            label = "BUY"
-        else:
-            label = "NONE"
+        probs = model.predict_proba(X)[:, 1]
+        p_last = float(probs[-1])
+        if p_last <= neg_thr: decision = "SELL"
+        elif p_last >= pos_thr: decision = "BUY"
+        else: decision = "NONE"
 
-        log.info("[Predict] ts=%s | score=%.6f | thr=(%.3f,%.3f) → %s | X_cols=%d md5=%s | wrote=%s",
-                 ts_now, score, neg_thr, pos_thr, label, X_last.shape[1], md5_cols, answer_fp)
-        return label, float(score)
-
-    while True:
         try:
-            # شرط‌های شروع پیش‌بینی
-            if os.path.exists(answer_fp):
-                time.sleep(args.poll_sec); continue
-
-            live_paths = [m5_live, m15_live, m30_live, h1_live]
-            if not all(os.path.exists(p) for p in live_paths):
-                time.sleep(args.poll_sec); continue
-            if not all(stable_file(p, 150) for p in live_paths):
-                time.sleep(args.poll_sec); continue
-
-            # ts_now از M30_live
-            ts_now = read_ts_from_live(m30_live)
-            if ts_now is None:
-                time.sleep(args.poll_sec); continue
-            if last_ts_done is not None and ts_now <= last_ts_done:
-                time.sleep(args.poll_sec); continue
-
-            label, _score = predict_one(ts_now)
-            atomic_write_text(answer_fp, label)
-
-            # طبق سناریوی شما: بعد از ساخت answer، چهار فایل live حذف شوند
-            for p in live_paths:
-                try: os.remove(p)
-                except Exception: pass
-
-            last_ts_done = ts_now
-            gc.collect()
+            ans_path.write_text(decision, encoding="utf-8")
         except Exception as e:
-            log.error("Unhandled error in loop: %s", e, exc_info=True)
-            time.sleep(max(1.0, args.poll_sec))
+            logging.error("Could not write answer.txt: %s", e)
+            time.sleep(args.poll_sec); continue
+
+        logging.info("[Predict] ts=%s | score=%.6f | thr=(%.3f,%.3f) → %s | wrote=%s",
+                     ts_now, p_last, neg_thr, pos_thr, decision, str(ans_path.resolve()))
+        last_ts = ts_now
+        # small sleep to avoid tight loop
+        time.sleep(args.poll_sec)
 
 if __name__ == "__main__":
     main()

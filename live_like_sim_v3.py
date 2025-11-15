@@ -29,6 +29,34 @@ def setup_logging(verbosity:int=1):
     ch.setLevel(logging.INFO); ch.setFormatter(fmt); logger.addHandler(ch)
     return logger
 
+# --- ADD: helper to dump pre-model feed ---
+def dump_sim_feed_tail(raw: pd.DataFrame, prep: PREPARE_DATA_FOR_TRAIN, payload: dict, last_n: int = 200, out_csv: str = "sim_X_feed_tail200.csv"):
+    cols   = payload.get("train_window_cols") or payload.get("feats") or []
+    window = int(payload["window_size"])
+    tcol   = f"{prep.main_timeframe}_time"
+
+    # build X,y,features,times with times returned
+    X_all, y_all, feats, t_idx = prep.ready(
+        raw.copy(),
+        window=window,
+        selected_features=cols,
+        mode="train",
+        with_times=True,            # important: get aligned timestamps
+        predict_drop_last=False,
+        train_drop_last=False
+    )
+    if X_all is None or len(X_all) == 0 or t_idx is None:
+        pd.DataFrame().to_csv(out_csv, index=False); return
+
+    # align & order columns
+    L = min(len(X_all), len(t_idx))
+    X_all = X_all.iloc[:L].reset_index(drop=True)
+    t_idx = pd.to_datetime(pd.Series(t_idx)).iloc[:L].reset_index(drop=True)
+    X_all = X_all.reindex(columns=cols, fill_value=0.0).astype(float)
+
+    df_out = pd.concat([t_idx.rename("timestamp"), X_all], axis=1).tail(last_n)
+    df_out.to_csv(out_csv, index=False)
+
 # ------------------- Robust model loader -------------------
 def _try_pickle(fp: str):
     with open(fp, "rb") as f:
@@ -261,7 +289,7 @@ def evaluate_block(df_part: pd.DataFrame, payload: dict, prep: PREPARE_DATA_FOR_
 # ----------------------------- main -----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--last-n", type=int, default=2000)
+    ap.add_argument("--last-n", type=int, default=200)
     ap.add_argument("--verbosity", type=int, default=1)
     ap.add_argument("--base-dir", type=str, default=".")
     ap.add_argument("--symbol", type=str, default="XAUUSD")
