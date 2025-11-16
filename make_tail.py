@@ -1,10 +1,10 @@
 import pandas as pd
 
 files_config = {
-    "XAUUSD_M5.csv": 2000,
-    "XAUUSD_M15.csv": 700,
-    "XAUUSD_M30.csv": 350,
-    "XAUUSD_H1.csv": 175
+    "XAUUSD_M5.csv": 10000,
+    "XAUUSD_M15.csv": 1000,
+    "XAUUSD_M30.csv": 1000,
+    "XAUUSD_H1.csv": 10000
 }
 
 for file_name, n_rows in files_config.items():

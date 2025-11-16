@@ -1,119 +1,71 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
-from __future__ import annotations
-import os, sys, json, argparse
+"""
+compare_feature_feeds.py
+ورودی‌ها:
+  - sim_X_feed_tail200.csv  (خروجی شبیه‌ساز)
+  - deploy_X_feed_tail200.csv (خروجی دپلوی)
+خروجی‌ها:
+  - features_compare_summary.csv
+  - features_compare_detailed.csv
+"""
+
+import pandas as pd
 from pathlib import Path
 import numpy as np
-import pandas as pd
 
-def load_meta_cols(meta_path="best_model.meta.json") -> list[str]:
-    cols = []
-    if os.path.exists(meta_path):
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        cols = meta.get("train_window_cols") or meta.get("feats") or []
-    return list(cols)
+SIM = Path("sim_X_feed_tail200.csv")
+DEP = Path("deploy_X_feed_tail200.csv")
+OUT_SUM = Path("features_compare_summary.csv")
+OUT_DET = Path("features_compare_detailed.csv")
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--sim", type=str, default="sim_X_feed_tail200.csv")
-    ap.add_argument("--dep", type=str, default="deploy_X_feed_log.csv")
-    ap.add_argument("--out-summary", type=str, default="features_compare_summary.csv")
-    ap.add_argument("--out-detailed", type=str, default="features_compare_detailed.csv")
-    args = ap.parse_args()
-
-    # read
-    sim = pd.read_csv(args.sim)
-    dep = pd.read_csv(args.dep)
-
-    # normalize timestamp dtype
-    sim["timestamp"] = pd.to_datetime(sim["timestamp"], errors="coerce")
-    dep["timestamp"] = pd.to_datetime(dep["timestamp"], errors="coerce")
-    sim = sim.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    dep = dep.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-
-    # columns intersection based on training window columns
-    train_cols = load_meta_cols("best_model.meta.json")
-    if not train_cols:
-        # fallback: all except timestamp/score/decision
-        train_cols = [c for c in sim.columns if c != "timestamp"]
-    feat_cols = [c for c in train_cols if c in sim.columns and c in dep.columns]
-
-    # inner-join on timestamp to get exactly overlapping rows
-    joined = sim[["timestamp"] + feat_cols].merge(
-        dep[["timestamp"] + feat_cols],
-        on="timestamp", suffixes=("_sim","_dep"), how="inner"
-    )
-    if joined.empty:
-        print("No overlapping timestamps; nothing to compare.")
+    if not SIM.exists() or not DEP.exists():
+        print("missing input CSVs")
         return
 
-    # build detailed rows per feature per timestamp
-    detailed_rows = []
-    for feat in feat_cols:
-        a = joined[f"{feat}_sim"].astype(float)
-        b = joined[f"{feat}_dep"].astype(float)
-        diff = a - b
-        rel = diff / (np.where(np.abs(a)>1e-12, np.abs(a), 1.0))
-        match = ( (a.isna() & b.isna()) | (np.isclose(a, b, atol=1e-9, rtol=1e-6)) )
-        df_feat = pd.DataFrame({
-            "timestamp": joined["timestamp"],
-            "feature": feat,
-            "sim": a, "dep": b,
-            "diff": diff,
-            "rel_diff": rel,
-            "match": match
-        })
-        detailed_rows.append(df_feat)
+    sim = pd.read_csv(SIM)
+    dep = pd.read_csv(DEP)
 
-    detailed = pd.concat(detailed_rows, ignore_index=True)
-    detailed.sort_values(["feature","timestamp"], inplace=True)
-    detailed.to_csv(args.out_detailed, index=False)
+    # نرمال‌سازی نام ستون timestamp
+    for df in (sim, dep):
+        if "timestamp" not in df.columns:
+            # برخی نسخه‌ها نام ستون را time نوشته‌اند
+            tcands = [c for c in df.columns if "time" in c.lower()]
+            if tcands:
+                df.rename(columns={tcands[0]: "timestamp"}, inplace=True)
+    sim["timestamp"] = pd.to_datetime(sim["timestamp"], errors="coerce")
+    dep["timestamp"] = pd.to_datetime(dep["timestamp"], errors="coerce")
 
-    # summary per feature
-    summary_rows = []
-    for feat in feat_cols:
-        df_f = detailed[detailed["feature"]==feat]
-        rows = len(df_f)
-        mismatch_cnt = int((~df_f["match"]).sum())
-        nan_sim = int(df_f["sim"].isna().sum())
-        nan_dep = int(df_f["dep"].isna().sum())
-        nan_both = int((df_f["sim"].isna() & df_f["dep"].isna()).sum())
-        mad = float(np.nanmean(np.abs(df_f["diff"]))) if rows else 0.0
-        med = float(np.nanmedian(np.abs(df_f["diff"]))) if rows else 0.0
-        mx = float(np.nanmax(np.abs(df_f["diff"]))) if rows else 0.0
-        try:
-            corr = float(np.corrcoef(
-                np.nan_to_num(df_f["sim"].values, nan=0.0),
-                np.nan_to_num(df_f["dep"].values, nan=0.0)
-            )[0,1])
-        except Exception:
-            corr = np.nan
-        rmse = float(np.sqrt(np.nanmean((df_f["diff"])**2))) if rows else 0.0
+    sim = sim.dropna(subset=["timestamp"]).sort_values("timestamp")
+    dep = dep.dropna(subset=["timestamp"]).sort_values("timestamp")
 
-        summary_rows.append({
-            "feature": feat,
-            "rows": rows,
-            "mismatch_cnt": mismatch_cnt,
-            "mismatch_rate": mismatch_cnt / max(1, rows),
-            "na_sim": nan_sim,
-            "na_dep": nan_dep,
-            "na_both": nan_both,
-            "mean_abs_diff": mad,
-            "median_abs_diff": med,
-            "max_abs_diff": mx,
-            "corr": corr,
-            "rmse": rmse,
-            # heuristic flags
-            "flag_time_offset_like": False,
-            "flag_scale_like": False,
-            "flag_lag_like": False,
-            "flag_nan_mismatch": (nan_sim != nan_dep)
-        })
+    # ستون‌های مشترک (به‌جز timestamp، score، decision)
+    skip = {"timestamp", "score", "decision"}
+    common = [c for c in sim.columns if c in dep.columns and c not in skip]
 
-    summary = pd.DataFrame(summary_rows).sort_values(["mismatch_rate","rmse","feature"], ascending=[False,False,True])
-    summary.to_csv(args.out_summary, index=False)
-    print(f"Wrote: {args.out_summary} & {args.out_detailed}")
+    # join بر اساس timestamp برابر
+    joined = sim.merge(dep, on="timestamp", suffixes=("_sim","_dep"), how="inner")
+
+    # مقایسهٔ اختلاف‌ها
+    rows = []
+    for c in common:
+        a = joined[f"{c}_sim"].astype(float)
+        b = joined[f"{c}_dep"].astype(float)
+        diff = (a - b).abs()
+        mism = (diff > 1e-12).sum()  # آستانهٔ بسیار سخت
+        rows.append({"feature": c, "mismatch_cnt": int(mism), "max_abs_diff": float(diff.max())})
+
+    summary = pd.DataFrame(rows).sort_values(["mismatch_cnt","max_abs_diff"], ascending=[False, False])
+    summary.to_csv(OUT_SUM, index=False)
+
+    # گزارش تفصیلی (برای فقط ستون‌هایی که mismatch دارند)
+    bads = summary[summary["mismatch_cnt"] > 0]["feature"].tolist()
+    det_cols = ["timestamp"] + [f"{c}_sim" for c in bads] + [f"{c}_dep" for c in bads]
+    detailed = joined[det_cols].copy()
+    detailed.to_csv(OUT_DET, index=False)
+
+    print(f"Wrote {OUT_SUM} and {OUT_DET}")
 
 if __name__ == "__main__":
     main()
