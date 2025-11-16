@@ -1,7 +1,15 @@
 # -*- coding: utf-8 -*-
 #!/usr/bin/env python3
+"""
+generating_data_for_predict_script.py
+
+این اسکریپت نقش MT4 را بازی می‌کند: در هر گام داده‌های live را می‌نویسد و
+منتظر جواب dploy می‌ماند. سپس برای محاسبه‌ی برچسب، زمان دقیق پیش‌بینی (ts_feat)
+را از deploy_X_feed_log.csv می‌خواند و جهت واقعی بازار را بر همان اساس می‌سنجد.
+"""
+
 from __future__ import annotations
-import os, sys, time, json, logging, argparse
+import os, sys, time, logging, argparse
 from pathlib import Path
 import pandas as pd
 
@@ -16,33 +24,28 @@ def setup_logging(verbosity:int=1):
     ch = logging.StreamHandler(sys.stdout); ch.setLevel(logging.INFO); ch.setFormatter(fmt); logger.addHandler(ch)
     return logger
 
-def resolve_raw_paths(base_dir: Path, symbol: str) -> dict[str,str]:
+def resolve_raw_paths(base: Path, symbol: str) -> dict[str,str]:
     cands = {
-        "30T": [f"{symbol}_30T.csv", f"{symbol}_M30.csv"],
-        "15T": [f"{symbol}_15T.csv", f"{symbol}_M15.csv"],
-        "5T" : [f"{symbol}_5T.csv",  f"{symbol}_M5.csv" ],
-        "1H" : [f"{symbol}_1H.csv",  f"{symbol}_H1.csv" ],
+        "30T":[f"{symbol}_30T.csv", f"{symbol}_M30.csv"],
+        "15T":[f"{symbol}_15T.csv", f"{symbol}_M15.csv"],
+        "5T" :[f"{symbol}_5T.csv",  f"{symbol}_M5.csv" ],
+        "1H" :[f"{symbol}_1H.csv",  f"{symbol}_H1.csv" ],
     }
-    res = {}
-    for tf, names in cands.items():
+    out = {}
+    for tf,names in cands.items():
         found = None
         for nm in names:
-            p = base_dir / nm
+            p = base / nm
             if p.exists(): found = str(p); break
-        if not found:
-            for ch in base_dir.iterdir():
+        if found is None:
+            for ch in base.iterdir():
                 if ch.is_file() and any(ch.name.lower()==nm.lower() for nm in names):
                     found = str(ch); break
-        if found:
-            logging.info(f"[raw] {tf} -> {found}")
-            res[tf] = found
-    if "30T" not in res:
-        raise FileNotFoundError("30T file not found.")
-    return res
-
-def pick_slice_sizes() -> dict[str,int]:
-    # حدودی که MT4 به‌صورت رایج در اختیار قرار می‌دهد
-    return {"30T": 500, "15T": 1000, "5T": 3000, "1H": 300}
+        if found is None:
+            raise FileNotFoundError(f"[{tf}] not found in {base}")
+        out[tf] = found
+        logging.info("[raw] %s -> %s", tf, found)
+    return out
 
 def live_name(path: str) -> str:
     p = Path(path)
@@ -50,90 +53,108 @@ def live_name(path: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--last-n", type=int, default=200, help="تعداد رکوردهای انتهایی برای سنجش (پیشنهادی: 200)")
+    ap.add_argument("--last-n", type=int, default=200)
     ap.add_argument("--base-dir", type=str, default=".")
     ap.add_argument("--symbol", type=str, default="XAUUSD")
-    ap.add_argument("--sleep", type=float, default=0.25, help="وقفه‌ی polling (ثانیه)")
+    ap.add_argument("--sleep", type=float, default=0.2)
+    ap.add_argument("--verbosity", type=int, default=1)
     args = ap.parse_args()
-
-    setup_logging(1)
+    setup_logging(args.verbosity)
     logging.info("=== Generator started ===")
 
     base = Path(args.base_dir).resolve()
     paths = resolve_raw_paths(base, args.symbol)
-    raw = {tf: pd.read_csv(paths[tf]) for tf in paths}
+    raw = {tf: pd.read_csv(p) for tf,p in paths.items()}
     for tf, df in raw.items():
-        if "time" not in df.columns:
-            raise ValueError(f"[{tf}] 'time' column missing.")
-        df["time"] = pd.to_datetime(df["time"], errors="coerce"); df.dropna(subset=["time"], inplace=True)
-        df.sort_values("time", inplace=True); df.reset_index(drop=True, inplace=True)
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        df.dropna(subset=["time"], inplace=True)
+        df.sort_values("time", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        raw[tf] = df
 
     df30 = raw["30T"]
     total = len(df30)
-    if total < args.last_n + 2:
-        logging.warning("Dataset is small vs last_n; proceeding anyway.")
+    n = min(args.last_n, total-2)
+    start_idx = max(0, total - (n + 1))  # need t and t+1
 
-    SL = pick_slice_sizes()
-    wins = loses = none = 0
+    # buffer sizes for writing live CSVs
+    SL = {"30T":1000,"15T":2000,"5T":5000,"1H":1000}
+    ans_path = Path("answer.txt")
+    feed_log = Path("deploy_X_feed_log.csv")
+
+    wins=loses=none=0
     audit_rows = []
-    start_idx = max(1, total - args.last_n)
-    ans_path = base / "answer.txt"
 
-    for i, idx in enumerate(range(start_idx, total-1), start=1):
-        ts_now = pd.Timestamp(df30.loc[idx, "time"])
-        # 1) write live CSV slices (up to ts_now)
-        for tf in raw.keys():
-            k = SL.get(tf, 500)
-            df = raw[tf]
-            df_cut = df[df["time"] <= ts_now].tail(k).copy()
-            out_path = live_name(paths[tf])
-            df_cut.to_csv(out_path, index=False)
+    for step, idx in enumerate(range(start_idx, start_idx+n), start=1):
+        ts_now = df30.loc[idx, "time"]
+        # write live CSVs up to ts_now
+        for tf, df in raw.items():
+            cut = df[df["time"] <= ts_now].tail(SL.get(tf,500)).copy()
+            Path(live_name(paths[tf])).write_text("")  # ensure file is cleared
+            cut.to_csv(live_name(paths[tf]), index=False)
 
-        logging.info(f"[Step {i}/{args.last_n}] Live CSVs written at {ts_now} — waiting for answer.txt …")
+        logging.info(f"[Step {step}/{n}] Live CSVs written at {ts_now} — waiting for answer.txt …")
 
-        # 2) wait for prediction then read and DELETE
+        # wait until answer.txt appears
         while not ans_path.exists():
             time.sleep(args.sleep)
-
         try:
-            ans = (ans_path.read_text(encoding="utf-8").strip() or "NONE").upper()
+            ans = ans_path.read_text(encoding="utf-8").strip().upper() or "NONE"
         except Exception:
             ans = "NONE"
-        try:
-            ans_path.unlink(missing_ok=True)  # مهم: حتماً حذف شود تا مرحله بعد گیر نکند
-        except Exception:
-            pass
+        # remove answer.txt for next iteration
+        ans_path.unlink(missing_ok=True)
 
-        # 3) compute ground-truth from 30T (direction t→t+1)
-        c0 = float(df30.loc[idx, "close"]); c1 = float(df30.loc[idx+1, "close"])
-        real_up = (c1 > c0)  # True=BUY, False=SELL
+        # read last timestamp from deploy_X_feed_log.csv (ts_feat)
+        try:
+            dflog = pd.read_csv(feed_log, parse_dates=["timestamp"])
+            ts_feat = pd.to_datetime(dflog["timestamp"].iloc[-1])
+        except Exception:
+            ts_feat = ts_now  # fallback
+
+        # compute real_up based on ts_feat (not ts_now)
+        try:
+            # find row index in 30T where time == ts_feat
+            ridx = df30.index[df30["time"] == ts_feat].tolist()
+            if not ridx:
+                real_up = None
+            else:
+                ridx = ridx[0]
+                c0 = float(df30.loc[ridx, "close"])
+                c1 = float(df30.loc[ridx+1, "close"])
+                real_up = (c1 > c0)
+        except Exception:
+            real_up = None
 
         pred_up = None
-        if ans == "BUY":
-            pred_up = True
-        elif ans == "SELL":
-            pred_up = False
+        if ans == "BUY": pred_up = True
+        elif ans == "SELL": pred_up = False
 
-        if pred_up is None:
+        if pred_up is None or real_up is None:
             none += 1
             hit = None
         else:
             hit = (pred_up == real_up)
             if hit: wins += 1
-            else:   loses += 1
+            else: loses += 1
+
+        pred_n = wins + loses
+        cover = pred_n / float(step)
+        acc = (wins / pred_n) if pred_n > 0 else 0.0
+        logging.info(f"[Step {step}] cover={cover:.3f} acc={acc:.3f} wins={wins} loses={loses} none={none}")
 
         audit_rows.append({
-            "timestamp": ts_now,
+            "timestamp_sim": ts_now,
+            "ts_pred": ts_feat,
             "answer": ans,
             "real_up": real_up,
             "hit": hit,
-            "close_t": c0,
-            "close_t1": c1
+            "acc_cum": acc,
+            "cover_cum": cover
         })
 
-    # 4) final metrics
     pred_n = wins + loses
-    cover = pred_n / max(1, args.last_n)
+    cover = pred_n / max(1, n)
     acc = (wins / pred_n) if pred_n > 0 else 0.0
     logging.info(f"[Final] acc={acc:.3f} cover={cover:.3f} wins={wins} loses={loses} none={none}")
     pd.DataFrame(audit_rows).to_csv("generator_audit.csv", index=False)
