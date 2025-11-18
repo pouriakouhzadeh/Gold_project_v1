@@ -30,6 +30,8 @@ from sklearn.feature_selection import VarianceThreshold, mutual_info_classif
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import MinMaxScaler
 from sklearnex import patch_sklearn
+from pathlib import Path
+import json
 from clear_data import ClearData
 from DriftBasedStartDateSuggester import DriftBasedStartDateSuggester
 from custom_indicators import (
@@ -66,6 +68,56 @@ logging.basicConfig(level=logging.INFO, filename="genetic_algorithm.log", format
 # ---------------- REPRODUCIBILITY ----------------
 SEED = 2025
 np.random.seed(SEED)
+
+
+# ---------------- BLACKLIST ----------------
+
+def _load_feature_blacklist() -> set[str]:
+    """
+    لیست فیچرهایی که نباید در آموزش/پیش‌بینی استفاده شوند.
+    خروجی: نام فیچرهای *پایه* (بدون _tminus).
+    """
+
+    bl: set[str] = set()
+
+    # ۱) فایل متنی دستی (هر خط یک نام فیچر پایه، مثل '30T_rsi_14')
+    txt_path = Path("feature_blacklist.txt")
+    if txt_path.exists():
+        for ln in txt_path.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if ln:
+                bl.add(ln)
+
+    # ۲) فایل JSON دستی (لیست رشته‌ها)
+    json_path = Path("feature_blacklist.json")
+    if json_path.exists():
+        try:
+            arr = json.loads(json_path.read_text(encoding="utf-8"))
+            for name in arr:
+                if isinstance(name, str) and name.strip():
+                    bl.add(name.strip())
+        except Exception:
+            pass
+
+    # ۳) از گزارش compare (ستون feature معمولاً پنجره‌ای است، با _tminusN)
+    csv_path = Path("features_compare_summary.csv")
+    if csv_path.exists():
+        try:
+            import pandas as pd
+            dfc = pd.read_csv(csv_path)
+            if {"feature", "mismatch_cnt"}.issubset(dfc.columns):
+                mask = dfc["mismatch_cnt"] > 0
+                cand = dfc.loc[mask, "feature"].astype(str).tolist()
+                base_names = set()
+                for f in cand:
+                    # حذف suffix مثل _tminus0 یا _tminus12
+                    base = re.sub(r"_tminus\d+$", "", f)
+                    base_names.add(base)
+                bl |= base_names
+        except Exception:
+            pass
+
+    return bl
 
 # ---------------- HELPERS ----------------
 
@@ -536,7 +588,12 @@ class PREPARE_DATA_FOR_TRAIN:
         if (not strict_cols) and self.bad_cols_tf:
             bad_union = set().union(*self.bad_cols_tf.values())
             feats = [f for f in feats if f not in bad_union]
-
+            
+        #     Blacklist    
+        _black = _load_feature_blacklist()
+        if _black:
+            # در این مرحله 'feats' نام‌های فیچرِ "پایه" هستند (بدون _tminus).
+            feats = [c for c in feats if c not in _black]
         X_f = df_diff[feats].copy()
 
         # --- پنجره‌بندی ---
