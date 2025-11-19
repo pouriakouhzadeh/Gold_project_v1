@@ -120,8 +120,8 @@ def load_checkpoint() -> tuple[int, list, float] | None:
 # ---------------------------------------------------------------------------
 @dataclass
 class GAConfig:
-    population_size: int = 16
-    n_generations: int = 8
+    population_size: int = 3
+    n_generations: int = 2
     cx_pb: float = 0.8
     mut_pb: float = 0.4
     early_stopping_threshold: float = 0.85
@@ -722,20 +722,18 @@ class GeneticAlgorithmRunner:
         except Exception:
             scaler = None
 
-        # ← این دو خط جدید
-        saver = ModelSaver()
+        saver = ModelSaver(model_dir=".")   # یا مسیر دلخواه
         saver.save_full(
             pipeline=model.pipeline,
             hyperparams=hyper,
-            scaler=scaler,
             window_size=window,
             neg_thr=self.neg_thr,
             pos_thr=self.pos_thr,
-            feats=feats,                         # لیست فیچرهای پایه
-            feat_mask=[],                       # اگر ماسک داری
-            train_window_cols=list(self.final_cols),   # *** مهم ***
+            feats=feats,
+            feat_mask=[],
+            train_window_cols=list(self.final_cols),
             train_distribution_path="train_distribution.json",
-        )        
+        )
         
         LOGGER.info("[save] All artefacts persisted to disk successfull")
 
