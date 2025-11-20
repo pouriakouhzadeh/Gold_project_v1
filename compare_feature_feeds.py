@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-compare_parity_reports.py  —  مقایسهٔ فیچرها و پیش‌بینی‌ها بین:
+compare_parity_reports.py  —  مقایسهٔ کامل بین:
 
-1) live_like_sim_v3/v4:
+1) live_like_sim_v3:
     - sim_X_feed_tail200.csv
     - sim_predictions.csv
 
@@ -14,7 +14,9 @@ compare_parity_reports.py  —  مقایسهٔ فیچرها و پیش‌بینی
 """
 
 from __future__ import annotations
-import argparse, logging
+
+import argparse
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -38,212 +40,181 @@ def compare_features(base_dir: Path) -> None:
     dep_feat_path = base_dir / "deploy_X_feed_tail200.csv"
 
     if not sim_feat_path.is_file() or not dep_feat_path.is_file():
-        LOG.warning(
-            "Feature CSVs not found (sim_X_feed_tail200.csv / deploy_X_feed_tail200.csv), skipping feature comparison."
-        )
+        LOG.warning("Feature CSVs not found, skipping feature comparison.")
         return
 
     sim = pd.read_csv(sim_feat_path)
     dep = pd.read_csv(dep_feat_path)
 
-    # ستون‌های زمان
     if "timestamp" in sim.columns:
         sim["timestamp"] = pd.to_datetime(sim["timestamp"], errors="coerce")
-        tcol_sim = "timestamp"
-    else:
-        LOG.warning("No 'timestamp' column in sim_X_feed_tail200.csv; using row index.")
-        sim["timestamp"] = range(len(sim))
-        tcol_sim = "timestamp"
+    if "timestamp" in dep.columns:
+        dep["timestamp"] = pd.to_datetime(dep["timestamp"], errors="coerce")
 
-    if "timestamp_feature" in dep.columns:
-        dep["timestamp_feature"] = pd.to_datetime(
-            dep["timestamp_feature"], errors="coerce"
-        )
-        tcol_dep = "timestamp_feature"
-    else:
-        LOG.warning(
-            "No 'timestamp_feature' column in deploy_X_feed_tail200.csv; using row index."
-        )
-        dep["timestamp_feature"] = range(len(dep))
-        tcol_dep = "timestamp_feature"
-
-    merged = sim.merge(
-        dep,
-        left_on=tcol_sim,
-        right_on=tcol_dep,
-        how="inner",
-        suffixes=("_sim", "_dep"),
-    )
+    merged = sim.merge(dep, on="timestamp", how="inner", suffixes=("_sim", "_dep"))
     if merged.empty:
-        LOG.warning("No overlapping timestamps between sim and deploy features.")
+        LOG.warning("No overlapping timestamps between sim and deploy feature feeds.")
         return
 
-    # فیچرهای مشترک
-    exclude_sim = {tcol_sim, "y_true"}
-    exclude_dep = {tcol_dep, "timestamp_trigger"}
+    # ستون‌هایی که واقعاً فیچر هستند (نه y_true و نه ستون‌های زمانی / متادیتا)
+    exclude_sim = {"timestamp", "y_true"}
+    exclude_dep = {
+        "timestamp",
+        "timestamp_trigger",
+        "y_true",
+        "y_prob",
+        "action",
+        "cover_cum",
+        "neg_thr",
+        "pos_thr",
+    }
     feat_cols = sorted(
-        set(c for c in sim.columns if c not in exclude_sim)
-        & set(c for c in dep.columns if c not in exclude_dep)
+        set(c.replace("_sim", "") for c in merged.columns if c.endswith("_sim"))
+        & set(c.replace("_dep", "") for c in merged.columns if c.endswith("_dep"))
     )
+    feat_cols = [c for c in feat_cols if c not in exclude_sim and c not in exclude_dep]
 
     if not feat_cols:
-        LOG.warning("No common feature columns between sim and deploy.")
+        LOG.warning("No common feature columns to compare.")
         return
 
-    # محاسبهٔ diff برای هر فیچر
-    for c in feat_cols:
-        merged[f"{c}_diff"] = (
-            merged[f"{c}_dep"].astype(float) - merged[f"{c}_sim"].astype(float)
-        )
-
-    # detailed
-    detailed_path = base_dir / "features_compare_detailed.csv"
-    merged.to_csv(detailed_path, index=False)
-    LOG.info("features_compare_detailed.csv written (%s)", detailed_path)
-
-    # summary
     rows = []
     for c in feat_cols:
-        diff = merged[f"{c}_diff"].astype(float)
+        diff = (
+            merged[f"{c}_dep"].astype(float) - merged[f"{c}_sim"].astype(float)
+        ).abs()
         rows.append(
             {
                 "feature": c,
-                "max_abs_diff": float(diff.abs().max()),
-                "mean_abs_diff": float(diff.abs().mean()),
+                "max_abs_diff": float(diff.max()),
+                "mean_abs_diff": float(diff.mean()),
             }
         )
+
     summary = pd.DataFrame(rows).sort_values("max_abs_diff", ascending=False)
-    summary_path = base_dir / "features_compare_summary.csv"
-    summary.to_csv(summary_path, index=False)
-    LOG.info("features_compare_summary.csv written (%s)", summary_path)
+    out_summary = base_dir / "features_compare_summary.csv"
+    summary.to_csv(out_summary, index=False)
+    LOG.info("Feature comparison summary written to %s", out_summary)
 
 
 # ---------- Prediction comparison ----------
+def _acc_cover(df: pd.DataFrame, src: str) -> None:
+    if "action" not in df.columns or "y_true" not in df.columns:
+        LOG.info("[%s] no 'action'/'y_true' columns, skipped", src)
+        return
+    act = df["action"].astype(str)
+    y_t = df["y_true"]
+    mask = act != "NONE"
+    cover = float(mask.mean()) if len(mask) else 0.0
+    if mask.any():
+        correct = (
+            ((act[mask] == "BUY") & (y_t[mask] == 1))
+            | ((act[mask] == "SELL") & (y_t[mask] == 0))
+        )
+        acc = float(correct.mean())
+    else:
+        acc = 0.0
+    LOG.info("[%s] acc=%.3f cover=%.3f", src, acc, cover)
+
+
 def compare_predictions(base_dir: Path, prob_tol: float = 1e-9) -> None:
     sim_path = base_dir / "sim_predictions.csv"
-    gen_path = base_dir / "generator_predictions.csv"
     dep_path = base_dir / "deploy_predictions.csv"
+    gen_path = base_dir / "generator_predictions.csv"
 
-    if not sim_path.is_file() or not gen_path.is_file() or not dep_path.is_file():
-        LOG.warning(
-            "Prediction CSVs not found (sim_predictions / generator_predictions / deploy_predictions), skipping prediction comparison."
-        )
+    if not sim_path.is_file() or not dep_path.is_file() or not gen_path.is_file():
+        LOG.warning("Prediction CSVs missing, skipping prediction comparison.")
         return
 
     sim = pd.read_csv(sim_path)
-    gen = pd.read_csv(gen_path)
     dep = pd.read_csv(dep_path)
+    gen = pd.read_csv(gen_path)
 
-    for df in (sim, gen, dep):
+    for df in (sim, dep, gen):
         if "timestamp" not in df.columns:
-            raise ValueError("All prediction files must have 'timestamp' column.")
+            raise ValueError(f"{df} must have 'timestamp' column")
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
-    # rename deploy columns to جلوگیری از تداخل نام‌ها
+    # نام‌گذاری ستون‌ها برای جلوگیری از تداخل
+    sim = sim.rename(
+        columns={
+            "action": "action_sim",
+            "y_true": "y_true_sim",
+            "y_prob": "y_prob_sim",
+        }
+    )
     dep = dep.rename(
         columns={
             "action": "action_dep",
-            "y_prob": "y_prob_dep",
-            "cover_cum": "cover_cum_dep",
             "y_true": "y_true_dep",
+            "y_prob": "y_prob_dep",
+        }
+    )
+    gen = gen.rename(
+        columns={
+            "action": "action_gen",
+            "y_true": "y_true_gen",
+            "y_prob": "y_prob_gen",
         }
     )
 
     merged = (
-        sim.merge(gen, on="timestamp", suffixes=("_sim", "_gen"))
-        .merge(dep, on="timestamp", how="left")
+        sim.merge(dep, on="timestamp", how="inner")
+        .merge(gen, on="timestamp", how="inner")
         .sort_values("timestamp")
     )
 
     if merged.empty:
-        LOG.warning("No overlapping timestamps between sim and generator.")
+        LOG.warning("No overlapping timestamps across sim/deploy/generator.")
         return
 
-    # فلگ‌های برابری / اختلاف
-    if "y_true_sim" in merged.columns and "y_true_gen" in merged.columns:
-        merged["y_true_equal_sim_gen"] = merged["y_true_sim"] == merged["y_true_gen"]
-    else:
-        merged["y_true_equal_sim_gen"] = np.nan
+    # اختلاف احتمالات
+    merged["prob_diff_sim_dep"] = (
+        merged["y_prob_sim"].astype(float) - merged["y_prob_dep"].astype(float)
+    ).abs()
+    merged["prob_diff_sim_gen"] = (
+        merged["y_prob_sim"].astype(float) - merged["y_prob_gen"].astype(float)
+    ).abs()
 
-    if "action_sim" in merged.columns and "action_gen" in merged.columns:
-        merged["action_equal_sim_gen"] = merged["action_sim"] == merged["action_gen"]
-    else:
-        merged["action_equal_sim_gen"] = np.nan
+    merged["prob_equal_sim_dep"] = merged["prob_diff_sim_dep"] <= prob_tol
+    merged["prob_equal_sim_gen"] = merged["prob_diff_sim_gen"] <= prob_tol
 
-    if "y_prob_sim" in merged.columns and "y_prob_gen" in merged.columns:
-        merged["prob_diff_sim_gen"] = (
-            merged["y_prob_sim"].astype(float) - merged["y_prob_gen"].astype(float)
-        ).abs()
-        merged["prob_equal_sim_gen"] = merged["prob_diff_sim_gen"] <= prob_tol
-    else:
-        merged["prob_diff_sim_gen"] = np.nan
-        merged["prob_equal_sim_gen"] = np.nan
+    # برابری اکشن‌ها
+    merged["action_equal_sim_dep"] = (
+        merged["action_sim"].astype(str) == merged["action_dep"].astype(str)
+    )
+    merged["action_equal_sim_gen"] = (
+        merged["action_sim"].astype(str) == merged["action_gen"].astype(str)
+    )
 
-    if "y_prob_sim" in merged.columns and "y_prob_dep" in merged.columns:
-        merged["prob_diff_sim_dep"] = (
-            merged["y_prob_sim"].astype(float) - merged["y_prob_dep"].astype(float)
-        ).abs()
-    else:
-        merged["prob_diff_sim_dep"] = np.nan
-
-    # ذخیره
     out_path = base_dir / "predictions_compare.csv"
     merged.to_csv(out_path, index=False)
-    LOG.info("predictions_compare.csv written (%s)", out_path)
+    LOG.info("predictions_compare.csv written to %s", out_path)
 
-    # خلاصهٔ آماری
     total = len(merged)
-    y_equal = merged["y_true_equal_sim_gen"].sum()
-    act_equal = merged["action_equal_sim_gen"].sum()
-    prob_close = merged["prob_equal_sim_gen"].sum()
+    LOG.info("---- Prediction parity summary (inner-joined timestamps) ----")
+    LOG.info("Total rows = %d", total)
 
-    LOG.info("---- Prediction parity summary ----")
-    LOG.info("Total rows (joined) = %d", total)
-    LOG.info(
-        "y_true equal (sim vs gen)    : %d (%.2f%%)",
-        y_equal,
-        100.0 * y_equal / max(1, total),
-    )
-    LOG.info(
-        "action equal (sim vs gen)    : %d (%.2f%%)",
-        act_equal,
-        100.0 * act_equal / max(1, total),
-    )
-    LOG.info(
-        "prob |sim-gen| <= %.1e       : %d (%.2f%%)",
-        prob_tol,
-        prob_close,
-        100.0 * prob_close / max(1, total),
-    )
+    for name, col in [
+        ("action_equal_sim_dep", "action_equal_sim_dep"),
+        ("action_equal_sim_gen", "action_equal_sim_gen"),
+        ("prob_equal_sim_dep", "prob_equal_sim_dep"),
+        ("prob_equal_sim_gen", "prob_equal_sim_gen"),
+    ]:
+        if col in merged.columns:
+            val = float(merged[col].mean())
+            LOG.info("%s: %.2f%%", name, 100.0 * val)
 
-    # دقت و cover برای هر سه
-    def _acc_cover(df: pd.DataFrame, src: str) -> None:
-        if "action" not in df.columns or "y_true" not in df.columns:
-            LOG.info("[%s] no 'action'/'y_true' columns, skip", src)
-            return
-        act = df["action"]
-        y_t = df["y_true"]
-        mask = act != "NONE"
-        cover = float(mask.mean()) if len(mask) else 0.0
-        if mask.any():
-            correct = ((act[mask] == "BUY") & (y_t[mask] == 1)) | (
-                (act[mask] == "SELL") & (y_t[mask] == 0)
-            )
-            acc = float(correct.mean())
-        else:
-            acc = 0.0
-        LOG.info("[%s] acc=%.3f cover=%.3f", src, acc, cover)
-
-    _acc_cover(sim.rename(columns={"action": "action", "y_true": "y_true"}), "sim")
-    _acc_cover(gen, "generator")
+    # دقت/کاور هر کدام جداگانه
     _acc_cover(
-        dep.rename(
-            columns={
-                "action_dep": "action",
-                "y_true_dep": "y_true",
-            }
-        ),
-        "deploy",
+        sim.rename(columns={"action_sim": "action", "y_true_sim": "y_true"}), "sim"
+    )
+    _acc_cover(
+        dep.rename(columns={"action_dep": "action", "y_true_dep": "y_true"}), "deploy"
+    )
+    _acc_cover(
+        gen.rename(columns={"action_gen": "action", "y_true_gen": "y_true"}),
+        "generator",
     )
 
 
@@ -257,10 +228,10 @@ def main() -> None:
     setup_logging(args.verbosity)
     base_dir = Path(args.base_dir).resolve()
 
-    LOG.info("=== Comparing features ===")
+    LOG.info("=== Feature comparison ===")
     compare_features(base_dir)
 
-    LOG.info("=== Comparing predictions ===")
+    LOG.info("=== Prediction comparison ===")
     compare_predictions(base_dir, prob_tol=args.prob_tol)
 
 
