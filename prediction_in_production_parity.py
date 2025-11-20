@@ -373,7 +373,16 @@ def main() -> None:
                 f.write(action)
         except Exception as e:
             LOG.error("Failed to write answer.txt: %s", e)
-
+        print(
+            "[Predict] step=%d ts_feat=%s ts_now=%s | p=%.6f → %s | y_true=%s | cover_cum=%.3f",
+            steps_done,
+            ts_feat,
+            ts_now,
+            prob,
+            action,
+            str(y_true),
+            cover_cum,
+        )
         LOG.info(
             "[Predict] step=%d ts_feat=%s ts_now=%s | p=%.6f → %s | y_true=%s | cover_cum=%.3f",
             steps_done,
