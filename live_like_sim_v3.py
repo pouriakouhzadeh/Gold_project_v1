@@ -47,13 +47,16 @@ def main() -> None:
 
     # ---------- مدل و متا ----------
     saver = ModelSaver(model_dir=str(base))
-    pipeline, meta = saver.load_full()      # این تابع را با امضای واقعی ModelSaver خودت هماهنگ کن
+    payload = saver.load_full()      # خروجی یک dict است
+    pipeline = payload["pipeline"]
+    meta     = payload               # خود dict را به عنوان meta استفاده می‌کنیم
 
-    model = pipeline        # wrapper که predict_proba دارد
+    model = pipeline        # همین pipeline اسکیک‌لرن است که predict_proba دارد
     window = int(meta["window_size"])
     neg_thr = float(meta["neg_thr"])
     pos_thr = float(meta["pos_thr"])
     train_cols = list(meta["train_window_cols"])
+
 
     LOG.info("Loaded model: window=%d neg_thr=%.3f pos_thr=%.3f cols=%d",
              window, neg_thr, pos_thr, len(train_cols))

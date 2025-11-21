@@ -648,7 +648,7 @@ class GeneticAlgorithmRunner:
         
         # ── پیش‌بینی با دو آستانه ─────────────────────────────
         y_prob = model.predict_proba(X)[:, 1]
-        y_pred = np.full_like(len(y_prob), -1, dtype=int)   # -1 ⇒ No-Trade
+        y_pred = np.full(len(y_prob), -1, dtype=int)   # ← اینجا
         y_pred[y_prob <= self.neg_thr] = 0
         y_pred[y_prob >= self.pos_thr] = 1
         # --- هم‌ترازی ایمن: اگر به هر دلیل طول‌ها متفاوت بود، کوتاه کن
