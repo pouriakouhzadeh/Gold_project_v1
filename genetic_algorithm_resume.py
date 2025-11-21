@@ -326,10 +326,10 @@ def evaluate_cv(ind):
         X, y, _, price_ser = PREP_SHARED.ready(
             DATA_TRAIN_SHARED,
             window=window,
-            selected_features=[],
+            selected_features=[],    # در GA خود فولدها select_features می‌کنند
             mode="train",
             predict_drop_last=False,
-            train_drop_last=True     # ← یکسان با لایو
+            train_drop_last=False    # ❗ حالا دیگر سطر آخر اضافی حذف نمی‌شود
         )
         if X.empty:
             return (0.0,)
@@ -412,10 +412,12 @@ class GeneticAlgorithmRunner:
             raw  = prep.load_data()
             LOGGER.info("[main] Raw data loaded → rows = %d, shape = %s", len(raw), raw.shape)
             # -------------------- save tain raw with def ready for test-------------
-            X_tail, _, _, _ = prep.ready(raw.tail(2001),
-                                        selected_features=self.final_cols,
-                                        mode="predict",
-                                        predict_drop_last=True)   # ← لایو هم drop-last داریم
+            X_tail, _, _, _ = prep.ready(
+                raw.tail(2001),
+                selected_features=self.final_cols if self.final_cols else None,
+                mode="predict",
+                predict_drop_last=False     # ❗ آخرین کندل نگه داشته می‌شود
+            )
             X_tail.to_csv("raw_tail2000_clean.csv", index=False)
             LOGGER.info(f"[main] Saved cleaned tail to raw_tail2000_clean.csv, Number of cols = {X_tail.shape[1]}")
             # ------ sort & split ------
@@ -534,10 +536,10 @@ class GeneticAlgorithmRunner:
         X, y, feats, _ = prep.ready(
             data_tr,
             window=window,
-            selected_features=None,
+            selected_features=None,   # این‌جا خود ready انتخاب فیچر انجام می‌دهد
             mode="train",
             predict_drop_last=False,
-            train_drop_last=True      # ← همرفتار با لایو
+            train_drop_last=False     # ❗
         )
 
         if X.empty:
@@ -599,10 +601,10 @@ class GeneticAlgorithmRunner:
         X_thr, y_thr, _, _ = prep.ready(
             data_thr,
             window=window,
-            selected_features=self.final_cols,
+            selected_features=self.final_cols,   # همان ستون‌های نهایی TRAIN
             mode="train",
             predict_drop_last=False,
-            train_drop_last=True      # ← با لایو یکسان
+            train_drop_last=False                # ❗
         )
 
 
@@ -636,7 +638,7 @@ class GeneticAlgorithmRunner:
             selected_features=self.final_cols,
             mode="train",
             predict_drop_last=False,
-            train_drop_last=True       # ← هم‌تراز با لایو
+            train_drop_last=False       # ❗
         )
         
         X = X[self.final_cols]                # ستون‌های نهایی مدل
