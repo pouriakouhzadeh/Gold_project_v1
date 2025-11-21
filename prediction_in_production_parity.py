@@ -3,15 +3,19 @@
 """
 prediction_in_production_parity.py  —  اسکریپت دپلوی هماهنگ با ژنراتور (MT4-like)
 
-نقش:
-- منتظر 4 فایل *_live.csv (M5/M15/M30/H1) می‌ماند
-- روی merged تا ts_now فیچر می‌سازد (مثل TRAIN)
-- مدل را اجرا می‌کند و:
-    • deploy_X_feed_log.csv      ← فیچر + متادیتا هر استپ
-    • deploy_X_feed_tail200.csv  ← 200 ردیف آخر فیچر
-    • deploy_predictions.csv     ← خلاصه‌ی پیش‌بینی‌ها
+نقش کلی
+---------
+- منتظر 4 فایل *_live.csv (M5 / M15 / M30 / H1) می‌ماند.
+- روی merged تا ts_now دقیقاً مثل TRAIN فیچر می‌سازد (PREPARE_DATA_FOR_TRAIN.ready با همان پارامترها).
+- مدل را اجرا می‌کند و نتایج را در این فایل‌ها می‌نویسد:
+    • deploy_X_feed_log.csv      ← تمام فیچر + متادیتا برای هر استپ
+    • deploy_X_feed_tail200.csv  ← آخرین ۲۰۰ ردیف فیچر
+    • deploy_predictions.csv     ← خلاصه‌ی پیش‌بینی‌ها (timestamp, action, y_prob, y_true)
     • answer.txt                 ← فقط اکشن برای ژنراتور / MT4
-را می‌نویسد، بعد فایل‌های live را پاک می‌کند.
+
+نکته‌ی مهم:
+- y_true در این اسکریپت مستقیماً از PREPARE_DATA_FOR_TRAIN می‌آید و با live_like_sim_v3 یکسان است.
+- ژنراتور جدید برای محاسبه‌ی دقت، به جای محاسبه‌ی دستی تارگت، همین y_true را استفاده می‌کند.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -50,7 +54,10 @@ def setup_logging(verbosity: int = 1) -> None:
 
 
 # ---------- Artifacts ----------
-def load_artifacts(model_dir: Path):
+def load_artifacts(model_dir: Path) -> Tuple[object, dict, List[str], int, float, float]:
+    """
+    مدل، متا و اطلاعات موردنیاز (ستون‌ها، window، آستانه‌ها) را برمی‌گرداند.
+    """
     meta_path = model_dir / "best_model.meta.json"
     pkl_path = model_dir / "best_model.pkl"
 
@@ -62,7 +69,7 @@ def load_artifacts(model_dir: Path):
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
 
     obj = joblib.load(pkl_path)
-    # اگر ModelSaver بعداً مدل را داخل دیکشنری ذخیره کرد
+    # اگر مدل داخل دیکشنری ذخیره شده باشد
     if isinstance(obj, dict) and "pipeline" in obj:
         model = obj["pipeline"]
     else:
@@ -86,7 +93,7 @@ def load_artifacts(model_dir: Path):
 
 
 # ---------- Live files ----------
-def live_files_ready(base_dir: Path, symbol: str) -> tuple[bool, Dict[str, Path]]:
+def live_files_ready(base_dir: Path, symbol: str) -> Tuple[bool, Dict[str, Path]]:
     files = {
         "30T": base_dir / f"{symbol}_M30_live.csv",
         "15T": base_dir / f"{symbol}_M15_live.csv",
@@ -98,6 +105,9 @@ def live_files_ready(base_dir: Path, symbol: str) -> tuple[bool, Dict[str, Path]
 
 
 def read_last_timestamp(m30_live: Path) -> Optional[pd.Timestamp]:
+    """
+    آخرین time موجود در فایل M30_live را برمی‌گرداند.
+    """
     try:
         df = pd.read_csv(m30_live)
         if "time" not in df.columns or df.empty:
@@ -139,6 +149,7 @@ def align_columns(
     except Exception:
         medians = {}
 
+    # ستون‌های مفقود را بساز
     for c in train_cols:
         if c not in X.columns:
             X[c] = float(medians.get(c, 0.0))
@@ -146,6 +157,7 @@ def align_columns(
     # فقط همین ستون‌ها و همین ترتیب
     X = X[[c for c in train_cols if c in X.columns]]
 
+    # نوع عددی و پر کردن NaN
     for c in X.columns:
         if not np.issubdtype(X[c].dtype, np.number):
             X[c] = pd.to_numeric(X[c], errors="coerce")
@@ -195,7 +207,7 @@ def main() -> None:
         len(train_cols),
     )
 
-    # --- Prepare PREPARE_DATA_FOR_TRAIN once ---
+    # --- Prepare PREPARE_DATA_FOR_TRAIN once (merged ثابت) ---
     filepaths = {
         "30T": base_dir / f"{symbol}_M30.csv",
         "15T": base_dir / f"{symbol}_M15.csv",
@@ -217,6 +229,7 @@ def main() -> None:
     )
     merged = prep.load_data()
     tcol = "30T_time" if "30T_time" in merged.columns else "time"
+    LOG.info("Merged data loaded: shape=%s (time column=%s)", merged.shape, tcol)
 
     # --- Output paths ---
     ans_path = base_dir / "answer.txt"
@@ -228,18 +241,23 @@ def main() -> None:
     # پاک کردن answer.txt قبلی اگر هست
     ans_path.unlink(missing_ok=True)
 
+    # اگر می‌خواهی تست جدید تمیز باشد، این سه تا را پاک می‌کنیم
+    feed_log_path.unlink(missing_ok=True)
+    feed_tail_path.unlink(missing_ok=True)
+    deploy_pred_path.unlink(missing_ok=True)
+
     steps_done = 0
     predicted_cnt = 0
     last_ts_seen: Optional[pd.Timestamp] = None
 
-    LOG.info("Waiting for *_live.csv files from generator ...")
+    LOG.info("Waiting for *_live.csv files from generator / MT4 ...")
 
     while True:
         if args.max_steps > 0 and steps_done >= args.max_steps:
             LOG.info("Max steps (%d) reached, stopping deploy.", args.max_steps)
             break
 
-        # اگر ژنراتور هنوز answer.txt قبلی را نخورده، به آن دست نزن
+        # اگر ژنراتور هنوز answer.txt قبلی را نخورده، دست نزن
         if ans_path.exists():
             time.sleep(args.poll_sec)
             continue
@@ -267,7 +285,7 @@ def main() -> None:
             time.sleep(args.poll_sec)
             continue
 
-        # ساخت فیچرها مثل TRAIN
+        # ساخت فیچرها مثل TRAIN (mode='train' تا y_true هم ساخته شود)
         try:
             X_all, y_all, _, price_ser, t_idx = prep.ready(
                 sub,
@@ -297,7 +315,10 @@ def main() -> None:
         ts_feat = pd.to_datetime(pd.Series(t_idx).iloc[-1])
         y_true = None
         if hasattr(y_all, "__len__") and len(y_all):
-            y_true = int(pd.Series(y_all).iloc[-1])
+            try:
+                y_true = int(pd.Series(y_all).iloc[-1])
+            except Exception:
+                y_true = None
 
         # پیش‌بینی
         try:
@@ -336,12 +357,14 @@ def main() -> None:
 
         # tail 200 برای مقایسه با sim_X_feed_tail200
         try:
-            pd.read_csv(
-                feed_log_path,
-                parse_dates=["timestamp", "timestamp_trigger"],
-            ).sort_values("timestamp").tail(200).to_csv(
-                feed_tail_path,
-                index=False,
+            (
+                pd.read_csv(
+                    feed_log_path,
+                    parse_dates=["timestamp", "timestamp_trigger"],
+                )
+                .sort_values("timestamp")
+                .tail(2000)
+                .to_csv(feed_tail_path, index=False)
             )
         except Exception:
             pass
@@ -373,26 +396,13 @@ def main() -> None:
                 f.write(action)
         except Exception as e:
             LOG.error("Failed to write answer.txt: %s", e)
-        print(
-            "[Predict] step=%d ts_feat=%s ts_now=%s | p=%.6f → %s | y_true=%s | cover_cum=%.3f",
-            steps_done,
-            ts_feat,
-            ts_now,
-            prob,
-            action,
-            str(y_true),
-            cover_cum,
+
+        msg = (
+            "[Predict] step=%d ts_feat=%s ts_now=%s | p=%.6f → %s | y_true=%s | cover_cum=%.3f"
+            % (steps_done, ts_feat, ts_now, prob, action, str(y_true), cover_cum)
         )
-        LOG.info(
-            "[Predict] step=%d ts_feat=%s ts_now=%s | p=%.6f → %s | y_true=%s | cover_cum=%.3f",
-            steps_done,
-            ts_feat,
-            ts_now,
-            prob,
-            action,
-            str(y_true),
-            cover_cum,
-        )
+        print(msg)
+        LOG.info(msg)
 
         # --- 4) پاک‌سازی فایل‌های live برای استپ بعدی ---
         remove_live_files(live_files)

@@ -1,16 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-generating_data_for_predict_script.py  —  ژنراتور نقش MT4 (هماهنگ با دپلوی)
+generating_data_for_predict_script.py  —  ژنراتور نقش MT4 (هماهنگ با دپلوی جدید)
 
-نقش:
-- روی CSVهای خام مَتی‌تریدر (XAUUSD_M5/M15/M30/H1.csv) کار می‌کند
+نقش کلی
+---------
+این اسکریپت در تست آفلاین دقیقاً نقش MT4 را بازی می‌کند:
+
+- روی CSVهای خام مَتی‌تریدر (XAUUSD_M5 / M15 / M30 / H1) کار می‌کند.
 - در هر استپ:
-    • XAUUSD_*_live.csv را تا ts_now می‌سازد
-    • منتظر answer.txt از دپلوی می‌ماند
-    • از deploy_X_feed_log.csv، ts_feat و y_prob و cover_cum را می‌گیرد
-    • y_true را از دیتای خام M30 (close[t+1] > close[t]) محاسبه می‌کند
-    • دقت و کاور تجمعی را می‌سازد و در generator_predictions.csv می‌نویسد
+    1) تا زمان ts_now از هر تایم‌فریم یک فایل *_live.csv می‌سازد.
+    2) منتظر می‌ماند دپلوی (prediction_in_production_parity.py) روی این فایل‌ها مدل را اجرا کند
+       و answer.txt (BUY/SELL/NONE) را بنویسد.
+    3) آخرین ردیف deploy_X_feed_log.csv را می‌خواند و:
+          - ts_feat (timestamp فیچر),
+          - y_prob (احتمال مدل),
+          - cover_cum_deploy,
+          - y_true_dep  (لیبل TRAIN، ساخته شده توسط PREPARE_DATA_FOR_TRAIN)
+       را برمی‌دارد.
+    4) با خودِ y_true_dep (نه محاسبه‌ی دستی از close[t+1]) دقت و کاور تجمعی را
+       حساب می‌کند و در generator_predictions.csv می‌نویسد.
+
+نتیجه‌ی مهم:
+- چون y_true از خود PREPARE_DATA_FOR_TRAIN (و دپلوی) گرفته می‌شود،
+  دقت و cover ژنراتور با خروجی live_like_sim_v3 یکسان می‌شود.
+- اگر بعداً MT4 واقعی را جایگزین ژنراتور کنی، دپلوی همان رفتار مدل را حفظ می‌کند
+  (فقط دیگر y_true در لحظه در دسترس نخواهد بود که طبیعی است).
 """
 
 from __future__ import annotations
@@ -19,13 +34,12 @@ import time
 import logging
 import argparse
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
 
 LOG = logging.getLogger("generator_mt4")
-
 
 # ---------- Logging ----------
 def setup_logging(verbosity: int = 1) -> None:
@@ -36,28 +50,39 @@ def setup_logging(verbosity: int = 1) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-
 # ---------- Helpers ----------
 def resolve_raw_paths(base: Path, symbol: str) -> Dict[str, Path]:
+    """
+    مسیر CSVهای خام هر تایم‌فریم را می‌سازد.
+    """
     return {
         "30T": base / f"{symbol}_M30.csv",
         "15T": base / f"{symbol}_M15.csv",
-        "5T": base / f"{symbol}_M5.csv",
-        "1H": base / f"{symbol}_M1H.csv" if (base / f"{symbol}_M1H.csv").is_file() else base / f"{symbol}_H1.csv",
+        "5T":  base / f"{symbol}_M5.csv",
+        "1H":  base / f"{symbol}_M1H.csv" if (base / f"{symbol}_M1H.csv").is_file() else base / f"{symbol}_H1.csv",
     }
-
 
 def live_name(path: Path) -> Path:
     """XAUUSD_M30.csv → XAUUSD_M30_live.csv"""
     return path.with_name(path.stem + "_live" + path.suffix)
 
-
+# ---------- MAIN ----------
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-dir", default=".", type=str)
     ap.add_argument("--symbol", default="XAUUSD", type=str)
-    ap.add_argument("--last-n", default=200, type=int)
-    ap.add_argument("--sleep", default=0.5, type=float)
+    ap.add_argument(
+        "--last-n",
+        default=2000,
+        type=int,
+        help="تعداد استپ‌هایی که می‌خواهی شبیه‌سازی شود (از انتهای دیتای M30)",
+    )
+    ap.add_argument(
+        "--sleep",
+        default=0.5,
+        type=float,
+        help="تاخیر بین چک‌کردن answer.txt (ثانیه)",
+    )
     ap.add_argument("--verbosity", default=1, type=int)
     args = ap.parse_args()
 
@@ -65,7 +90,7 @@ def main() -> None:
     base = Path(args.base_dir).resolve()
     symbol = args.symbol
 
-    LOG.info("=== Generator (MT4-like) started ===")
+    LOG.info("=== Generator (MT4-like, with correct labels) started ===")
     LOG.info("Base dir=%s | Symbol=%s | last-n=%d", base, symbol, args.last_n)
 
     raw_paths = resolve_raw_paths(base, symbol)
@@ -75,7 +100,7 @@ def main() -> None:
             return
         LOG.info("[raw] %s -> %s", tf, p)
 
-    # --- Load raw CSVs (بدون PREPARE) ---
+    # --- Load raw CSVs (بدون PREPARE؛ فقط برای ساخت *_live.csv) ---
     raw: Dict[str, pd.DataFrame] = {}
     for tf, p in raw_paths.items():
         df = pd.read_csv(p)
@@ -93,7 +118,7 @@ def main() -> None:
         return
 
     total = len(df30)
-    # حداکثر ایندکسی که می‌توانیم y_true (close[t+1]>close[t]) برایش بسازیم
+    # حداکثر ایندکسی که می‌توانیم برایش تارگت آینده تعریف کنیم
     max_idx_for_label = total - 2
     if max_idx_for_label <= 0:
         LOG.error("Not enough M30 rows for labels.")
@@ -103,7 +128,12 @@ def main() -> None:
     start_idx = max(0, max_idx_for_label - n_steps + 1)
     idx_range = range(start_idx, start_idx + n_steps)
 
-    LOG.info("Using %d steps from M30 index [%d .. %d]", n_steps, start_idx, start_idx + n_steps - 1)
+    LOG.info(
+        "Using %d steps from M30 index [%d .. %d]",
+        n_steps,
+        start_idx,
+        start_idx + n_steps - 1,
+    )
 
     # نگه‌داشتن آخرین N ردیف هر TF (برای سبک شدن فایل‌های live)
     SL = {"30T": 1000, "15T": 2000, "5T": 5000, "1H": 1000}
@@ -149,67 +179,80 @@ def main() -> None:
         except Exception:
             pass
 
-        # --- 3) خواندن آخرین ردیف از deploy_X_feed_log.csv (ts_feat, y_prob, cover_cum_deploy) ---
+        # --- 3) خواندن آخرین ردیف از deploy_X_feed_log.csv
+        #      (ts_feat, y_prob, cover_cum_deploy, y_true_dep)
         ts_feat = ts_now
         y_prob = np.nan
         cover_dep = np.nan
+        y_true_dep: Optional[float] = None
         try:
             dflog = pd.read_csv(feed_log_path)
             if "timestamp" in dflog.columns:
                 dflog["timestamp"] = pd.to_datetime(dflog["timestamp"], errors="coerce")
-                last = dflog.iloc[-1]
-                ts_feat = pd.to_datetime(last["timestamp"])
-                if "y_prob" in last:
-                    y_prob = float(last["y_prob"])
-                if "cover_cum" in last:
-                    cover_dep = float(last["cover_cum"])
-        except Exception as e:
-            LOG.warning("Could not read deploy_X_feed_log.csv (using ts_now as ts_feat): %s", e)
+            if "timestamp_trigger" in dflog.columns:
+                dflog["timestamp_trigger"] = pd.to_datetime(
+                    dflog["timestamp_trigger"], errors="coerce"
+                )
 
-        # --- 4) محاسبه‌ی y_true از دیتای خام M30 با ts_feat ---
-        try:
-            ridx_list = df30.index[df30["time"] == ts_feat].tolist()
-            if ridx_list and ridx_list[0] < len(df30) - 1:
-                ridx = ridx_list[0]
-                c0 = float(df30.loc[ridx, "close"])
-                c1 = float(df30.loc[ridx + 1, "close"])
-                real_up: Optional[bool] = c1 > c0
-            else:
-                real_up = None
-        except Exception as e:
-            LOG.warning("Failed to compute y_true for %s: %s", ts_feat, e)
-            real_up = None
+            last = dflog.iloc[-1]
+            ts_feat = pd.to_datetime(last["timestamp"])
+            if "y_prob" in last:
+                y_prob = float(last["y_prob"])
+            if "cover_cum" in last:
+                cover_dep = float(last["cover_cum"])
+            if "y_true" in last:
+                try:
+                    y_true_dep = float(last["y_true"])
+                except Exception:
+                    y_true_dep = None
 
-        # --- 5) نگاشت اکشن به pred_up ---
+            # یک چک کوچک: timestamp_trigger دپلوی باید با ts_now ژنراتور برابر باشد
+            if "timestamp_trigger" in last and not pd.isna(last["timestamp_trigger"]):
+                if pd.to_datetime(last["timestamp_trigger"]) != ts_now:
+                    LOG.warning(
+                        "timestamp_trigger mismatch at step %d: deploy=%s generator=%s",
+                        step,
+                        last["timestamp_trigger"],
+                        ts_now,
+                    )
+
+        except Exception as e:
+            LOG.warning(
+                "Could not read deploy_X_feed_log.csv (using ts_now as ts_feat): %s", e
+            )
+            y_true_dep = None
+
+        # --- 4) محاسبه‌ی دقت با استفاده از y_true خود دپلوی (TRAIN label) ---
+        # نگاشت اکشن به برچسب باینری
         if ans == "BUY":
-            pred_up: Optional[bool] = True
+            pred_label: Optional[int] = 1
         elif ans == "SELL":
-            pred_up = False
+            pred_label = 0
         else:
-            pred_up = None
+            pred_label = None
 
-        if pred_up is None or real_up is None:
+        if pred_label is None or y_true_dep is None or np.isnan(y_true_dep):
             none += 1
             y_true_int = np.nan
         else:
-            y_true_int = int(real_up)
-            if pred_up == real_up:
+            y_true_int = int(y_true_dep)
+            if pred_label == y_true_int:
                 wins += 1
             else:
                 loses += 1
 
         traded = wins + loses
-        cover_gen = traded / float(step)
+        cover_gen = traded / float(step) if step > 0 else 0.0
         acc_gen = (wins / traded) if traded > 0 else 0.0
 
         LOG.info(
-            "[Step %d] ts_now=%s ts_feat=%s action=%s y_true=%s | "
+            "[Step %d] ts_now=%s ts_feat=%s action=%s y_true_dep=%s | "
             "acc_gen=%.3f cover_gen=%.3f (wins=%d loses=%d none=%d) | cover_dep=%.3f",
             step,
             ts_now,
             ts_feat,
             ans,
-            str(real_up),
+            str(y_true_dep),
             acc_gen,
             cover_gen,
             wins,
@@ -218,7 +261,7 @@ def main() -> None:
             cover_dep,
         )
 
-        # --- 6) ذخیره‌ی رکورد این استپ در generator_predictions.csv ---
+        # --- 5) ذخیره‌ی رکورد این استپ در generator_predictions.csv ---
         row = {
             "timestamp": ts_feat,
             "timestamp_trigger": ts_now,
@@ -246,7 +289,6 @@ def main() -> None:
         loses,
         none,
     )
-
 
 if __name__ == "__main__":
     main()
