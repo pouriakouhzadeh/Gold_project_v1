@@ -339,10 +339,10 @@ def evaluate_cv(ind):
         X, y, _, price_ser = PREP_SHARED.ready(
             DATA_TRAIN_SHARED,
             window=window,
-            selected_features=[],    # در GA خود فولدها select_features می‌کنند
+            selected_features=[],    # در GA، انتخاب فیچر درون فولد انجام می‌شود
             mode="train",
             predict_drop_last=False,
-            train_drop_last=False    # ❗ حالا دیگر سطر آخر اضافی حذف نمی‌شود
+            train_drop_last=False    # ❗ هیچ حذف اضافه‌ای روی سطر آخر
         )
         if X.empty:
             return (0.0,)

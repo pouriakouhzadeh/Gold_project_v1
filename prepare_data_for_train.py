@@ -483,7 +483,7 @@ class PREPARE_DATA_FOR_TRAIN:
         top_k: int = 300,
         n_splits: int = 3,
     ) -> List[str]:
-        """Time‑series aware feature selection (Variance→Corr‑filter→Mutual‑Info).
+        """Time series aware feature selection (Variance→Corr filter→Mutual Info).
 
         * فقط ستون‌های عددی استفاده می‌شود (datetime / object حذف می‌شود).
         * NaN / Inf قبل از VarianceThreshold و MI با میانه‌ی ستون پر می‌شود.
@@ -540,7 +540,7 @@ class PREPARE_DATA_FOR_TRAIN:
             if X_corr.empty:
                 continue
 
-            # 3) Mutual information (روی داده‌ی scale‑شده و بدون NaN)
+            # 3) Mutual information (روی داده‌ی scale شده و بدون NaN)
             X_filled = X_corr.replace([np.inf, -np.inf], np.nan)
             if X_filled.isna().any().any():
                 X_filled = X_filled.fillna(X_filled.median())
@@ -554,7 +554,12 @@ class PREPARE_DATA_FOR_TRAIN:
             y_arr = pd.Series(y_tr).loc[mask_y].astype(np.int64).to_numpy(copy=False)
             mi = mutual_info_classif(X_scaled[mask_y], y_arr, random_state=SEED)
 
-            pool.extend(pd.Series(mi, index=X_corr.columns).nlargest(top_k).index.tolist())
+            pool.extend(
+                pd.Series(mi, index=X_corr.columns)
+                .nlargest(top_k)
+                .index
+                .tolist()
+            )
 
         if not pool:
             return []
@@ -588,7 +593,11 @@ class PREPARE_DATA_FOR_TRAIN:
         """
 
         close_col = f"{self.main_timeframe}_close"
-        tcol = f"{self.main_timeframe}_time" if f"{self.main_timeframe}_time" in data.columns else "time"
+        tcol = (
+            f"{self.main_timeframe}_time"
+            if f"{self.main_timeframe}_time" in data.columns
+            else "time"
+        )
         if close_col not in data.columns:
             raise ValueError(f"{close_col} missing")
 
@@ -602,28 +611,34 @@ class PREPARE_DATA_FOR_TRAIN:
             # y(t) = 1{ close(t+1) > close(t) }  با NaN برای آخرین ردیف
             close_next = close.shift(-1)
             y = (close_next > close).astype("float64")
-            y[close_next.isna()] = np.nan    # آخرین ردیف، تارگت ندارد
+            y[close_next.isna()] = np.nan  # آخرین ردیف، تارگت ندارد
 
             valid = y.notna()
-            df    = df.loc[valid].reset_index(drop=True)
+            df = df.loc[valid].reset_index(drop=True)
             t_idx = t_idx.loc[valid].reset_index(drop=True)
             close = close.loc[valid].reset_index(drop=True)
-            y     = y.loc[valid].reset_index(drop=True)
+            y = y.loc[valid].reset_index(drop=True)
         else:
             # در پیش‌بینی، y واقعی لازم نداریم؛ بعداً صفر می‌کنیم
             y = pd.Series(np.zeros(len(df), dtype=np.int8))
 
         # ----------------- انتخاب ستون‌های فیچر پایه -----------------
-        # ----------------- انتخاب ستون‌های فیچر پایه -----------------
         time_tokens = ("hour", "day_of_week", "is_weekend")
         time_cols = [
-            c for c in df.columns
-            if c.endswith("_time") or c == "time" or any(tok in c for tok in time_tokens)
+            c
+            for c in df.columns
+            if c.endswith("_time")
+            or c == "time"
+            or any(tok in c for tok in time_tokens)
         ]
         base_candidates = [c for c in df.columns if c not in time_cols + [close_col]]
 
-        # --- PATCH: فقط ستون‌های عددی (حذف datetime / object مثل 'index') ---
-        num_cols = df[base_candidates].select_dtypes(include=[np.number]).columns.tolist()
+        # فقط ستون‌های عددی (حذف datetime / object، مثل index با dtype عجیب)
+        num_cols = (
+            df[base_candidates]
+            .select_dtypes(include=[np.number])
+            .columns.tolist()
+        )
         dropped_non_numeric = [c for c in base_candidates if c not in num_cols]
         if dropped_non_numeric:
             logging.getLogger(__name__).info(
@@ -639,9 +654,11 @@ class PREPARE_DATA_FOR_TRAIN:
 
         # ----------------- تفسیر selected_features -----------------
         import re as _re
+
         tminus_regex = _re.compile(r"_tminus\d+$")
         has_tminus = bool(
-            selected_features and any(tminus_regex.search(str(f)) for f in selected_features)
+            selected_features
+            and any(tminus_regex.search(str(f)) for f in selected_features)
         )
 
         if has_tminus:
@@ -666,28 +683,58 @@ class PREPARE_DATA_FOR_TRAIN:
         if not feats_base:
             # هیچ فیچری نداریم → خروجی خالی
             if with_times:
-                return (pd.DataFrame(), pd.Series(dtype="int64"), [], pd.Series(dtype=float), pd.Series(dtype="datetime64[ns]"))
+                return (
+                    pd.DataFrame(),
+                    pd.Series(dtype="int64"),
+                    [],
+                    pd.Series(dtype=float),
+                    pd.Series(dtype="datetime64[ns]"),
+                )
             else:
-                return (pd.DataFrame(), pd.Series(dtype="int64"), [], pd.Series(dtype=float))
+                return (
+                    pd.DataFrame(),
+                    pd.Series(dtype="int64"),
+                    [],
+                    pd.Series(dtype=float),
+                )
 
         X_base = df[feats_base].copy()
 
         # ----------------- پنجره‌بندی (window > 1) -----------------
         if window > 1:
             if len(X_base) < window:
-                logging.warning("Not enough rows (%d) for window=%d", len(X_base), window)
+                logging.warning(
+                    "Not enough rows (%d) for window=%d", len(X_base), window
+                )
                 if with_times:
-                    return (pd.DataFrame(), pd.Series(dtype="int64"), [], pd.Series(dtype=float), pd.Series(dtype="datetime64[ns]"))
+                    return (
+                        pd.DataFrame(),
+                        pd.Series(dtype="int64"),
+                        [],
+                        pd.Series(dtype=float),
+                        pd.Series(dtype="datetime64[ns]"),
+                    )
                 else:
-                    return (pd.DataFrame(), pd.Series(dtype="int64"), [], pd.Series(dtype=float))
+                    return (
+                        pd.DataFrame(),
+                        pd.Series(dtype="int64"),
+                        [],
+                        pd.Series(dtype=float),
+                    )
 
             mats = [X_base.shift(i) for i in range(window)]
-            Xw = pd.concat(mats, axis=1).iloc[window - 1 :].reset_index(drop=True)
-            col_names = [f"{c}_tminus{i}" for i in range(window) for c in feats_base]
+            Xw = (
+                pd.concat(mats, axis=1)
+                .iloc[window - 1 :]
+                .reset_index(drop=True)
+            )
+            col_names = [
+                f"{c}_tminus{i}" for i in range(window) for c in feats_base
+            ]
             Xw.columns = col_names[: Xw.shape[1]]
 
             # هم‌تراز کردن y, زمان و قیمت با پنجره
-            y     = y.iloc[window - 1 :].reset_index(drop=True)
+            y = y.iloc[window - 1 :].reset_index(drop=True)
             t_idx = t_idx.iloc[window - 1 :].reset_index(drop=True)
             close = close.iloc[window - 1 :].reset_index(drop=True)
 
@@ -702,21 +749,21 @@ class PREPARE_DATA_FOR_TRAIN:
 
         # ----------------- هم‌قد کردن نهایی -----------------
         L = min(len(X_f), len(y), len(t_idx), len(close))
-        X_f   = X_f.iloc[:L].reset_index(drop=True)
-        y     = y.iloc[:L].reset_index(drop=True)
+        X_f = X_f.iloc[:L].reset_index(drop=True)
+        y = y.iloc[:L].reset_index(drop=True)
         t_idx = t_idx.iloc[:L].reset_index(drop=True)
         close = close.iloc[:L].reset_index(drop=True)
 
         # ----------------- drop-last اختیاری -----------------
         if mode == "train" and train_drop_last and len(X_f) > 0:
-            X_f   = X_f.iloc[:-1].reset_index(drop=True)
-            y     = y.iloc[:-1].reset_index(drop=True)
+            X_f = X_f.iloc[:-1].reset_index(drop=True)
+            y = y.iloc[:-1].reset_index(drop=True)
             t_idx = t_idx.iloc[:-1].reset_index(drop=True)
             close = close.iloc[:-1].reset_index(drop=True)
 
         if mode != "train":
             if predict_drop_last and len(X_f) > 0:
-                X_f   = X_f.iloc[:-1].reset_index(drop=True)
+                X_f = X_f.iloc[:-1].reset_index(drop=True)
                 t_idx = t_idx.iloc[:-1].reset_index(drop=True)
                 close = close.iloc[:-1].reset_index(drop=True)
             # در پیش‌بینی، y مصرف نمی‌شود → صفر نگه می‌داریم
@@ -742,7 +789,7 @@ class PREPARE_DATA_FOR_TRAIN:
         window: int = 1,
         selected_features: List[str] | None = None,
         with_times: bool = False,
-        predict_drop_last: bool = True,
+        predict_drop_last: bool = False,   # ❗ دیفالت جدید = False
     ):
         if not hasattr(self, "_live_prev2") or self._live_prev2 is None:
             self._live_prev2 = data_window.iloc[-2:].copy()
@@ -756,7 +803,7 @@ class PREPARE_DATA_FOR_TRAIN:
             selected_features=selected_features,
             mode="predict",
             with_times=True,
-            predict_drop_last=predict_drop_last
+            predict_drop_last=predict_drop_last,
         )
 
         self._live_prev2 = data_window.iloc[-2:].copy()
@@ -765,7 +812,11 @@ class PREPARE_DATA_FOR_TRAIN:
             return (pd.DataFrame(), feats, None) if with_times else (pd.DataFrame(), feats)
 
         X_last = X_full.tail(1).reset_index(drop=True)
-        t_feat = pd.to_datetime(t_idx.iloc[-1]) if (t_idx is not None and len(t_idx) > 0) else None
+        t_feat = (
+            pd.to_datetime(t_idx.iloc[-1])
+            if (t_idx is not None and len(t_idx) > 0)
+            else None
+        )
         return (X_last, feats, t_feat) if with_times else (X_last, feats)
 
     # ================= 5) LOAD & MERGE =================
