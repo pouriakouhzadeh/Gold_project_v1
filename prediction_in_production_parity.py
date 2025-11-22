@@ -145,7 +145,7 @@ def main() -> None:
             selected_features=train_cols,
             mode="predict",
             with_times=True,
-            predict_drop_last=False,
+            predict_drop_last=True,
             train_drop_last=False,
         )
 

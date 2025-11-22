@@ -245,11 +245,24 @@ def _fit_and_score_fold(tr_idx, ts_idx, X_full, y_full, price_series, hyper, cal
     X_tr_raw, y_tr = X_full.iloc[tr_idx], y_full.iloc[tr_idx]
     X_ts_raw, y_ts = X_full.iloc[ts_idx], y_full.iloc[ts_idx]
 
+    # --- PATCH: از همین‌جا فقط ستون‌های عددی را نگه می‌داریم ---
+    num_cols = X_tr_raw.select_dtypes(include=[np.number]).columns
+    X_tr_raw = X_tr_raw[num_cols]
+    X_ts_raw = X_ts_raw[num_cols]
+    if X_tr_raw.shape[1] == 0:
+        return 0.0
+
     feats = PREP_SHARED.select_features(X_tr_raw, y_tr)
     if not feats:
         return 0.0
 
     X_tr, X_ts = X_tr_raw[feats], X_ts_raw[feats]
+
+    # --- PATCH: پاک‌سازی NaN / Inf قبل از مدل ---
+    for df in (X_tr, X_ts):
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        if df.isna().any().any():
+            df.fillna(df.median(), inplace=True)
 
     # در مرحله GA کالیبراسیون را خاموش می‌کنیم تا سریع و بدون لیکیج باشد
     pipe = ModelPipeline(hyper, calibrate=False, calib_method=calib_method).fit(X_tr, y_tr)
@@ -334,6 +347,18 @@ def evaluate_cv(ind):
         if X.empty:
             return (0.0,)
 
+        # --- PATCH: فقط ستون‌های عددی را نگه دار (حذف datetime و غیره) ---
+        num_cols = X.select_dtypes(include=[np.number]).columns
+        if len(num_cols) == 0:
+            LOGGER.warning("evaluate_cv: no numeric columns after dtype filter; returning 0")
+            return (0.0,)
+
+        dropped = [c for c in X.columns if c not in num_cols]
+        if dropped:
+            LOGGER.info("evaluate_cv: dropping non-numeric columns from X: %s", dropped)
+
+        X = X[num_cols]
+
         hyper = {
             "C": C, "max_iter": max_iter, "tol": tol, "penalty": penalty,
             "solver": solver, "fit_intercept": fit_intercept,
@@ -349,8 +374,9 @@ def evaluate_cv(ind):
         return (float(np.mean(scores)) if scores else 0.0,)
 
     except Exception as e:
-        LOGGER.error("evaluate_cv failed: %s", e)
+        LOGGER.warning("evaluate_cv failed (fitness set to 0): %s", e)
         return (0.0,)
+
 
 # ---------------------------------------------------------------------------
 # ثبت در TOOLBOX

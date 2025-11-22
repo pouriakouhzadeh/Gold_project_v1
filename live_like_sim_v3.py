@@ -84,7 +84,7 @@ def main() -> None:
         selected_features=train_cols,
         mode="train",           # چون می‌خواهیم y_true داشته باشیم
         with_times=True,
-        predict_drop_last=False,
+        predict_drop_last=True,
         train_drop_last=False,
     )
 

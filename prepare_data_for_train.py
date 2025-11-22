@@ -476,7 +476,6 @@ class PREPARE_DATA_FOR_TRAIN:
         # print("Load and process time frame finished")
         return df
 
-    # ================= 2) FEATURE SELECTION =================
     def select_features(
         self,
         X: pd.DataFrame,
@@ -486,42 +485,81 @@ class PREPARE_DATA_FOR_TRAIN:
     ) -> List[str]:
         """Time‑series aware feature selection (Variance→Corr‑filter→Mutual‑Info).
 
-        * تمام NaN/Inf پیش از MI با **میانه** ستون پر می‌شود تا خطای "contains NaN" رفع شود.
+        * فقط ستون‌های عددی استفاده می‌شود (datetime / object حذف می‌شود).
+        * NaN / Inf قبل از VarianceThreshold و MI با میانه‌ی ستون پر می‌شود.
         """
-        # print("Feature selection start ...")
+        logger = logging.getLogger(__name__)
+
+        # --- فقط ستون‌های عددی ---
+        num_cols = X.select_dtypes(include=[np.number]).columns
+        dropped = [c for c in X.columns if c not in num_cols]
+        if dropped:
+            logger.info("[select_features] dropping non-numeric columns: %s", dropped)
+        if len(num_cols) == 0:
+            return []
+
+        X = X[num_cols].copy()
+
         tscv = TimeSeriesSplit(n_splits=n_splits)
         pool: List[str] = []
+
         for tr_idx, _ in tscv.split(X):
-            X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
+            X_tr = X.iloc[tr_idx].copy()
+            y_tr = y.iloc[tr_idx]
+
+            # --- پاک‌سازی NaN / Inf در این فولد ---
+            X_tr.replace([np.inf, -np.inf], np.nan, inplace=True)
+            if X_tr.isna().any().any():
+                X_tr.fillna(X_tr.median(), inplace=True)
+
+            if X_tr.shape[1] == 0:
+                continue
+
             # 1) Variance threshold
             vt = VarianceThreshold(0.01)
-            cols_var = X_tr.columns[vt.fit(X_tr).get_support()]
-            if cols_var.empty:
+            try:
+                vt.fit(X_tr)
+            except Exception as e:
+                logger.warning("[select_features] VarianceThreshold failed: %s", e)
+                continue
+
+            cols_var = X_tr.columns[vt.get_support()]
+            if len(cols_var) == 0:
                 continue
             X_var = X_tr[cols_var]
+
             # 2) Correlation filter
-            corr = X_var.corr().abs(); mask = np.triu(np.ones_like(corr, bool), k=1)
-            upper = corr.where(mask)
+            corr = X_var.corr().abs()
+            if corr.empty:
+                continue
+
+            mask_corr = np.triu(np.ones_like(corr, bool), k=1)
+            upper = corr.where(mask_corr)
             drop_cols = [c for c in upper.columns if any(upper[c] > 0.9)]
             X_corr = X_var.drop(columns=drop_cols, errors="ignore")
             if X_corr.empty:
                 continue
-            # ---- FILL NA BEFORE MI ----
-            X_filled = X_corr.replace([np.inf, -np.inf], np.nan).fillna(X_corr.median())
-            # 3) Mutual information
+
+            # 3) Mutual information (روی داده‌ی scale‑شده و بدون NaN)
+            X_filled = X_corr.replace([np.inf, -np.inf], np.nan)
+            if X_filled.isna().any().any():
+                X_filled = X_filled.fillna(X_filled.median())
+
             X_scaled = MinMaxScaler().fit_transform(X_filled)
 
-            # ردیف‌هایی که y در آن‌ها NaN است را کنار بگذار (آخر دنباله)
-            mask = pd.Series(y_tr).notna().to_numpy()
-            if mask.sum() < 2:
+            mask_y = pd.Series(y_tr).notna().to_numpy()
+            if mask_y.sum() < 2:
                 continue
 
-            y_arr = pd.Series(y_tr).loc[mask].astype(np.int64).to_numpy(copy=False)
-            mi = mutual_info_classif(X_scaled[mask], y_arr, random_state=SEED)
+            y_arr = pd.Series(y_tr).loc[mask_y].astype(np.int64).to_numpy(copy=False)
+            mi = mutual_info_classif(X_scaled[mask_y], y_arr, random_state=SEED)
 
             pool.extend(pd.Series(mi, index=X_corr.columns).nlargest(top_k).index.tolist())
+
+        if not pool:
+            return []
+
         counts = pd.Series(pool).value_counts()
-        # print("Feature selection finished")
         return counts[counts >= n_splits].index[:top_k].tolist()
 
     # ================= 3) READY (X, y, WINDOW) =================
@@ -576,12 +614,23 @@ class PREPARE_DATA_FOR_TRAIN:
             y = pd.Series(np.zeros(len(df), dtype=np.int8))
 
         # ----------------- انتخاب ستون‌های فیچر پایه -----------------
+        # ----------------- انتخاب ستون‌های فیچر پایه -----------------
         time_tokens = ("hour", "day_of_week", "is_weekend")
         time_cols = [
             c for c in df.columns
             if c.endswith("_time") or c == "time" or any(tok in c for tok in time_tokens)
         ]
         base_candidates = [c for c in df.columns if c not in time_cols + [close_col]]
+
+        # --- PATCH: فقط ستون‌های عددی (حذف datetime / object مثل 'index') ---
+        num_cols = df[base_candidates].select_dtypes(include=[np.number]).columns.tolist()
+        dropped_non_numeric = [c for c in base_candidates if c not in num_cols]
+        if dropped_non_numeric:
+            logging.getLogger(__name__).info(
+                "[ready] dropping non-numeric base feature columns: %s",
+                dropped_non_numeric,
+            )
+        base_candidates = num_cols
 
         # بلاک‌لیست فیچرها (از فایل‌ها)
         _black = _load_feature_blacklist()
