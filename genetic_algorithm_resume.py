@@ -571,6 +571,31 @@ class GeneticAlgorithmRunner:
         if X.empty:
             return None, []
 
+        # --- PATCH: فقط ستون‌های عددی + پاک‌سازی NaN/Inf قبل از CalibratedCV ---
+        num_cols = X.select_dtypes(include=[np.number]).columns
+        dropped = [c for c in X.columns if c not in num_cols]
+        if dropped:
+            LOGGER.info("[_build_final_model] dropping non-numeric columns before fit: %s", dropped)
+        X = X[num_cols].copy()
+
+        # جایگزینی Inf با NaN
+        X.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        # اگر ستونی کامل NaN است، آن را حذف کن
+        all_nan_cols = X.columns[X.isna().all()].tolist()
+        if all_nan_cols:
+            LOGGER.warning("[_build_final_model] dropping all-NaN columns before fit: %s", all_nan_cols)
+            X.drop(columns=all_nan_cols, inplace=True)
+
+        # پر کردن NaN با میانهٔ هر ستون
+        if X.isna().any().any():
+            med = X.median()
+            X.fillna(med, inplace=True)
+
+        if X.empty:
+            LOGGER.warning("[_build_final_model] X became empty after cleaning; aborting final model.")
+            return None, []
+
         # ⬅️ multi_class را هم پاس بده تا سازگاری کامل شود
         hyper = {
             "C": C, "max_iter": max_iter, "tol": tol, "penalty": penalty,
@@ -621,7 +646,9 @@ class GeneticAlgorithmRunner:
 
     def _run_thresholds(self, model, data_thr, prep, ind, feats):
         if data_thr.empty:
-            LOGGER.info("[threshold] No threshold data … skipped"); return
+            LOGGER.info("[threshold] No threshold data … skipped")
+            return
+
         window = ind[8]
         
         X_thr, y_thr, _, _ = prep.ready(
@@ -633,11 +660,22 @@ class GeneticAlgorithmRunner:
             train_drop_last=False                # ❗
         )
 
-
         X_thr = X_thr[self.final_cols]
-        if X_thr.empty:                       # ← جلوگیری از خطا
-            LOGGER.info("[threshold] X_thr empty – skipped")
+
+        # --- PATCH: پاک‌سازی X_thr قبل از predict_proba ---
+        X_thr.replace([np.inf, -np.inf], np.nan, inplace=True)
+        all_nan_cols = X_thr.columns[X_thr.isna().all()].tolist()
+        if all_nan_cols:
+            LOGGER.warning("[threshold] dropping all-NaN columns in X_thr: %s", all_nan_cols)
+            X_thr.drop(columns=all_nan_cols, inplace=True)
+
+        if X_thr.isna().any().any():
+            X_thr.fillna(X_thr.median(), inplace=True)
+
+        if X_thr.empty:
+            LOGGER.info("[threshold] X_thr empty – skipped after cleaning")
             return
+
         y_prob = model.predict_proba(X_thr)[:, 1]
 
         tf = ThresholdFinder(steps=200, min_predictions_ratio=2/3)
@@ -668,8 +706,22 @@ class GeneticAlgorithmRunner:
         )
         
         X = X[self.final_cols]                # ستون‌های نهایی مدل
-        if X.empty:                           # ← جلوگیری از خطا
+        if X.empty:
             LOGGER.info(f"[{label}] X empty – skipped")
+            return
+
+        # --- PATCH: پاک‌سازی X قبل از predict_proba ---
+        X.replace([np.inf, -np.inf], np.nan, inplace=True)
+        all_nan_cols = X.columns[X.isna().all()].tolist()
+        if all_nan_cols:
+            LOGGER.warning(f"[{label}] dropping all-NaN columns in X: %s", all_nan_cols)
+            X.drop(columns=all_nan_cols, inplace=True)
+
+        if X.isna().any().any():
+            X.fillna(X.median(), inplace=True)
+
+        if X.empty:
+            LOGGER.info(f"[{label}] X empty after cleaning – skipped")
             return
         
         # ── پیش‌بینی با دو آستانه ─────────────────────────────
