@@ -78,23 +78,6 @@ logging.getLogger("sklearn").setLevel(logging.WARNING)
 logging.getLogger("daal4py").setLevel(logging.WARNING)
 
 
-def timeout(seconds=900):
-    def decorator(func):
-        def _handle_timeout(signum, frame):
-            raise TimeoutError("Timeout reached")
-        def wrapper(*args, **kwargs):
-            signal.signal(signal.SIGALRM, _handle_timeout)
-            signal.alarm(seconds)
-            try:
-                return func(*args, **kwargs)
-            except TimeoutError:
-                LOGGER.warning("Timeout in evaluate_cv; returning 0")
-                return (0.0,)
-            finally:
-                signal.alarm(0)
-        return wrapper
-    return decorator
-
 
 def _install_sig_handlers(cur_gen_fn, pop_fn, best_fn):
 
@@ -339,17 +322,34 @@ def _fit_and_score_fold(tr_idx, ts_idx, X_full, y_full, price_series, hyper, cal
 # تابع fitness
 # ---------------------------------------------------------------------------
 
-@timeout(10800)
 def evaluate_cv(ind):
+    """
+    تابع fitness برای GA.
+    - داخل خودش تایم‌اوت 3 ساعته با signal.alarm پیاده شده است
+      تا با multiprocessing قابل pickling باشد.
+    """
+    # مدت تایم‌اوت بر حسب ثانیه
+    timeout_seconds = 10800  # 3 ساعت
+    old_handler = None
+
+    # فقط اگر SIGALRM روی این پلتفرم وجود دارد (لینوکس)، تایم‌اوت را فعال کن
+    if hasattr(signal, "SIGALRM"):
+        def _handle_timeout(signum, frame):
+            raise TimeoutError("Timeout reached in evaluate_cv")
+        # هندلر قبلی را نگه می‌داریم تا در انتها برگردانیم
+        old_handler = signal.signal(signal.SIGALRM, _handle_timeout)
+        signal.alarm(timeout_seconds)
+
     try:
+        # ---------------- sanity check اشتراک داده‌ها ----------------
         if any(v is None for v in (DATA_TRAIN_SHARED, PREP_SHARED)):
             raise RuntimeError("Shared globals not ready!")
 
         (C, max_iter, tol, penalty, solver,
-        fit_intercept, class_weight, multi_class,
-        window, calib_method) = ind
+         fit_intercept, class_weight, multi_class,
+         window, calib_method) = ind
 
-        # ناسازگاری‌های سریع
+        # ---------------- ناسازگاری‌های سریع ----------------
         if penalty == "l1" and solver not in ["liblinear", "saga"]:
             return (0.0,)
         if penalty == "l2" and solver not in ["lbfgs", "liblinear", "sag", "saga"]:
@@ -357,6 +357,7 @@ def evaluate_cv(ind):
         if solver == "liblinear" and multi_class == "multinomial":
             return (0.0,)
 
+        # ---------------- آماده‌سازی X, y, price ----------------
         X, y, _, price_ser = PREP_SHARED.ready(
             DATA_TRAIN_SHARED,
             window=window,
@@ -370,7 +371,7 @@ def evaluate_cv(ind):
 
         LOGGER.info(f"evaluate_cv started PID={os.getpid()} window={window}")
 
-        # --- PATCH: فقط ستون‌های عددی را نگه دار (حذف datetime و غیره) ---
+        # --- فقط ستون‌های عددی را نگه دار (حذف datetime و غیره) ---
         num_cols = X.select_dtypes(include=[np.number]).columns
         if len(num_cols) == 0:
             LOGGER.warning("evaluate_cv: no numeric columns after dtype filter; returning 0")
@@ -383,11 +384,17 @@ def evaluate_cv(ind):
         X = X[num_cols]
 
         hyper = {
-            "C": C, "max_iter": max_iter, "tol": tol, "penalty": penalty,
-            "solver": solver, "fit_intercept": fit_intercept,
-            "class_weight": class_weight, "multi_class": multi_class
+            "C": C,
+            "max_iter": max_iter,
+            "tol": tol,
+            "penalty": penalty,
+            "solver": solver,
+            "fit_intercept": fit_intercept,
+            "class_weight": class_weight,
+            "multi_class": multi_class,
         }
 
+        # ---------------- TimeSeriesSplit + امتیاز ----------------
         tscv = TimeSeriesSplit(n_splits=3)
         scores = []
         for tr, ts in tscv.split(X, y):
@@ -396,9 +403,25 @@ def evaluate_cv(ind):
 
         return (float(np.mean(scores)) if scores else 0.0,)
 
+    except TimeoutError:
+        # تایم‌اوت اختصاصی این تابع
+        LOGGER.warning("Timeout in evaluate_cv; returning 0")
+        return (0.0,)
+
     except Exception as e:
         LOGGER.warning("evaluate_cv failed (fitness set to 0): %s", e)
         return (0.0,)
+
+    finally:
+        # تایم‌اوت را خاموش کن و هندلر قبلی را برگردان
+        if hasattr(signal, "SIGALRM"):
+            signal.alarm(0)
+            if old_handler is not None:
+                try:
+                    signal.signal(signal.SIGALRM, old_handler)
+                except Exception:
+                    # اگر به هر دلیل نتوانستیم هندلر قبلی را برگردانیم، فقط نادیده می‌گیریم
+                    pass
 
 
 # ---------------------------------------------------------------------------
