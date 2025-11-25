@@ -79,15 +79,17 @@ def main() -> None:
     symbol = args.symbol
 
     # ---------- مدل ----------
+    # ---------- مدل ----------
     saver = ModelSaver(model_dir=str(base))
-    payload = saver.load_full()  # dict
-    model = payload["pipeline"]
+    payload = saver.load_full()      # خروجی یک dict است
+    pipeline = payload["pipeline"]
     meta = payload
-
+    model = pipeline
     window = int(meta["window_size"])
     neg_thr = float(meta["neg_thr"])
     pos_thr = float(meta["pos_thr"])
-    train_cols = list(meta.get("train_window_cols") or meta.get("feats") or [])
+    train_cols = list(meta["train_window_cols"])
+
 
     if not train_cols:
         raise ValueError("train_window_cols/feats در مدل ذخیره نشده است.")

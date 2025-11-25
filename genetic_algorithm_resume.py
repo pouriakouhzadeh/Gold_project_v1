@@ -27,7 +27,7 @@ import logging, gc, os, random, copy, multiprocessing as mp
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass
 from typing import Any, Tuple
-
+import signal
 import numpy as np
 import pandas as pd
 from deap import base, creator, tools
@@ -76,6 +76,25 @@ LOGGER.addHandler(file_hdl)
 logging.getLogger("sklearnex").setLevel(logging.WARNING)
 logging.getLogger("sklearn").setLevel(logging.WARNING)
 logging.getLogger("daal4py").setLevel(logging.WARNING)
+
+
+def timeout(seconds=900):
+    def decorator(func):
+        def _handle_timeout(signum, frame):
+            raise TimeoutError("Timeout reached")
+        def wrapper(*args, **kwargs):
+            signal.signal(signal.SIGALRM, _handle_timeout)
+            signal.alarm(seconds)
+            try:
+                return func(*args, **kwargs)
+            except TimeoutError:
+                LOGGER.warning("Timeout in evaluate_cv; returning 0")
+                return (0.0,)
+            finally:
+                signal.alarm(0)
+        return wrapper
+    return decorator
+
 
 def _install_sig_handlers(cur_gen_fn, pop_fn, best_fn):
 
@@ -234,6 +253,7 @@ def pool_init(data_train: pd.DataFrame,
     DATA_TRAIN_SHARED = data_train
     PREP_SHARED       = prep
     LOGGER.info("[Pool] Initialised shared globals in worker process")
+    LOGGER.info(f"[Pool] Worker PID={os.getpid()} started")
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +339,7 @@ def _fit_and_score_fold(tr_idx, ts_idx, X_full, y_full, price_series, hyper, cal
 # تابع fitness
 # ---------------------------------------------------------------------------
 
+@timeout(10800)
 def evaluate_cv(ind):
     try:
         if any(v is None for v in (DATA_TRAIN_SHARED, PREP_SHARED)):
@@ -346,6 +367,8 @@ def evaluate_cv(ind):
         )
         if X.empty:
             return (0.0,)
+
+        LOGGER.info(f"evaluate_cv started PID={os.getpid()} window={window}")
 
         # --- PATCH: فقط ستون‌های عددی را نگه دار (حذف datetime و غیره) ---
         num_cols = X.select_dtypes(include=[np.number]).columns
@@ -522,27 +545,29 @@ class GeneticAlgorithmRunner:
             best_ind = tools.selBest(population, 1)[0]
             LOGGER.info("[GA] Finished optimisation → best_score = %.4f", best_ind.fitness.values[0])
 
-            # ------ final model ------
-            final_model, feats = self._build_final_model(best_ind, data_tr, prep)
-            if final_model is None:
-                LOGGER.info("[ERROR] Final model could not be built!")
-                pool.close(); pool.join(); return best_ind, best_ind.fitness.values[0]
-            LOGGER.info("[main] Final model trained")
+            # ------ final model + thresholds / eval / save ------
+            try:
+                final_model, feats = self._build_final_model(best_ind, data_tr, prep)
+                if final_model is None:
+                    LOGGER.error("[main] Final model could not be built – skipping thresholds/eval/save")
+                else:
+                    LOGGER.info("[main] Final model trained")
+                    self._run_thresholds(final_model, data_thr, prep, best_ind, feats)
+                    self._eval(final_model, data_te, prep, best_ind, feats, label="Test")
+                    self._save(final_model, best_ind, feats)
+                    LOGGER.info("[main] Model & thresholds saved")
+                    success = True
+            except Exception as e:
+                LOGGER.exception("[main] Finalisation (build/thresholds/eval/save) failed: %s", e)
 
-            self._run_thresholds(final_model, data_thr, prep, best_ind, feats)
-            self._eval(final_model, data_te, prep, best_ind, feats, label="Test")
-            self._save(final_model, best_ind, feats)
-            LOGGER.info("[main] Model & thresholds saved")
-            
-            pool.close(); pool.join()
-            success = True
             return best_ind, best_ind.fitness.values[0]
-        
+
         finally:
             # بستن pool اگر ساخته شده
             if pool is not None:
                 try:
-                    pool.close(); pool.join()
+                    pool.close()
+                    pool.join()
                 except Exception as e:
                     LOGGER.warning("Pool cleanup failed: %s", e)
             # اگر اجرا موفق بود، چک‌پوینت را حذف کن
@@ -556,71 +581,91 @@ class GeneticAlgorithmRunner:
     # ---------------- helpers ----------------
     def _build_final_model(self, ind, data_tr, prep):
         (C, max_iter, tol, penalty, solver,
-        fit_intercept, class_weight, multi_class,
-        window, calib_method) = ind
+         fit_intercept, class_weight, multi_class,
+         window, calib_method) = ind
 
-        X, y, feats, _ = prep.ready(
-            data_tr,
-            window=window,
-            selected_features=None,   # این‌جا خود ready انتخاب فیچر انجام می‌دهد
-            mode="train",
-            predict_drop_last=False,
-            train_drop_last=False     # ❗
-        )
-
-        if X.empty:
+        # --- آماده‌سازی X,y با هندل خطا ---
+        try:
+            X, y, feats, _ = prep.ready(
+                data_tr,
+                window=window,
+                selected_features=None,   # این‌جا خود ready انتخاب فیچر انجام می‌دهد
+                mode="train",
+                predict_drop_last=False,
+                train_drop_last=False     # ❗
+            )
+        except Exception as e:
+            LOGGER.exception("[_build_final_model] prep.ready failed: %s", e)
             return None, []
 
-        # --- PATCH: فقط ستون‌های عددی + پاک‌سازی NaN/Inf قبل از CalibratedCV ---
+        if X.empty or y is None or len(X) == 0:
+            LOGGER.error("[_build_final_model] Empty X/y after ready(); aborting final model.")
+            return None, []
+
+        # --- فقط ستون‌های عددی + پاک‌سازی NaN/Inf ---
         num_cols = X.select_dtypes(include=[np.number]).columns
         dropped = [c for c in X.columns if c not in num_cols]
         if dropped:
             LOGGER.info("[_build_final_model] dropping non-numeric columns before fit: %s", dropped)
         X = X[num_cols].copy()
 
-        # جایگزینی Inf با NaN
         X.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-        # اگر ستونی کامل NaN است، آن را حذف کن
         all_nan_cols = X.columns[X.isna().all()].tolist()
         if all_nan_cols:
             LOGGER.warning("[_build_final_model] dropping all-NaN columns before fit: %s", all_nan_cols)
             X.drop(columns=all_nan_cols, inplace=True)
 
-        # پر کردن NaN با میانهٔ هر ستون
         if X.isna().any().any():
-            med = X.median()
-            X.fillna(med, inplace=True)
+            X.fillna(X.median(), inplace=True)
 
         if X.empty:
-            LOGGER.warning("[_build_final_model] X became empty after cleaning; aborting final model.")
+            LOGGER.error("[_build_final_model] X became empty after cleaning; aborting final model.")
             return None, []
 
-        # ⬅️ multi_class را هم پاس بده تا سازگاری کامل شود
+        # --- سازگاری hyperparams با LogisticRegression (همان گاردهای evaluate_cv) ---
+        if penalty == "l1" and solver not in ["liblinear", "saga"]:
+            LOGGER.warning("[_build_final_model] fixing incompatible (penalty=%s, solver=%s) → saga", penalty, solver)
+            solver = "saga"
+        if penalty == "l2" and solver not in ["lbfgs", "liblinear", "sag", "saga"]:
+            LOGGER.warning("[_build_final_model] fixing incompatible (penalty=%s, solver=%s) → lbfgs", penalty, solver)
+            solver = "lbfgs"
+        if solver == "liblinear" and multi_class == "multinomial":
+            LOGGER.warning("[_build_final_model] fixing incompatible multi_class=multinomial with liblinear → ovr")
+            multi_class = "ovr"
+
         hyper = {
-            "C": C, "max_iter": max_iter, "tol": tol, "penalty": penalty,
-            "solver": solver, "fit_intercept": fit_intercept,
-            "class_weight": class_weight, "multi_class": multi_class
+            "C": C,
+            "max_iter": max_iter,
+            "tol": tol,
+            "penalty": penalty,
+            "solver": solver,
+            "fit_intercept": fit_intercept,
+            "class_weight": class_weight,
+            "multi_class": multi_class,
         }
         # چون مدل نهایی را با SMOTE آموزش می‌دهیم، از وزن‌دهی balanced صرف‌نظر کنیم
         if class_weight == "balanced":
             hyper["class_weight"] = None
 
-        model = ModelPipeline(
-            hyper,
-            calibrate=True,
-            calib_method=calib_method,
-            use_smote_in_fit=True          # ← روشن
-        ).fit(X, y)
+        # --- آموزش مدل با هندل خطا ---
+        try:
+            model = ModelPipeline(
+                hyper,
+                calibrate=True,
+                calib_method=calib_method,
+                use_smote_in_fit=True,          # ← روشن
+            ).fit(X, y)
+        except Exception as e:
+            LOGGER.exception("[_build_final_model] ModelPipeline.fit failed: %s", e)
+            return None, []
 
         self.final_cols = list(X.columns)
         LOGGER.info("[helper] Final model built with %d features", len(self.final_cols))
 
-        # ⬅️ اسکیلرِ فیت-شده ممکن است مستقیماً در دسترس نباشد (CalibratedCV کلون می‌سازد)
-        #    برای پایدارسازیِ DriftChecker، اگر اسکیلرِ فیت-شده نبود، یک StandardScaler روی X فیت کن.
+        # --- اسکیلر برای DriftChecker ---
         scaler = None
         try:
-            # نسخهٔ جدید ModelPipeline یک wrapper دارد
             scaler = model.get_scaler()
         except Exception:
             pass
@@ -632,16 +677,25 @@ class GeneticAlgorithmRunner:
                 from sklearn.preprocessing import StandardScaler
                 _tmp = StandardScaler().fit(X)
                 X_proc = _tmp.transform(X)
-        except Exception:
+        except Exception as e:
+            LOGGER.warning(
+                "[_build_final_model] scaler transform failed (%s); refitting temporary StandardScaler", e
+            )
             from sklearn.preprocessing import StandardScaler
             _tmp = StandardScaler().fit(X)
             X_proc = _tmp.transform(X)
 
-        DriftChecker(verbose=False).fit_on_train(
-            pd.DataFrame(X_proc, columns=X.columns),
-            bins=10, quantile=False
-        ).save_train_distribution("train_distribution.json")
-        LOGGER.info("train_distribution.json saved (window=%d)", window)
+        # --- DriftChecker نباید باعث fail شدن کل فاز نهایی شود ---
+        try:
+            DriftChecker(verbose=False).fit_on_train(
+                pd.DataFrame(X_proc, columns=X.columns),
+                bins=10,
+                quantile=False,
+            ).save_train_distribution("train_distribution.json")
+            LOGGER.info("train_distribution.json saved (window=%d)", window)
+        except Exception as e:
+            LOGGER.exception("[_build_final_model] DriftChecker failed; skipping drift save: %s", e)
+
         return model, feats
 
     def _run_thresholds(self, model, data_thr, prep, ind, feats):

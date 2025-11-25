@@ -681,23 +681,34 @@ class PREPARE_DATA_FOR_TRAIN:
                 feats_base = [c for c in selected_features if c in base_candidates]
 
         if not feats_base:
-            # هیچ فیچری نداریم → خروجی خالی
-            if with_times:
-                return (
-                    pd.DataFrame(),
-                    pd.Series(dtype="int64"),
-                    [],
-                    pd.Series(dtype=float),
-                    pd.Series(dtype="datetime64[ns]"),
+            logger = logging.getLogger(__name__)
+            # سناریوی اصلی مشکل‌ساز: TRAIN + selected_features=None
+            # یعنی select_features هیچ ستونی برنگردانده؛
+            # برای این‌که فاز نهایی GA نخوابد، روی تمام base_candidates برمی‌گردیم.
+            if (selected_features is None) and base_candidates:
+                logger.warning(
+                    "[ready] feats_base empty (mode=%s) – falling back to all %d numeric base features",
+                    mode,
+                    len(base_candidates),
                 )
+                feats_base = base_candidates
             else:
-                return (
-                    pd.DataFrame(),
-                    pd.Series(dtype="int64"),
-                    [],
-                    pd.Series(dtype=float),
-                )
-
+                # در سایر حالت‌ها اگر همچنان فیچری نداریم، ناچاریم خروجی خالی بدهیم
+                if with_times:
+                    return (
+                        pd.DataFrame(),
+                        pd.Series(dtype="int64"),
+                        [],
+                        pd.Series(dtype=float),
+                        pd.Series(dtype="datetime64[ns]"),
+                    )
+                else:
+                    return (
+                        pd.DataFrame(),
+                        pd.Series(dtype="int64"),
+                        [],
+                        pd.Series(dtype=float),
+                    )
         X_base = df[feats_base].copy()
 
         # ----------------- پنجره‌بندی (window > 1) -----------------
