@@ -122,8 +122,8 @@ def load_checkpoint() -> tuple[int, list, float] | None:
 # ---------------------------------------------------------------------------
 @dataclass
 class GAConfig:
-    population_size: int = 16
-    n_generations: int = 8
+    population_size: int = 8
+    n_generations: int = 3
     cx_pb: float = 0.8
     mut_pb: float = 0.4
     early_stopping_threshold: float = 0.85
@@ -268,7 +268,14 @@ def _fit_and_score_fold(tr_idx, ts_idx, X_full, y_full, price_series, hyper, cal
             df.fillna(df.median(), inplace=True)
 
     # در مرحله GA کالیبراسیون را خاموش می‌کنیم تا سریع و بدون لیکیج باشد
-    pipe = ModelPipeline(hyper, calibrate=False, calib_method=calib_method).fit(X_tr, y_tr)
+    # --- PATCH: استفاده از SMOTE داخل هر فولد برای بالانس کردن y_tr ---
+    pipe = ModelPipeline(
+        hyper,
+        calibrate=False,
+        calib_method=calib_method,
+        use_smote_in_fit=True,   # ← oversampling فقط روی داده‌ی TRAIN این فولد
+    ).fit(X_tr, y_tr)
+
     y_pred = pipe.predict(X_ts)       # 1 = لانگ، 0 = نقد
 
     # ── استخراج قیمت خام (ستون 30T_close) ──
@@ -757,7 +764,9 @@ class GeneticAlgorithmRunner:
 
         tf = ThresholdFinder(steps=200, min_predictions_ratio=2/3)
         self.neg_thr, self.pos_thr, best_acc, *_ = tf.find_best_thresholds(y_prob, y_thr.values)
-        LOGGER.info(f"[threshold] neg={self.neg_thr:.3f} · pos={self.pos_thr:.3f} · acc={best_acc:.4f}")
+        LOGGER.info(
+            f"[threshold] neg={self.neg_thr:.3f} · pos={self.pos_thr:.3f} · bal_acc={best_acc:.4f}"
+        )
 
     def _eval(self, model, data_part, prep, ind, feats, label="Test"):
         """

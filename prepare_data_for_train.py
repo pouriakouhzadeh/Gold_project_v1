@@ -618,9 +618,35 @@ class PREPARE_DATA_FOR_TRAIN:
             t_idx = t_idx.loc[valid].reset_index(drop=True)
             close = close.loc[valid].reset_index(drop=True)
             y = y.loc[valid].reset_index(drop=True)
+
+            # --- PATCH: حذف روزهای «تعطیل‌مانند» با تارگت ثابت و نوسان بسیار کم ---
+            # تعریف «تعطیل‌مانند»:
+            #   1) در آن روز y فقط یک مقدار دارد (همه 0 یا همه 1)
+            #   2) رِنج close آن روز بسیار کوچک است (بازار تقریباً فلت)
+            day_idx = t_idx.dt.normalize()
+            grp_df = pd.DataFrame({"y": y, "close": close, "day": day_idx})
+
+            bad_days = []
+            for d, g in grp_df.groupby("day"):
+                if g["y"].nunique(dropna=True) <= 1:
+                    c_range = float(g["close"].max() - g["close"].min())
+                    c_level = float(max(1.0, g["close"].mean()))
+                    # رِنج کمتر از 0.01% سطح قیمت ⇒ بازار تقریباً بسته است
+                    if c_range <= 1e-4 * c_level:
+                        bad_days.append(d)
+
+            if bad_days:
+                mask = ~day_idx.isin(bad_days)
+                df = df.loc[mask].reset_index(drop=True)
+                y = y.loc[mask].reset_index(drop=True)
+                t_idx = t_idx.loc[mask].reset_index(drop=True)
+                close = close.loc[mask].reset_index(drop=True)
+
         else:
             # در پیش‌بینی، y واقعی لازم نداریم؛ بعداً صفر می‌کنیم
             y = pd.Series(np.zeros(len(df), dtype=np.int8))
+
+        # ----------------- انتخاب ستون‌های فیچر پایه -----------------
 
         # ----------------- انتخاب ستون‌های فیچر پایه -----------------
         time_tokens = ("hour", "day_of_week", "is_weekend")
