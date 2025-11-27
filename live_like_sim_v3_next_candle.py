@@ -141,6 +141,7 @@ def main() -> None:
         y_pred = np.where(actions[mask_trade] == "BUY", 1, 0)
         y_true = y_tail[mask_trade].to_numpy()
         acc = float((y_pred == y_true).mean())
+        print(f"ACC = {acc}")
     else:
         acc = 0.0
 
