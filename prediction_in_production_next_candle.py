@@ -159,26 +159,34 @@ def main() -> None:
             continue
 
         # فیچرها برای تمام کندل‌ها تا ts_now
+        # استفاده از سطر پایدارِ ماقبل آخر:
+        # در mode="predict" اگر predict_drop_last=True باشد، سطر آخر حذف می‌شود
+        # و آخرین سطر X_all مربوط به آخرین کندل «کاملاً پایدار» خواهد بود.
         X_all, _, _, price_ser, t_idx = prep.ready(
             sub,
             window=window,
             selected_features=train_cols,
             mode="predict",
             with_times=True,
-            predict_drop_last=False,  # ❗ کندل فعلی (سطر آخر) را نگه می‌داریم
+            predict_drop_last=True,   # ⬅️ سطر آخر را حذف کن (کندل ناپایدار فعلی)
             train_drop_last=False,
         )
 
         if X_all.empty:
-            LOG.warning("ready() returned empty at %s", ts_now)
+            LOG.warning("ready() returned empty at %s (after dropping last row)", ts_now)
             time.sleep(args.poll_sec)
             continue
 
-        # آخرین کندل بسته شده (زمان ts_now)
+        # آخرین کندل پایدار (مثلاً کندلی که قبل از ts_now بسته شده)
         X_last = X_all.tail(1).reset_index(drop=True)
         ts_feat = pd.to_datetime(t_idx.iloc[-1])
-        if ts_feat != ts_now:
-            LOG.warning("Time mismatch: ts_feat=%s ts_now=%s", ts_feat, ts_now)
+
+        if ts_feat > ts_now:
+            LOG.warning(
+                "Time mismatch (unexpected): ts_feat=%s > ts_now=%s (after drop_last)",
+                ts_feat,
+                ts_now,
+            )
 
         prob = float(model.predict_proba(X_last)[:, 1][0])
         action = decide_action(prob, neg_thr, pos_thr)

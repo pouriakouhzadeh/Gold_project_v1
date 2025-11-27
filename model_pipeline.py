@@ -90,6 +90,7 @@ class ModelPipeline:
         self,
         hyperparams: Dict[str, Any],
         *,
+        algo: str = "logreg",
         calibrate: bool = True,
         calib_method: str = "sigmoid",
         use_smote_in_fit: bool = False,
@@ -100,6 +101,7 @@ class ModelPipeline:
         self.calibrate = bool(calibrate)
         self.calib_method = str(calib_method)
         self.use_smote_in_fit = bool(use_smote_in_fit)
+        self.algo = algo
         # اگر SMOTE در fit فعال است، balanced را خنثی کن تا دوباره‌وزن‌دهی رخ ندهد
         if self.use_smote_in_fit and self.hyperparams.get("class_weight") == "balanced":
             self.hyperparams["class_weight"] = None
@@ -150,7 +152,9 @@ class ModelPipeline:
 
                 sm_params = dict(self.smote_kwargs)
                 sm_params["k_neighbors"] = k_safe
-                # برای جلوگیری از oversubscription
+                # NEW:
+                if "sampling_strategy" not in sm_params:
+                    sm_params["sampling_strategy"] = 0.8  # بجای 1.0
                 sm = SMOTE(random_state=self.random_state, **sm_params)
 
                 X_res, y_res = sm.fit_resample(
@@ -181,3 +185,104 @@ class ModelPipeline:
 
     def get_scaler(self):
         return self.pipeline.get_scaler()
+    
+    
+    def _build_base_estimator(self):
+        """
+        بر اساس self.algo مدل پایه را می‌سازد.
+        """
+        algo = self.algo.lower()
+        params = dict(self.hyperparams)
+
+        if algo == "logreg":
+            return LogisticRegression(**params)
+
+        elif algo == "svm":
+            from sklearn.svm import SVC
+            # پارامترهای ساده: C, kernel, gamma
+            default = dict(C=1.0, kernel="rbf", gamma="scale", probability=True)
+            default.update(params)
+            return SVC(**default)
+
+        elif algo == "rf":
+            from sklearn.ensemble import RandomForestClassifier
+            default = dict(
+                n_estimators=params.pop("n_estimators", 200),
+                max_depth=params.pop("max_depth", None),
+                min_samples_leaf=params.pop("min_samples_leaf", 2),
+                n_jobs=-1,
+                random_state=self.random_state,
+            )
+            return RandomForestClassifier(**default)
+
+        elif algo == "hgb":
+            from sklearn.ensemble import HistGradientBoostingClassifier
+            default = dict(
+                learning_rate=params.pop("learning_rate", 0.05),
+                max_depth=params.pop("max_depth", None),
+                max_leaf_nodes=params.pop("max_leaf_nodes", 31),
+                max_iter=params.pop("max_iter", 200),
+                random_state=self.random_state,
+            )
+            return HistGradientBoostingClassifier(**default)
+
+        else:
+            raise ValueError(f"Unknown algo={algo}")
+
+class EnsembleModel:
+    """
+    نگه‌دارنده‌ی چند ModelPipeline و انجام رای‌گیری/تجمیع احتمالات.
+    """
+
+    def __init__(self, models: list[ModelPipeline], vote_k: int = 3):
+        if not models:
+            raise ValueError("EnsembleModel needs at least one ModelPipeline")
+        self.models = models
+        self.vote_k = vote_k
+
+    def predict_proba(self, X):
+        """
+        احتمال نهایی = میانگین احتمال کلاس ۱ بین همه‌ی مدل‌ها.
+        """
+        probs = [m.predict_proba(X)[:, 1] for m in self.models]
+        avg = np.mean(np.vstack(probs), axis=0)
+        # برگرداندن در قالب (n_samples, 2) مثل اسکیک‌لرن
+        p1 = avg
+        p0 = 1.0 - p1
+        return np.vstack([p0, p1]).T
+
+    def predict_actions(self, X, neg_thrs: list[float], pos_thrs: list[float]) -> np.ndarray:
+        """
+        اعمال آستانه‌ی جداگانه برای هر مدل و رای‌گیری:
+        - اگر حداقل vote_k مدل BUY بگویند → BUY
+        - اگر حداقل vote_k مدل SELL بگویند → SELL
+        - در غیر این صورت → NONE
+        """
+        n = X.shape[0]
+        votes = np.zeros((len(self.models), n), dtype=int)  # 1=BUY, 0=SELL, -1=NONE
+
+        for i, m in enumerate(self.models):
+            p = m.predict_proba(X)[:, 1]
+            neg, pos = neg_thrs[i], pos_thrs[i]
+            v = np.full(n, -1, dtype=int)
+            v[p <= neg] = 0
+            v[p >= pos] = 1
+            votes[i, :] = v
+
+        final = np.full(n, -1, dtype=int)
+        # BUY اگر >= vote_k رای BUY
+        buy_mask = (votes == 1).sum(axis=0) >= self.vote_k
+        # SELL اگر >= vote_k رای SELL
+        sell_mask = (votes == 0).sum(axis=0) >= self.vote_k
+
+        final[buy_mask] = 1
+        final[sell_mask] = 0
+        # اگر هم BUY هم SELL شد (خیلی بعید) می‌توانی ترجیحی بگذاری؛ فعلاً اولویت را BUY بگذاریم:
+        conflict_mask = buy_mask & sell_mask
+        final[conflict_mask] = 1
+
+        return final
+
+    def get_scaler(self):
+        # از اولین مدل اسکیلر را بگیر (برای DriftChecker / compatibility)
+        return self.models[0].get_scaler()

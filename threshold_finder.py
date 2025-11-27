@@ -58,7 +58,7 @@ class ThresholdFinder:
 
                 # --- PATCH: جلوگیری از BUY-only بودن ---
                 pos_ratio = np.mean(y_pred[mask] == 1)
-                if (pos_ratio < 0.20) or (pos_ratio > 0.80):
+                if (pos_ratio < 0.30) or (pos_ratio > 0.70):
                     # خیلی کم یا خیلی زیاد BUY → این ترکیب آستانه را رد کن
                     continue
 

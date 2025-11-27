@@ -139,14 +139,14 @@ creator.create("Individual", list, fitness=creator.FitnessMax)
 TOOLBOX = base.Toolbox()
 
 # -------------------- توابع تصادفی --------------------
-rand_C             = lambda: 10 ** random.uniform(-4, 2)
+rand_C             = lambda: 10 ** random.uniform(-3, 1)
 rand_max_iter      = lambda: random.randint(8000, 10_000)
 rand_tol           = lambda: 10 ** random.uniform(-5, -2)
 rand_penalty       = lambda: random.choice(["l1", "l2"])
 rand_solver        = lambda: random.choice(["sag", "saga"])     # ← چندترد
 rand_calib         = lambda: random.choice(["sigmoid", "isotonic"])
 rand_fit_intercept = lambda: random.choice([True, False])
-rand_class_weight  = lambda: random.choice([None, "balanced"])
+rand_class_weight  = lambda: None
 rand_multi_class   = lambda: random.choice(["auto", "ovr", "multinomial"])
 rand_window_size   = lambda: random.choice(CFG.possible_window_sizes)
 
@@ -397,7 +397,7 @@ def evaluate_cv(ind):
             "penalty": penalty,
             "solver": solver,
             "fit_intercept": fit_intercept,
-            "class_weight": class_weight,
+            # "class_weight": class_weight,
             "multi_class": multi_class,
         }
 
@@ -624,6 +624,13 @@ class GeneticAlgorithmRunner:
                 predict_drop_last=False,
                 train_drop_last=False     # ❗
             )
+        
+            # ---- Save prepared training data for reuse ----
+            prepared_df = X.copy()
+            prepared_df["target"] = y.values
+            prepared_df.to_csv("prepared_train_data.csv", index=False)
+            LOGGER.info(f"[SAVE] Prepared training data saved to prepared_train_data.csv (rows={len(prepared_df)}, cols={prepared_df.shape[1]})")
+
         except Exception as e:
             LOGGER.exception("[_build_final_model] prep.ready failed: %s", e)
             return None, []

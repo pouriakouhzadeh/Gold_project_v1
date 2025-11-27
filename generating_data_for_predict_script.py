@@ -270,18 +270,37 @@ def main() -> None:
                 "Could not read deploy_X_feed_log.csv (using ts_now as ts_feat): %s", e
             )
 
-        # --- 4) محاسبه‌ی y_true از M30 خام: جهت کندل بعدی (t → t+1) ---
+        # --- 4) محاسبه‌ی y_true بر اساس زمان فیچر (ts_feat) ---
         y_true_dep: Optional[float] = None
         y_true_int = np.nan
 
-        if idx + 1 < len(df30):
-            try:
-                c_now = float(df30.loc[idx, close_col_30])
-                c_next = float(df30.loc[idx + 1, close_col_30])
+        try:
+            # ts_feat زمانی است که دپلوی برایش فیچر ساخته (ستون 'timestamp' در لاگ دپلوی)
+            # ما باید در M30 ردیفی با این زمان پیدا کنیم و جهت کندل بعدیِ آن را حساب کنیم.
+            ts_feat_norm = pd.to_datetime(ts_feat)
+
+            # پیدا کردن ایندکس کندلی که time == ts_feat
+            idx_feat_arr = np.where(df30["time"].values == ts_feat_norm)[0]
+            if len(idx_feat_arr) == 0:
+                # اگر به هر دلیل پیدا نشد، از idx فعلی استفاده می‌کنیم (رفتار قبلی)
+                idx_feat = idx
+            else:
+                idx_feat = int(idx_feat_arr[0])
+
+            if idx_feat + 1 < len(df30):
+                c_now = float(df30.loc[idx_feat, close_col_30])
+                c_next = float(df30.loc[idx_feat + 1, close_col_30])
                 y_true_dep = 1.0 if (c_next > c_now) else 0.0
-            except Exception as e:
-                LOG.warning("Could not compute y_true at idx=%d: %s", idx, e)
+                y_true_int = int(y_true_dep)
+            else:
+                # آخرین کندل دیتاست: جهت کندل بعدی را نمی‌توان حساب کرد
                 y_true_dep = None
+                y_true_int = np.nan
+
+        except Exception as e:
+            LOG.warning("Could not compute y_true for ts_feat=%s: %s", ts_feat, e)
+            y_true_dep = None
+            y_true_int = np.nan
 
         # نگاشت اکشن مدل به برچسب باینری
         if ans == "BUY":
