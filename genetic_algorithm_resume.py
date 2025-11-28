@@ -267,6 +267,12 @@ def _fit_and_score_fold(tr_idx, ts_idx, X_full, y_full, price_series, hyper, cal
         if df.isna().any().any():
             df.fillna(df.median(), inplace=True)
 
+
+    prepared_df = X_tr.copy()
+    prepared_df["target"] = y_tr.values
+    prepared_df.to_csv("prepared_train_data.csv", index=False)
+    LOGGER.info(f"[SAVE] Prepared training data saved to prepared_train_data.csv (rows={len(prepared_df)}, cols={prepared_df.shape[1]})")
+
     # در مرحله GA کالیبراسیون را خاموش می‌کنیم تا سریع و بدون لیکیج باشد
     # --- PATCH: استفاده از SMOTE داخل هر فولد برای بالانس کردن y_tr ---
     pipe = ModelPipeline(
