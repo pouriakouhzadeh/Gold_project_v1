@@ -241,14 +241,26 @@ ens_df.to_csv("ensemble_predictions.csv", index=False)
 log.info("💾 ensemble_predictions.csv created successfully.")
 
 # ============================================================
-# 7️⃣ Generate signals.csv + Coverage report
+# 7️⃣ Balanced Voting Logic (with divide-by-zero safety)
 # ============================================================
-stage("Generating final BUY/SELL signals and computing live accuracy + coverage")
+stage("Generating balanced voting decisions with coverage report")
 
 signals = np.full(len(vote_sum), "NONE", dtype=object)
-signals[vote_sum >= 3] = "BUY"
-signals[(vote_conf >= 3) & (vote_sum <= 1)] = "SELL"
 
+# جلوگیری از تقسیم بر صفر
+safe_conf = np.where(vote_conf == 0, np.nan, vote_conf)
+vote_ratio = np.divide(vote_sum, safe_conf)
+
+# شرایط متقارن و متعادل
+buy_condition = (vote_ratio >= 0.7) & (vote_conf >= 3)
+sell_condition = (vote_ratio <= 0.3) & (vote_conf >= 3)
+
+# اعمال تصمیم نهایی
+signals[buy_condition] = "BUY"
+signals[sell_condition] = "SELL"
+signals[~(buy_condition | sell_condition)] = "NONE"
+
+# ذخیره فایل سیگنال‌ها
 sig_df = pd.DataFrame({
     "Index": np.arange(len(signals)),
     "Signal": signals,
@@ -260,7 +272,7 @@ sig_df = pd.DataFrame({
 sig_df.to_csv("signals.csv", index=False)
 log.info("💾 signals.csv saved successfully.")
 
-# Count categories
+# محاسبه‌ی کاوریج و آمار نهایی
 buy_count = np.sum(signals == "BUY")
 sell_count = np.sum(signals == "SELL")
 none_count = np.sum(signals == "NONE")
@@ -270,7 +282,7 @@ coverage = ((buy_count + sell_count) / total_count) * 100 if total_count > 0 els
 log.info(f"✅ BUY={buy_count}, SELL={sell_count}, NONE={none_count}")
 log.info(f"📈 COVERAGE (Predictable Ratio): {coverage:.2f}% of live data covered")
 
-# 🔹 Compute overall ensemble accuracy on live data (using voting)
+# محاسبه دقت نهایی در داده‌های لایو
 mask_live = signals != "NONE"
 if np.any(mask_live):
     y_pred_final = np.where(signals[mask_live] == "BUY", 1, 0)
