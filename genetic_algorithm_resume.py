@@ -270,8 +270,17 @@ def _fit_and_score_fold(tr_idx, ts_idx, X_full, y_full, price_series, hyper, cal
 
     prepared_df = X_tr.copy()
     prepared_df["target"] = y_tr.values
-    prepared_df.to_csv("prepared_train_data.csv", index=False)
-    LOGGER.info(f"[SAVE] Prepared training data saved to prepared_train_data.csv (rows={len(prepared_df)}, cols={prepared_df.shape[1]})")
+
+    # مسیر فایل
+    save_path = "prepared_train_data.csv"
+
+    # اگر فایل هنوز وجود ندارد، آن را ذخیره کن
+    if not os.path.exists(save_path):
+        prepared_df.to_csv(save_path, index=False)
+        LOGGER.info(f"[SAVE] Prepared training data saved to {save_path} "
+                    f"(rows={len(prepared_df)}, cols={prepared_df.shape[1]})")
+    else:
+        LOGGER.info(f"[SKIP] File {save_path} already exists — skipping save.")
 
     # در مرحله GA کالیبراسیون را خاموش می‌کنیم تا سریع و بدون لیکیج باشد
     # --- PATCH: استفاده از SMOTE داخل هر فولد برای بالانس کردن y_tr ---
