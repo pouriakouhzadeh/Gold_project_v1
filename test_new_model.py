@@ -4,11 +4,11 @@ import numpy as np
 import logging
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
-from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
 from xgboost import XGBClassifier
-from datetime import datetime
+from threshold_finder import ThresholdFinder
 
 # ============================================================
 # 1️⃣ Logging setup
@@ -25,14 +25,14 @@ logging.basicConfig(
 log = logging.getLogger()
 
 def stage(msg: str):
-    """Display stage separator"""
-    sep = "=" * 65
+    sep = "=" * 80
     log.info(f"\n{sep}\n🟢 STAGE: {msg}\n{sep}")
 
 # ============================================================
-# 2️⃣ Load prepared dataset
+# 2️⃣ Load and split data
 # ============================================================
-stage("Loading dataset")
+stage("Loading and splitting dataset")
+
 df = pd.read_csv("prepared_train_data.csv")
 if "target" not in df.columns:
     raise ValueError("❌ 'target' column missing in dataset")
@@ -40,31 +40,50 @@ if "target" not in df.columns:
 X = df.drop("target", axis=1)
 y = df["target"].astype(int)
 
-# Clean non-numeric and NaNs
+# Detect a price column (optional for profitability)
+price_col = None
+for c in X.columns:
+    if "close" in c.lower():
+        price_col = c
+        break
+prices = X[price_col].values if price_col else np.arange(len(X))
+
 X = X.select_dtypes(include=[np.number])
 X.replace([np.inf, -np.inf], np.nan, inplace=True)
 X.fillna(X.median(), inplace=True)
 
-# Split last 1000 rows as live data
-live_size = 1000
-X_live, y_live = X.tail(live_size), y.tail(live_size)
-X_train_full, y_train_full = X.iloc[:-live_size], y.iloc[:-live_size]
+total_len = len(X)
+live_size = 4000
+threshold_size = int(total_len * 0.05)
 
-# Split training data for validation
+X_train_full = X.iloc[:-(live_size + threshold_size)]
+y_train_full = y.iloc[:-(live_size + threshold_size)]
+
+X_thresh = X.iloc[-(live_size + threshold_size):-live_size]
+y_thresh = y.iloc[-(live_size + threshold_size):-live_size]
+
+X_live = X.tail(live_size)
+y_live = y.tail(live_size)
+price_live = prices[-live_size:] if len(prices) >= live_size else np.arange(live_size)
+
 X_train, X_test, y_train, y_test = train_test_split(
     X_train_full, y_train_full, test_size=0.2, shuffle=False
 )
 
-log.info(f"Dataset loaded: total={len(df)}, train={len(X_train)}, test={len(X_test)}, live={len(X_live)}")
+log.info(f"Dataset split:")
+log.info(f"  • Train: {len(X_train)} rows")
+log.info(f"  • Threshold: {len(X_thresh)} rows (~5%)")
+log.info(f"  • Test: {len(X_test)} rows")
+log.info(f"  • Live: {len(X_live)} rows")
 
 # ============================================================
-# 3️⃣ Define models and hyperparameter grids
+# 3️⃣ Define models and grids
 # ============================================================
 stage("Defining models and hyperparameter grids")
 
 models_config = {
     "XGBoost": {
-        "model": XGBClassifier(random_state=2025, n_jobs=-1),
+        "model": XGBClassifier(random_state=2025, n_jobs=-1, eval_metric="logloss"),
         "scaler": None,
         "param_grid": {
             "n_estimators": [200, 400],
@@ -72,6 +91,7 @@ models_config = {
             "max_depth": [4, 6, 8],
             "subsample": [0.8, 1.0],
             "colsample_bytree": [0.8, 1.0],
+            "reg_lambda": [1.0, 1.5, 2.0],
         },
     },
     "HistGradientBoosting": {
@@ -84,13 +104,13 @@ models_config = {
             "l2_regularization": [0.0, 0.5, 1.0],
         },
     },
-    "SVM (RBF)": {
-        "model": SVC(probability=True, random_state=2025),
+    "LogisticRegression": {
+        "model": LogisticRegression(max_iter=5000, random_state=2025, solver="saga"),
         "scaler": StandardScaler(),
         "param_grid": {
-            "C": [0.1, 1, 10],
-            "gamma": ["scale", 0.1, 0.01],
-            "kernel": ["rbf"],
+            "C": [0.01, 0.1, 1, 10],
+            "penalty": ["l1", "l2"],
+            "class_weight": [None, "balanced"]
         },
     },
     "RandomForest": {
@@ -100,154 +120,125 @@ models_config = {
             "n_estimators": [200, 400],
             "max_depth": [6, 8, 10],
             "max_features": ["sqrt", "log2"],
+            "class_weight": [None, "balanced_subsample"],
         },
     },
 }
 
 # ============================================================
-# 4️⃣ Training and evaluation on training/test data
+# 4️⃣ Training, Bias, Threshold, and Stability Analysis
 # ============================================================
-stage("Model training and evaluation")
-results = []
+stage("Training models, checking bias & overfitting, and computing stability indices")
 
+results = []
 for name, cfg in models_config.items():
     try:
-        model = cfg["model"]
-        scaler = cfg["scaler"]
-        params = cfg["param_grid"]
+        model, scaler, params = cfg["model"], cfg["scaler"], cfg["param_grid"]
+        log.info(f"\n🔹 Optimizing {name} parameters with GridSearch ...")
 
-        log.info(f"\n🔹 Starting GridSearch for {name} ...")
         if scaler is not None:
             scaler.fit(X_train)
             X_train_scaled = scaler.transform(X_train)
             X_test_scaled = scaler.transform(X_test)
+            X_thresh_scaled = scaler.transform(X_thresh)
             X_live_scaled = scaler.transform(X_live)
         else:
-            X_train_scaled, X_test_scaled, X_live_scaled = X_train, X_test, X_live
+            X_train_scaled, X_test_scaled, X_thresh_scaled, X_live_scaled = (
+                X_train, X_test, X_thresh, X_live
+            )
 
-        grid = GridSearchCV(
-            estimator=model,
-            param_grid=params,
-            scoring="f1",
-            cv=3,
-            n_jobs=-1,
-            verbose=0,
-        )
+        grid = GridSearchCV(model, params, scoring="f1", cv=3, n_jobs=-1)
         grid.fit(X_train_scaled, y_train)
-
         best_model = grid.best_estimator_
         best_params = grid.best_params_
+
         log.info(f"✅ {name}: Best Params = {best_params}")
 
-        # Evaluate on test data
-        y_pred = best_model.predict(X_test_scaled)
-        acc = accuracy_score(y_test, y_pred)
-        bal_acc = balanced_accuracy_score(y_test, y_pred)
-        f1 = f1_score(y_test, y_pred)
-        wins = int(((y_pred == 1) & (y_test == 1)).sum())
-        loses = int(((y_pred == 1) & (y_test == 0)).sum())
+        # Bias check
+        y_pred_train = best_model.predict(X_train_scaled)
+        buy_ratio = np.mean(y_pred_train == 1)
+        sell_ratio = np.mean(y_pred_train == 0)
+        bias_penalty = 0.0
+        if buy_ratio > 0.9 or sell_ratio > 0.9:
+            bias_penalty = 0.1
+            log.warning(f"⚠️ {name} shows bias → BUY={buy_ratio:.2f}, SELL={sell_ratio:.2f}")
+        else:
+            log.info(f"✅ {name} output distribution OK → BUY={buy_ratio:.2f}, SELL={sell_ratio:.2f}")
 
-        log.info(f"--------------------------- {name} ---------------------------")
-        log.info(f"Accuracy:           {acc:.4f}")
-        log.info(f"Balanced Accuracy:  {bal_acc:.4f}")
-        log.info(f"F1 Score:           {f1:.4f}")
-        log.info(f"Wins (pred=1,y=1):  {wins}")
-        log.info(f"Loses(pred=1,y=0):  {loses}")
-        log.info(f"-------------------------------------------------------------")
+        # Evaluate
+        y_pred_test = best_model.predict(X_test_scaled)
+        acc = accuracy_score(y_test, y_pred_test) - bias_penalty
+        bal_acc = balanced_accuracy_score(y_test, y_pred_test)
+        f1 = f1_score(y_test, y_pred_test)
+
+        # Thresholds
+        y_proba_thresh = best_model.predict_proba(X_thresh_scaled)[:, 1]
+        tf = ThresholdFinder(steps=600, min_predictions_ratio=0.9)
+        neg_thr, pos_thr, thr_acc, _, _ = tf.find_best_thresholds(y_proba_thresh, y_thresh.values)
+
+        # Live
+        y_proba_live = best_model.predict_proba(X_live_scaled)[:, 1]
+        y_pred_live = np.full_like(y_live, -1)
+        y_pred_live[y_proba_live <= neg_thr] = 0
+        y_pred_live[y_proba_live >= pos_thr] = 1
+
+        mask_live = y_pred_live != -1
+        acc_live = accuracy_score(y_live[mask_live], y_pred_live[mask_live]) if mask_live.any() else 0
+        bal_live = balanced_accuracy_score(y_live[mask_live], y_pred_live[mask_live]) if mask_live.any() else 0
+        f1_live = f1_score(y_live[mask_live], y_pred_live[mask_live]) if mask_live.any() else 0
+
+        # ======================================================
+        # Stability & Drift metrics
+        # ======================================================
+        log.info(f"\n📈 Stability & Drift Analysis for {name}")
+
+        try:
+            mean_proba_train = np.mean(best_model.predict_proba(X_train_scaled)[:, 1])
+            mean_proba_test = np.mean(best_model.predict_proba(X_test_scaled)[:, 1])
+            mean_proba_thresh = np.mean(y_proba_thresh)
+            mean_proba_live = np.mean(y_proba_live)
+            drift_train_live = abs(mean_proba_live - mean_proba_train)
+            drift_test_live = abs(mean_proba_live - mean_proba_test)
+            std_proba_live = np.std(y_proba_live)
+            stability_index = 1 - (drift_train_live + drift_test_live + std_proba_live)
+            stability_index = max(0, min(stability_index, 1))
+            log.info(f"Avg_Proba: train={mean_proba_train:.3f}, test={mean_proba_test:.3f}, thresh={mean_proba_thresh:.3f}, live={mean_proba_live:.3f}")
+            log.info(f"Drift: train→live={drift_train_live:.3f}, test→live={drift_test_live:.3f}")
+            log.info(f"Stability Index={stability_index:.3f} (1=perfect stability, 0=unstable)")
+        except Exception as e:
+            stability_index = 0.5
+            log.warning(f"⚠️ Stability calculation issue for {name}: {e}")
 
         results.append({
             "Model": name,
             "Best_Params": best_params,
+            "Bias_Penalty": bias_penalty,
             "Accuracy": acc,
             "Balanced_Accuracy": bal_acc,
             "F1": f1,
-            "Wins": wins,
-            "Loses": loses,
+            "NegThr": neg_thr,
+            "PosThr": pos_thr,
+            "Live_Accuracy": acc_live,
+            "Live_F1": f1_live,
+            "Stability_Index": stability_index,
             "Best_Model": best_model,
             "Scaler": scaler,
-            "X_live_scaled": X_live_scaled,
+            "Y_proba_live": y_proba_live,
         })
 
     except Exception as e:
         log.error(f"❌ Error training {name}: {e}")
 
 # ============================================================
-# 5️⃣ Evaluation on LIVE data
+# 5️⃣ Full report summary
 # ============================================================
-stage("Evaluating models on LIVE data")
+stage("Comprehensive Model Stability Summary")
 
-for r in results:
-    try:
-        name = r["Model"]
-        model = r["Best_Model"]
-        scaler = r["Scaler"]
-        X_live_scaled = r["X_live_scaled"]
+stability_df = pd.DataFrame(results)[["Model", "Accuracy", "Live_Accuracy", "F1", "Live_F1", "Stability_Index", "Bias_Penalty"]]
+stability_df["Performance_Drift"] = abs(stability_df["F1"] - stability_df["Live_F1"])
+stability_df["Composite_Score"] = (stability_df["Stability_Index"] * 0.5) + (1 - stability_df["Performance_Drift"]) * 0.5 - stability_df["Bias_Penalty"]
 
-        log.info(f"\n🔹 Evaluating {name} on live data ...")
-        y_live_pred = model.predict(X_live_scaled)
-
-        acc = accuracy_score(y_live, y_live_pred)
-        bal_acc = balanced_accuracy_score(y_live, y_live_pred)
-        f1 = f1_score(y_live, y_live_pred)
-        wins = int(((y_live_pred == 1) & (y_live == 1)).sum())
-        loses = int(((y_live_pred == 1) & (y_live == 0)).sum())
-
-        log.info(f"--------------------------- {name} (LIVE) ---------------------------")
-        log.info(f"Accuracy:           {acc:.4f}")
-        log.info(f"Balanced Accuracy:  {bal_acc:.4f}")
-        log.info(f"F1 Score:           {f1:.4f}")
-        log.info(f"Wins (pred=1,y=1):  {wins}")
-        log.info(f"Loses(pred=1,y=0):  {loses}")
-        log.info(f"Best Params:        {r['Best_Params']}")
-        log.info(f"-------------------------------------------------------------")
-
-        r["Live_Accuracy"] = acc
-        r["Live_BalAcc"] = bal_acc
-        r["Live_F1"] = f1
-
-    except Exception as e:
-        log.error(f"❌ Error evaluating {name} on live data: {e}")
-
-# ============================================================
-# 6️⃣ Summary comparison
-# ============================================================
-stage("Summary comparison")
-results_df = pd.DataFrame(results)[
-    [
-        "Model",
-        "Accuracy",
-        "Balanced_Accuracy",
-        "F1",
-        "Live_Accuracy",
-        "Live_BalAcc",
-        "Live_F1",
-    ]
-].sort_values("F1", ascending=False).reset_index(drop=True)
-
-log.info("\n📊 FINAL COMPARISON:")
-log.info(results_df.to_string(index=False))
-
-# Additional qualitative analysis
-log.info("\n🔍 Qualitative model insights:")
-for _, r in results_df.iterrows():
-    strengths, weaknesses = [], []
-    if r["F1"] > results_df["F1"].mean():
-        strengths.append("High stability on training/test data")
-    else:
-        weaknesses.append("Below-average F1")
-
-    if r["Live_F1"] > results_df["Live_F1"].mean():
-        strengths.append("Strong live generalization")
-    else:
-        weaknesses.append("Weak live performance")
-
-    if r["Balanced_Accuracy"] > 0.7:
-        strengths.append("Handles class imbalance well")
-    else:
-        weaknesses.append("Might struggle with class imbalance")
-
-    log.info(f"\n📈 {r['Model']}:")
-    log.info(f"   Strengths : {', '.join(strengths) if strengths else '—'}")
-    log.info(f"   Weaknesses: {', '.join(weaknesses) if weaknesses else '—'}")
-
-log.info("\n✅ All stages completed successfully.")
+log.info("\n📊 MODEL STABILITY ANALYSIS REPORT:")
+log.info(stability_df.sort_values("Composite_Score", ascending=False).to_string(index=False))
+log.info("==============================================================")
+log.info("✅ Stability and drift analysis completed successfully.")
