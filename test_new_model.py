@@ -2,6 +2,7 @@
 import pandas as pd
 import numpy as np
 import logging
+import os
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
@@ -9,7 +10,6 @@ from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassif
 from sklearn.linear_model import LogisticRegression
 from xgboost import XGBClassifier
 from threshold_finder import ThresholdFinder
-import os
 
 # ============================================================
 # 1️⃣ Logging setup
@@ -200,15 +200,20 @@ for name, cfg in models_config.items():
 # 5️⃣ Export stability report
 # ============================================================
 stage("Exporting model stability report")
-if results:
-    stab_df = pd.DataFrame(results)[[
-        "Model", "Accuracy", "Live_Accuracy", "F1", "Live_F1", "Stability_Index", "Bias_Penalty"
-    ]]
-    stab_df["Performance_Drift"] = abs(stab_df["F1"] - stab_df["Live_F1"])
-    stab_df.to_csv("stability_report.csv", index=False)
-    log.info("💾 stability_report.csv saved successfully.")
-else:
-    log.warning("⚠️ No model results available to export stability report.")
+stab_path = "stability_report.csv"
+try:
+    if results:
+        stab_df = pd.DataFrame(results)[[
+            "Model", "Accuracy", "Live_Accuracy", "F1", "Live_F1", "Stability_Index", "Bias_Penalty"
+        ]]
+        stab_df["Performance_Drift"] = abs(stab_df["F1"] - stab_df["Live_F1"])
+        stab_df.to_csv(stab_path, index=False)
+        log.info(f"💾 {stab_path} saved successfully.")
+    else:
+        pd.DataFrame(columns=["Model", "Accuracy", "Live_Accuracy", "F1", "Live_F1"]).to_csv(stab_path, index=False)
+        log.warning(f"⚠️ No model results. Empty {stab_path} created.")
+except Exception as e:
+    log.error(f"❌ Failed to write {stab_path}: {e}")
 
 # ============================================================
 # 6️⃣ Voting and prediction export
@@ -224,11 +229,11 @@ for r in results:
     votes.append(y_pred)
     probas.append(y_proba)
 
-votes = np.array(votes)
-probas = np.array(probas)
-vote_sum = np.sum(votes == 1, axis=0)
-vote_conf = np.sum(votes != -1, axis=0)
-mean_conf = np.nanmean(np.where(votes != -1, probas, np.nan), axis=0)
+votes = np.array(votes) if votes else np.empty((0, len(X_live)))
+probas = np.array(probas) if probas else np.empty((0, len(X_live)))
+vote_sum = np.sum(votes == 1, axis=0) if votes.size else np.zeros(len(X_live))
+vote_conf = np.sum(votes != -1, axis=0) if votes.size else np.zeros(len(X_live))
+mean_conf = np.nanmean(np.where(votes != -1, probas, np.nan), axis=0) if votes.size else np.zeros(len(X_live))
 
 ens_df = pd.DataFrame({
     "Index": np.arange(len(y_live)),
@@ -237,30 +242,26 @@ ens_df = pd.DataFrame({
     "Confident_Models": vote_conf,
     "Mean_Confidence": mean_conf
 })
-ens_df.to_csv("ensemble_predictions.csv", index=False)
-log.info("💾 ensemble_predictions.csv created successfully.")
+ens_path = "ensemble_predictions.csv"
+ens_df.to_csv(ens_path, index=False)
+log.info(f"💾 {ens_path} created successfully.")
 
 # ============================================================
-# 7️⃣ Balanced Voting Logic (with divide-by-zero safety)
+# 7️⃣ Balanced Voting Logic (Safe)
 # ============================================================
 stage("Generating balanced voting decisions with coverage report")
 
 signals = np.full(len(vote_sum), "NONE", dtype=object)
-
-# جلوگیری از تقسیم بر صفر
 safe_conf = np.where(vote_conf == 0, np.nan, vote_conf)
 vote_ratio = np.divide(vote_sum, safe_conf)
 
-# شرایط متقارن و متعادل
 buy_condition = (vote_ratio >= 0.7) & (vote_conf >= 3)
 sell_condition = (vote_ratio <= 0.3) & (vote_conf >= 3)
 
-# اعمال تصمیم نهایی
 signals[buy_condition] = "BUY"
 signals[sell_condition] = "SELL"
 signals[~(buy_condition | sell_condition)] = "NONE"
 
-# ذخیره فایل سیگنال‌ها
 sig_df = pd.DataFrame({
     "Index": np.arange(len(signals)),
     "Signal": signals,
@@ -269,10 +270,11 @@ sig_df = pd.DataFrame({
     "Votes_BUY": vote_sum,
     "Confident_Models": vote_conf
 })
-sig_df.to_csv("signals.csv", index=False)
-log.info("💾 signals.csv saved successfully.")
+sig_path = "signals.csv"
+sig_df.to_csv(sig_path, index=False)
+log.info(f"💾 {sig_path} saved successfully with {len(sig_df)} rows.")
 
-# محاسبه‌ی کاوریج و آمار نهایی
+# Coverage & accuracy
 buy_count = np.sum(signals == "BUY")
 sell_count = np.sum(signals == "SELL")
 none_count = np.sum(signals == "NONE")
@@ -282,7 +284,6 @@ coverage = ((buy_count + sell_count) / total_count) * 100 if total_count > 0 els
 log.info(f"✅ BUY={buy_count}, SELL={sell_count}, NONE={none_count}")
 log.info(f"📈 COVERAGE (Predictable Ratio): {coverage:.2f}% of live data covered")
 
-# محاسبه دقت نهایی در داده‌های لایو
 mask_live = signals != "NONE"
 if np.any(mask_live):
     y_pred_final = np.where(signals[mask_live] == "BUY", 1, 0)
