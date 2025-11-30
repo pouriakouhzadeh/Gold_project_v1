@@ -9,7 +9,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
-
+import logging
 
 class _CompatWrapper:
     """
@@ -175,7 +175,10 @@ class ModelPipeline:
                 X_fit, y_fit = X, y
 
         # آموزش مدل (در صورت کالیبراسیون، روی داده‌های resampled/Train انجام می‌شود)
+        logging.info(f"Model {self.pipeline._model} is starting to train ...")
         self.pipeline._model.fit(X_fit, y_fit)
+        logging.info(f"Finish model {self.pipeline._model} training")
+       
         return self
 
     def predict(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:

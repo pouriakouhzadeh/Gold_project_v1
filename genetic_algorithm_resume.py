@@ -410,7 +410,7 @@ def evaluate_cv(ind):
         15..18: HGB
         19..24: XGB
     """
-    timeout_seconds = 32400  # 3 ساعت
+    timeout_seconds = 32400  # 9 ساعت
     old_handler = None
 
     if hasattr(signal, "SIGALRM"):
