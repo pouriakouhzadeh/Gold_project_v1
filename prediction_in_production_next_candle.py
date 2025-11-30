@@ -85,10 +85,21 @@ def main() -> None:
     pipeline = payload["pipeline"]
     meta = payload
     model = pipeline
+
     window = int(meta["window_size"])
     neg_thr = float(meta["neg_thr"])
     pos_thr = float(meta["pos_thr"])
     train_cols = list(meta["train_window_cols"])
+
+    # آستانه‌های جداگانه‌ی هر مدل در hyperparams
+    hyper = meta.get("hyperparams", {}) or {}
+    neg_thrs = hyper.get("neg_thrs")
+    pos_thrs = hyper.get("pos_thrs")
+
+    if not neg_thrs or not pos_thrs:
+        # سازگاری با مدل تک‌مدلی
+        neg_thrs = [neg_thr]
+        pos_thrs = [pos_thr]
 
 
     if not train_cols:
@@ -188,8 +199,22 @@ def main() -> None:
                 ts_now,
             )
 
+        # احتمال ensemble (میانگین)
         prob = float(model.predict_proba(X_last)[:, 1][0])
-        action = decide_action(prob, neg_thr, pos_thr)
+
+        # اگر EnsembleModel است، از رأی‌گیری آستانه‌ای استفاده کن
+        if hasattr(model, "predict_actions"):
+            actions_int = model.predict_actions(X_last, neg_thrs, pos_thrs)
+            a_int = int(actions_int[0])
+            if a_int == 1:
+                action = "BUY"
+            elif a_int == 0:
+                action = "SELL"
+            else:
+                action = "NONE"
+        else:
+            # سازگاری تک‌مدلی
+            action = decide_action(prob, neg_thr, pos_thr)
 
         total_steps += 1
         if action != "NONE":

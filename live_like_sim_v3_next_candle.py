@@ -27,15 +27,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-
-def decide_action(p: float, neg_thr: float, pos_thr: float) -> str:
-    if p >= pos_thr:
-        return "BUY"
-    if p <= neg_thr:
-        return "SELL"
-    return "NONE"
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-dir", default=".", type=str)
@@ -61,6 +52,16 @@ def main() -> None:
     neg_thr = float(meta["neg_thr"])
     pos_thr = float(meta["pos_thr"])
     train_cols = list(meta.get("train_window_cols") or meta.get("feats") or [])
+
+    # آستانه‌های جداگانه‌ی هر مدل در hyperparams
+    hyper = meta.get("hyperparams", {}) or {}
+    neg_thrs = hyper.get("neg_thrs")
+    pos_thrs = hyper.get("pos_thrs")
+
+    # سازگاری با مدل قدیمی تک‌مدلی
+    if not neg_thrs or not pos_thrs:
+        neg_thrs = [neg_thr]
+        pos_thrs = [pos_thr]
 
     if not train_cols:
         raise ValueError("train_window_cols/feats در مدل ذخیره نشده است.")
@@ -129,8 +130,24 @@ def main() -> None:
     LOG.info("sim_X_feed_tail200.csv written: %s", sim_feat_path)
 
     # ---------- پیش‌بینی ----------
+    # ---------- پیش‌بینی ----------
+    # احتمال ensemble (میانگین)
     y_prob = model.predict_proba(X_tail)[:, 1]
-    actions = np.array([decide_action(p, neg_thr, pos_thr) for p in y_prob])
+
+    # اگر EnsembleModel است از رأی‌گیری آستانه‌ای استفاده کن
+    if hasattr(model, "predict_actions"):
+        actions_int = model.predict_actions(X_tail, neg_thrs, pos_thrs)
+        actions = np.where(
+            actions_int == 1,
+            "BUY",
+            np.where(actions_int == 0, "SELL", "NONE"),
+        )
+    else:
+        # سازگاری تک‌مدلی قبلی
+        actions = np.empty(len(y_prob), dtype=object)
+        actions[:] = "NONE"
+        actions[y_prob >= pos_thr] = "BUY"
+        actions[y_prob <= neg_thr] = "SELL"
 
     # ---------- محاسبه‌ی دقت و کاور ----------
     mask_trade = actions != "NONE"

@@ -34,14 +34,14 @@ from deap import base, creator, tools
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
 from joblib import Parallel, delayed
-from model_pipeline import ModelPipeline          # type: ignore
+from model_pipeline import ModelPipeline, EnsembleModel  # type: ignore
 from prepare_data_for_train import PREPARE_DATA_FOR_TRAIN  # type: ignore
 from ModelSaver import ModelSaver                 # type: ignore
 from threshold_finder import ThresholdFinder      # type: ignore
 from drift_checker import DriftChecker            # type: ignore
 from sklearn.exceptions import ConvergenceWarning
 import pickle, sys, signal
-import warnings; 
+import warnings;
 warnings.filterwarnings("ignore",
                 category=ConvergenceWarning)
 # ---------------------------------------------------------------------------
@@ -138,7 +138,7 @@ creator.create("FitnessMax", base.Fitness, weights=(1.0,))
 creator.create("Individual", list, fitness=creator.FitnessMax)
 TOOLBOX = base.Toolbox()
 
-# -------------------- توابع تصادفی --------------------
+# --------------------Logestic regression --------------------
 rand_C             = lambda: 10 ** random.uniform(-3, 1)
 rand_max_iter      = lambda: random.randint(8000, 10_000)
 rand_tol           = lambda: 10 ** random.uniform(-5, -2)
@@ -149,6 +149,26 @@ rand_fit_intercept = lambda: random.choice([True, False])
 rand_class_weight  = lambda: None
 rand_multi_class   = lambda: random.choice(["auto", "ovr", "multinomial"])
 rand_window_size   = lambda: random.choice(CFG.possible_window_sizes)
+# -------------------- RF hyperparams --------------------
+rand_rf_n_estimators     = lambda: random.randint(200, 600)
+rand_rf_max_depth        = lambda: random.choice([4, 6, 8, None])
+rand_rf_min_samples_leaf = lambda: random.randint(1, 5)
+rand_rf_max_features     = lambda: random.choice(["sqrt", "log2"])
+rand_rf_class_weight     = lambda: random.choice([None, "balanced_subsample"])
+
+# -------------------- HistGradientBoosting hyperparams --------------------
+rand_hgb_learning_rate   = lambda: random.choice([0.03, 0.05, 0.08, 0.1])
+rand_hgb_max_depth       = lambda: random.choice([3, 4, 5, 6, None])
+rand_hgb_max_leaf_nodes  = lambda: random.choice([31, 63, 127])
+rand_hgb_max_iter        = lambda: random.randint(200, 600)
+
+# -------------------- XGBoost hyperparams --------------------
+rand_xgb_n_estimators     = lambda: random.randint(200, 600)
+rand_xgb_learning_rate    = lambda: random.choice([0.03, 0.05, 0.1])
+rand_xgb_max_depth        = lambda: random.choice([3, 4, 5, 6])
+rand_xgb_subsample        = lambda: random.choice([0.7, 0.8, 1.0])
+rand_xgb_colsample_bytree = lambda: random.choice([0.7, 0.8, 1.0])
+rand_xgb_reg_lambda       = lambda: 10 ** random.uniform(-1, 1)
 
 # -------------------- ساخت فرد --------------------
 # ---------------------------------------------------------------------------
@@ -169,22 +189,48 @@ def _suppress_warnings() -> None:
 
 
 def create_individual() -> creator.Individual:
-    """یک فرد تصادفی می‌سازد."""
+    """یک فرد تصادفی می‌سازد (۴ مدل + پنجره + کالیبراسیون)."""
     penalty = rand_penalty()
     solver = rand_solver() if penalty == "l2" else "saga"   # l1 ⇒ فقط saga
 
-    multi   = rand_multi_class()
+    multi = rand_multi_class()
     if solver == "liblinear" and multi == "multinomial":
         multi = random.choice(["auto", "ovr"])
 
     return creator.Individual([
-        rand_C(), rand_max_iter(), rand_tol(),
-        penalty, solver,
-        rand_fit_intercept(), rand_class_weight(),
-        multi,
-        rand_window_size(),         # ژن ۸
-        rand_calib()                # ژن ۹ : calib_method
-])
+        # --- Logistic Regression ---
+        rand_C(),               # 0
+        rand_max_iter(),        # 1
+        rand_tol(),             # 2
+        penalty,                # 3
+        solver,                 # 4
+        rand_fit_intercept(),   # 5
+        rand_class_weight(),    # 6
+        multi,                  # 7
+        rand_window_size(),     # 8
+        rand_calib(),           # 9
+
+        # --- Random Forest ---
+        rand_rf_n_estimators(),     # 10
+        rand_rf_max_depth(),        # 11
+        rand_rf_min_samples_leaf(), # 12
+        rand_rf_max_features(),     # 13
+        rand_rf_class_weight(),     # 14
+
+        # --- HistGradientBoosting ---
+        rand_hgb_learning_rate(),   # 15
+        rand_hgb_max_depth(),       # 16
+        rand_hgb_max_leaf_nodes(),  # 17
+        rand_hgb_max_iter(),        # 18
+
+        # --- XGBoost ---
+        rand_xgb_n_estimators(),    # 19
+        rand_xgb_learning_rate(),   # 20
+        rand_xgb_max_depth(),       # 21
+        rand_xgb_subsample(),       # 22
+        rand_xgb_colsample_bytree(),# 23
+        rand_xgb_reg_lambda(),      # 24
+    ])
 
 
 # -------------------- جهش --------------------
@@ -193,18 +239,40 @@ def mutate_ind(ind: creator.Individual, indpb: float = 0.2):
     for i in range(len(ind)):
         if random.random() >= indpb:
             continue
-        if   i == 0: ind[0] = rand_C()
-        elif i == 1: ind[1] = rand_max_iter()
-        elif i == 2: ind[2] = rand_tol()
-        elif i == 3: ind[3] = rand_penalty()
-        elif i == 4: ind[4] = rand_solver()
-        elif i == 5: ind[5] = rand_fit_intercept()
-        elif i == 6: ind[6] = rand_class_weight()
-        elif i == 7: ind[7] = rand_multi_class()
-        elif i == 8: ind[8] = rand_window_size()
-        elif i == 9: ind[9] = rand_calib()
-    
-    # سازگاری‌ها
+
+        if   i == 0:  ind[0]  = rand_C()
+        elif i == 1:  ind[1]  = rand_max_iter()
+        elif i == 2:  ind[2]  = rand_tol()
+        elif i == 3:  ind[3]  = rand_penalty()
+        elif i == 4:  ind[4]  = rand_solver()
+        elif i == 5:  ind[5]  = rand_fit_intercept()
+        elif i == 6:  ind[6]  = rand_class_weight()
+        elif i == 7:  ind[7]  = rand_multi_class()
+        elif i == 8:  ind[8]  = rand_window_size()
+        elif i == 9:  ind[9]  = rand_calib()
+
+        # RF
+        elif i == 10: ind[10] = rand_rf_n_estimators()
+        elif i == 11: ind[11] = rand_rf_max_depth()
+        elif i == 12: ind[12] = rand_rf_min_samples_leaf()
+        elif i == 13: ind[13] = rand_rf_max_features()
+        elif i == 14: ind[14] = rand_rf_class_weight()
+
+        # HGB
+        elif i == 15: ind[15] = rand_hgb_learning_rate()
+        elif i == 16: ind[16] = rand_hgb_max_depth()
+        elif i == 17: ind[17] = rand_hgb_max_leaf_nodes()
+        elif i == 18: ind[18] = rand_hgb_max_iter()
+
+        # XGB
+        elif i == 19: ind[19] = rand_xgb_n_estimators()
+        elif i == 20: ind[20] = rand_xgb_learning_rate()
+        elif i == 21: ind[21] = rand_xgb_max_depth()
+        elif i == 22: ind[22] = rand_xgb_subsample()
+        elif i == 23: ind[23] = rand_xgb_colsample_bytree()
+        elif i == 24: ind[24] = rand_xgb_reg_lambda()
+
+    # سازگاری‌های لاجستیک
     penalty, solver, multi = ind[3], ind[4], ind[7]
     if penalty == "l1" and solver not in ["liblinear", "saga"]:
         ind[4] = random.choice(["liblinear", "saga"])
@@ -243,98 +311,85 @@ def pool_init(data_train: pd.DataFrame,
 # ارزیابی یک فولد (انتخاب ویژگی درون‑فولد)
 # ---------------------------------------------------------------------------
 
-def _fit_and_score_fold(tr_idx, ts_idx, X_full, y_full, price_series, hyper, calib_method):
-   
+def _fit_and_score_fold(tr_idx, ts_idx, X_full, y_full, price_series, hyper_all, calib_method):
+    """
+    یک فولد TimeSeriesSplit:
+    - انتخاب فیچرها (درون فولد)
+    - آموزش ۴ مدل (logreg / rf / hgb / xgb)
+    - ساخت EnsembleModel
+    - محاسبه Sharpe / MaxDD / BalAcc بر اساس رأی‌گیری ساده (threshold=0.5)
+    """
     X_tr_raw, y_tr = X_full.iloc[tr_idx], y_full.iloc[tr_idx]
     X_ts_raw, y_ts = X_full.iloc[ts_idx], y_full.iloc[ts_idx]
 
-    # --- PATCH: از همین‌جا فقط ستون‌های عددی را نگه می‌داریم ---
+    # فقط ستون‌های عددی
     num_cols = X_tr_raw.select_dtypes(include=[np.number]).columns
     X_tr_raw = X_tr_raw[num_cols]
     X_ts_raw = X_ts_raw[num_cols]
     if X_tr_raw.shape[1] == 0:
         return 0.0
 
+    # انتخاب فیچر درون فولد
     feats = PREP_SHARED.select_features(X_tr_raw, y_tr)
     if not feats:
         return 0.0
 
     X_tr, X_ts = X_tr_raw[feats], X_ts_raw[feats]
 
-    # --- PATCH: پاک‌سازی NaN / Inf قبل از مدل ---
+    # پاک‌سازی NaN / Inf
     for df in (X_tr, X_ts):
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         if df.isna().any().any():
             df.fillna(df.median(), inplace=True)
 
+    # ۴ ModelPipeline بدون کالیبراسیون (برای سرعت GA)
+    models: list[ModelPipeline] = []
+    for algo in ("logreg", "rf", "hgb", "xgb"):
+        h = hyper_all[algo]
+        mp = ModelPipeline(
+            h,
+            algo=algo,
+            calibrate=False,
+            calib_method=calib_method,
+            use_smote_in_fit=True,  # SMOTE فقط روی TRAIN فولد
+        ).fit(X_tr, y_tr)
+        models.append(mp)
 
-    # prepared_df = X_tr.copy()
-    # prepared_df["target"] = y_tr.values
+    ens = EnsembleModel(models=models, names=["logreg", "rf", "hgb", "xgb"], vote_k=3)
 
-    # # مسیر فایل
-    # save_path = "prepared_train_data.csv"
+    # پیش‌بینی کلاس با رأی‌گیری (threshold=0.5)
+    y_pred = ens.predict(X_ts)    # 0 یا 1
 
-    # # اگر فایل هنوز وجود ندارد، آن را ذخیره کن
-    # if not os.path.exists(save_path):
-    #     prepared_df.to_csv(save_path, index=False)
-    #     LOGGER.info(f"[SAVE] Prepared training data saved to {save_path} "
-    #                 f"(rows={len(prepared_df)}, cols={prepared_df.shape[1]})")
-    # else:
-    #     LOGGER.info(f"[SKIP] File {save_path} already exists — skipping save.")
-
-    # در مرحله GA کالیبراسیون را خاموش می‌کنیم تا سریع و بدون لیکیج باشد
-    # --- PATCH: استفاده از SMOTE داخل هر فولد برای بالانس کردن y_tr ---
-    pipe = ModelPipeline(
-        hyper,
-        calibrate=False,
-        calib_method=calib_method,
-        use_smote_in_fit=True,   # ← oversampling فقط روی داده‌ی TRAIN این فولد
-    ).fit(X_tr, y_tr)
-
-    y_pred = pipe.predict(X_ts)       # 1 = لانگ، 0 = نقد
-
-    # ── استخراج قیمت خام (ستون 30T_close) ──
+    # ── قیمت‌ها ─────────────────────────────────────────────
     prices = price_series.iloc[ts_idx].astype(float).values
-    
-    if len(prices) < 2:               # داده‌ی خیلی کم
+    if len(prices) < 2:
         return 0.0
 
-    # ── بازده بازار و بازده استراتژی ──
     ret_mkt = np.diff(prices) / prices[:-1]
 
-    pos_shift = np.roll(y_pred, 1)    # پوزیشنِ کندل قبلی
-    pos_shift[0] = 0                  # اولین کندل → No-Trade
-    pos_shift = pos_shift[:-1]        # طول = len(ret_mkt)
+    pos_shift = np.roll(y_pred, 1)
+    pos_shift[0] = 0
+    pos_shift = pos_shift[:-1]
 
     ret_str = np.where(pos_shift == 1, ret_mkt, 0.0)
-
-
     ret_ser = pd.Series(ret_str)
     std = ret_ser.std()
     if (std is None) or (std == 0) or np.isnan(std):
-        return 0.0                    # استراتژی بی‌تحرک یا انحراف صفر
+        return 0.0
 
-    # Sharpe Ratio سالانه‌شده (برای 48 کندل ۳۰-دقیقه‌ای در روز)
     periods_per_year = 252 * 48
     sharpe = ret_ser.mean() / std * np.sqrt(periods_per_year)
 
-    # Max-DrawDown
     cum_equity = ret_ser.add(1).cumprod()
     max_dd = (cum_equity.cummax() - cum_equity).max()
 
-    # امتیاز نهایی = Sharpe – DrawDown (می‌توانی فرمول دیگری بگذاری)
-    # --- Sharpe و Max-DD محاسبه شدند ---
-
-    # ➊ Balanced Accuracy
     bal_acc = balanced_accuracy_score(y_ts, y_pred)
-    
     if bal_acc < 0.55:
         return 0.0
-    # ➋ ترکیب دو معیار در یک Fitness
-    #    ضریبِ 1 برای Score و 1 برای BalAcc → می‌توان تغییر داد
-    norm_sharpe = (np.tanh(sharpe / 5) + 1) / 2       # ۰…۱
-    norm_dd     = 1.0 - min(max_dd, 1.0)              # ۰…۱
-    fitness     = 0.4 * norm_sharpe + 0.4 * norm_dd + 0.2 * bal_acc
+
+    norm_sharpe = (np.tanh(sharpe / 5) + 1) / 2
+    norm_dd = 1.0 - min(max_dd, 1.0)
+    fitness = 0.4 * norm_sharpe + 0.4 * norm_dd + 0.2 * bal_acc
 
     return fitness
 
@@ -346,32 +401,40 @@ def _fit_and_score_fold(tr_idx, ts_idx, X_full, y_full, price_series, hyper, cal
 
 def evaluate_cv(ind):
     """
-    تابع fitness برای GA.
-    - داخل خودش تایم‌اوت 3 ساعته با signal.alarm پیاده شده است
-      تا با multiprocessing قابل pickling باشد.
+    تابع fitness برای GA روی ensemble چهارمدلی.
+    کروموزوم:
+        0..7  : لاجستیک
+        8     : window
+        9     : calib_method
+        10..14: RF
+        15..18: HGB
+        19..24: XGB
     """
-    # مدت تایم‌اوت بر حسب ثانیه
     timeout_seconds = 10800  # 3 ساعت
     old_handler = None
 
-    # فقط اگر SIGALRM روی این پلتفرم وجود دارد (لینوکس)، تایم‌اوت را فعال کن
     if hasattr(signal, "SIGALRM"):
         def _handle_timeout(signum, frame):
             raise TimeoutError("Timeout reached in evaluate_cv")
-        # هندلر قبلی را نگه می‌داریم تا در انتها برگردانیم
         old_handler = signal.signal(signal.SIGALRM, _handle_timeout)
         signal.alarm(timeout_seconds)
 
     try:
-        # ---------------- sanity check اشتراک داده‌ها ----------------
         if any(v is None for v in (DATA_TRAIN_SHARED, PREP_SHARED)):
             raise RuntimeError("Shared globals not ready!")
 
-        (C, max_iter, tol, penalty, solver,
-         fit_intercept, class_weight, multi_class,
-         window, calib_method) = ind
+        (
+            C, max_iter, tol, penalty, solver,
+            fit_intercept, class_weight, multi_class,
+            window, calib_method,
+            rf_n_estimators, rf_max_depth, rf_min_samples_leaf,
+            rf_max_features, rf_class_weight,
+            hgb_lr, hgb_max_depth, hgb_max_leaf_nodes, hgb_max_iter,
+            xgb_n_estimators, xgb_lr, xgb_max_depth, xgb_subsample,
+            xgb_colsample, xgb_reg_lambda,
+        ) = ind
 
-        # ---------------- ناسازگاری‌های سریع ----------------
+        # ناسازگاری‌های لاجستیک
         if penalty == "l1" and solver not in ["liblinear", "saga"]:
             return (0.0,)
         if penalty == "l2" and solver not in ["lbfgs", "liblinear", "sag", "saga"]:
@@ -379,54 +442,87 @@ def evaluate_cv(ind):
         if solver == "liblinear" and multi_class == "multinomial":
             return (0.0,)
 
-        # ---------------- آماده‌سازی X, y, price ----------------
+        # آماده‌سازی داده
         X, y, _, price_ser = PREP_SHARED.ready(
             DATA_TRAIN_SHARED,
-            window=window,
-            selected_features=[],    # در GA، انتخاب فیچر درون فولد انجام می‌شود
+            window=int(window),
+            selected_features=[],    # انتخاب فیچر درون فولد
             mode="train",
             predict_drop_last=False,
-            train_drop_last=False    # ❗ هیچ حذف اضافه‌ای روی سطر آخر
+            train_drop_last=False,
         )
         if X.empty:
             return (0.0,)
 
         LOGGER.info(f"evaluate_cv started PID={os.getpid()} window={window}")
 
-        # --- فقط ستون‌های عددی را نگه دار (حذف datetime و غیره) ---
         num_cols = X.select_dtypes(include=[np.number]).columns
         if len(num_cols) == 0:
             LOGGER.warning("evaluate_cv: no numeric columns after dtype filter; returning 0")
             return (0.0,)
-
         dropped = [c for c in X.columns if c not in num_cols]
         if dropped:
             LOGGER.info("evaluate_cv: dropping non-numeric columns from X: %s", dropped)
-
         X = X[num_cols]
 
-        hyper = {
+        # لاجستیک
+        hyper_logreg = {
             "C": C,
-            "max_iter": max_iter,
+            "max_iter": int(max_iter),
             "tol": tol,
             "penalty": penalty,
             "solver": solver,
-            "fit_intercept": fit_intercept,
-            # "class_weight": class_weight,
+            "fit_intercept": bool(fit_intercept),
+            "class_weight": class_weight,
             "multi_class": multi_class,
         }
+        if hyper_logreg.get("class_weight") == "balanced":
+            hyper_logreg["class_weight"] = None
 
-        # ---------------- TimeSeriesSplit + امتیاز ----------------
+        # RF
+        hyper_rf = {
+            "n_estimators": int(rf_n_estimators),
+            "max_depth": None if rf_max_depth in (None, "None") else int(rf_max_depth),
+            "min_samples_leaf": max(1, int(rf_min_samples_leaf)),
+            "max_features": rf_max_features,
+            "class_weight": rf_class_weight,
+        }
+
+        # HGB
+        hyper_hgb = {
+            "learning_rate": float(hgb_lr),
+            "max_depth": None if hgb_max_depth in (None, "None") else int(hgb_max_depth),
+            "max_leaf_nodes": int(hgb_max_leaf_nodes),
+            "max_iter": int(hgb_max_iter),
+        }
+
+        # XGB
+        hyper_xgb = {
+            "n_estimators": int(xgb_n_estimators),
+            "learning_rate": float(xgb_lr),
+            "max_depth": int(xgb_max_depth),
+            "subsample": float(xgb_subsample),
+            "colsample_bytree": float(xgb_colsample),
+            "reg_lambda": float(xgb_reg_lambda),
+        }
+
+        hyper_all = {
+            "logreg": hyper_logreg,
+            "rf": hyper_rf,
+            "hgb": hyper_hgb,
+            "xgb": hyper_xgb,
+            "calib_method": calib_method,
+        }
+
         tscv = TimeSeriesSplit(n_splits=3)
         scores = []
         for tr, ts in tscv.split(X, y):
-            s = _fit_and_score_fold(tr, ts, X, y, price_ser, hyper, calib_method)
+            s = _fit_and_score_fold(tr, ts, X, y, price_ser, hyper_all, calib_method)
             scores.append(s)
 
         return (float(np.mean(scores)) if scores else 0.0,)
 
     except TimeoutError:
-        # تایم‌اوت اختصاصی این تابع
         LOGGER.warning("Timeout in evaluate_cv; returning 0")
         return (0.0,)
 
@@ -435,14 +531,12 @@ def evaluate_cv(ind):
         return (0.0,)
 
     finally:
-        # تایم‌اوت را خاموش کن و هندلر قبلی را برگردان
         if hasattr(signal, "SIGALRM"):
             signal.alarm(0)
             if old_handler is not None:
                 try:
                     signal.signal(signal.SIGALRM, old_handler)
                 except Exception:
-                    # اگر به هر دلیل نتوانستیم هندلر قبلی را برگردانیم، فقط نادیده می‌گیریم
                     pass
 
 
@@ -458,8 +552,16 @@ TOOLBOX.register("select", tools.selTournament, tournsize=3)
 # ---------------------------------------------------------------------------
 class GeneticAlgorithmRunner:
     def __init__(self):
+        # آستانه‌های ensemble (روی احتمال میانگین)
         self.neg_thr = 0.5
         self.pos_thr = 0.5
+
+        # آستانه‌های جداگانه برای هر مدل در ensemble
+        self.neg_thrs: list[float] = []
+        self.pos_thrs: list[float] = []
+        self.model_names: list[str] = []
+
+        # ستون‌های نهایی TRAIN بعد از window
         self.final_cols: list[str] = []
 
     # ----------------------- main -----------------------
@@ -625,26 +727,40 @@ class GeneticAlgorithmRunner:
                     
     # ---------------- helpers ----------------
     def _build_final_model(self, ind, data_tr, prep):
-        (C, max_iter, tol, penalty, solver,
-         fit_intercept, class_weight, multi_class,
-         window, calib_method) = ind
+        """
+        آموزش نهایی ۴ مدل (logreg, rf, hgb, xgb) روی کل train
+        و ساخت یک EnsembleModel کالیبره‌شده.
+        """
+        (
+            C, max_iter, tol, penalty, solver,
+            fit_intercept, class_weight, multi_class,
+            window, calib_method,
+            rf_n_estimators, rf_max_depth, rf_min_samples_leaf,
+            rf_max_features, rf_class_weight,
+            hgb_lr, hgb_max_depth, hgb_max_leaf_nodes, hgb_max_iter,
+            xgb_n_estimators, xgb_lr, xgb_max_depth, xgb_subsample,
+            xgb_colsample, xgb_reg_lambda,
+        ) = ind
 
-        # --- آماده‌سازی X,y با هندل خطا ---
+        # --- آماده‌سازی X,y ---
         try:
             X, y, feats, _ = prep.ready(
                 data_tr,
-                window=window,
-                selected_features=None,   # این‌جا خود ready انتخاب فیچر انجام می‌دهد
+                window=int(window),
+                selected_features=None,   # انتخاب فیچر در خود ready
                 mode="train",
                 predict_drop_last=False,
-                train_drop_last=False     # ❗
+                train_drop_last=False,
             )
-        
-            # ---- Save prepared training data for reuse ----
+
+            # ذخیره‌ی دیتا برای اسکریپت تست ۴ مدلی (همان قبلی)
             prepared_df = X.copy()
             prepared_df["target"] = y.values
             prepared_df.to_csv("prepared_train_data.csv", index=False)
-            LOGGER.info(f"[SAVE] Prepared training data saved to prepared_train_data.csv (rows={len(prepared_df)}, cols={prepared_df.shape[1]})")
+            LOGGER.info(
+                "[SAVE] Prepared training data saved to prepared_train_data.csv "
+                f"(rows={len(prepared_df)}, cols={prepared_df.shape[1]})"
+            )
 
         except Exception as e:
             LOGGER.exception("[_build_final_model] prep.ready failed: %s", e)
@@ -654,7 +770,7 @@ class GeneticAlgorithmRunner:
             LOGGER.error("[_build_final_model] Empty X/y after ready(); aborting final model.")
             return None, []
 
-        # --- فقط ستون‌های عددی + پاک‌سازی NaN/Inf ---
+        # فقط عددی + پاک‌سازی
         num_cols = X.select_dtypes(include=[np.number]).columns
         dropped = [c for c in X.columns if c not in num_cols]
         if dropped:
@@ -662,65 +778,129 @@ class GeneticAlgorithmRunner:
         X = X[num_cols].copy()
 
         X.replace([np.inf, -np.inf], np.nan, inplace=True)
-
         all_nan_cols = X.columns[X.isna().all()].tolist()
         if all_nan_cols:
             LOGGER.warning("[_build_final_model] dropping all-NaN columns before fit: %s", all_nan_cols)
             X.drop(columns=all_nan_cols, inplace=True)
-
         if X.isna().any().any():
             X.fillna(X.median(), inplace=True)
-
         if X.empty:
             LOGGER.error("[_build_final_model] X became empty after cleaning; aborting final model.")
             return None, []
 
-        # --- سازگاری hyperparams با LogisticRegression (همان گاردهای evaluate_cv) ---
+        # سازگاری لاجستیک
         if penalty == "l1" and solver not in ["liblinear", "saga"]:
-            LOGGER.warning("[_build_final_model] fixing incompatible (penalty=%s, solver=%s) → saga", penalty, solver)
+            LOGGER.warning(
+                "[_build_final_model] fixing incompatible (penalty=%s, solver=%s) → saga",
+                penalty, solver,
+            )
             solver = "saga"
         if penalty == "l2" and solver not in ["lbfgs", "liblinear", "sag", "saga"]:
-            LOGGER.warning("[_build_final_model] fixing incompatible (penalty=%s, solver=%s) → lbfgs", penalty, solver)
+            LOGGER.warning(
+                "[_build_final_model] fixing incompatible (penalty=%s, solver=%s) → lbfgs",
+                penalty, solver,
+            )
             solver = "lbfgs"
         if solver == "liblinear" and multi_class == "multinomial":
-            LOGGER.warning("[_build_final_model] fixing incompatible multi_class=multinomial with liblinear → ovr")
+            LOGGER.warning(
+                "[_build_final_model] fixing incompatible multi_class=multinomial with liblinear → ovr"
+            )
             multi_class = "ovr"
 
-        hyper = {
+        # لاجستیک
+        hyper_logreg = {
             "C": C,
-            "max_iter": max_iter,
+            "max_iter": int(max_iter),
             "tol": tol,
             "penalty": penalty,
             "solver": solver,
-            "fit_intercept": fit_intercept,
+            "fit_intercept": bool(fit_intercept),
             "class_weight": class_weight,
             "multi_class": multi_class,
         }
-        # چون مدل نهایی را با SMOTE آموزش می‌دهیم، از وزن‌دهی balanced صرف‌نظر کنیم
-        if class_weight == "balanced":
-            hyper["class_weight"] = None
+        if hyper_logreg.get("class_weight") == "balanced":
+            hyper_logreg["class_weight"] = None
 
-        # --- آموزش مدل با هندل خطا ---
+        # RF
+        hyper_rf = {
+            "n_estimators": int(rf_n_estimators),
+            "max_depth": None if rf_max_depth in (None, "None") else int(rf_max_depth),
+            "min_samples_leaf": max(1, int(rf_min_samples_leaf)),
+            "max_features": rf_max_features,
+            "class_weight": rf_class_weight,
+        }
+
+        # HGB
+        hyper_hgb = {
+            "learning_rate": float(hgb_lr),
+            "max_depth": None if hgb_max_depth in (None, "None") else int(hgb_max_depth),
+            "max_leaf_nodes": int(hgb_max_leaf_nodes),
+            "max_iter": int(hgb_max_iter),
+        }
+
+        # XGB
+        hyper_xgb = {
+            "n_estimators": int(xgb_n_estimators),
+            "learning_rate": float(xgb_lr),
+            "max_depth": int(xgb_max_depth),
+            "subsample": float(xgb_subsample),
+            "colsample_bytree": float(xgb_colsample),
+            "reg_lambda": float(xgb_reg_lambda),
+        }
+
+        # --- آموزش چهار مدل با کالیبراسیون ---
         try:
-            model = ModelPipeline(
-                hyper,
+            mdl_lr = ModelPipeline(
+                hyper_logreg,
+                algo="logreg",
                 calibrate=True,
                 calib_method=calib_method,
-                use_smote_in_fit=True,          # ← روشن
+                use_smote_in_fit=True,
             ).fit(X, y)
+
+            mdl_rf = ModelPipeline(
+                hyper_rf,
+                algo="rf",
+                calibrate=True,
+                calib_method=calib_method,
+                use_smote_in_fit=True,
+            ).fit(X, y)
+
+            mdl_hgb = ModelPipeline(
+                hyper_hgb,
+                algo="hgb",
+                calibrate=True,
+                calib_method=calib_method,
+                use_smote_in_fit=True,
+            ).fit(X, y)
+
+            mdl_xgb = ModelPipeline(
+                hyper_xgb,
+                algo="xgb",
+                calibrate=True,
+                calib_method=calib_method,
+                use_smote_in_fit=True,
+            ).fit(X, y)
+
         except Exception as e:
-            LOGGER.exception("[_build_final_model] ModelPipeline.fit failed: %s", e)
+            LOGGER.exception("[_build_final_model] Ensemble fit failed: %s", e)
             return None, []
 
-        self.final_cols = list(X.columns)
-        LOGGER.info("[helper] Final model built with %d features", len(self.final_cols))
+        ensemble = EnsembleModel(
+            [mdl_lr, mdl_rf, mdl_hgb, mdl_xgb],
+            names=["logreg", "rf", "hgb", "xgb"],
+            vote_k=3,
+        )
+        self.model_names = ["logreg", "rf", "hgb", "xgb"]
 
-        # --- اسکیلر برای DriftChecker ---
-        scaler = None
+        self.final_cols = list(X.columns)
+        LOGGER.info("[helper] Final ensemble built with %d features", len(self.final_cols))
+
+        # DriftChecker
         try:
-            scaler = model.get_scaler()
+            scaler = ensemble.get_scaler()
         except Exception:
-            pass
+            scaler = None
 
         try:
             if (scaler is not None) and hasattr(scaler, "mean_"):
@@ -731,13 +911,13 @@ class GeneticAlgorithmRunner:
                 X_proc = _tmp.transform(X)
         except Exception as e:
             LOGGER.warning(
-                "[_build_final_model] scaler transform failed (%s); refitting temporary StandardScaler", e
+                "[_build_final_model] scaler transform failed (%s); refitting temporary StandardScaler",
+                e,
             )
             from sklearn.preprocessing import StandardScaler
             _tmp = StandardScaler().fit(X)
             X_proc = _tmp.transform(X)
 
-        # --- DriftChecker نباید باعث fail شدن کل فاز نهایی شود ---
         try:
             DriftChecker(verbose=False).fit_on_train(
                 pd.DataFrame(X_proc, columns=X.columns),
@@ -748,27 +928,33 @@ class GeneticAlgorithmRunner:
         except Exception as e:
             LOGGER.exception("[_build_final_model] DriftChecker failed; skipping drift save: %s", e)
 
-        return model, feats
+        return ensemble, feats
 
     def _run_thresholds(self, model, data_thr, prep, ind, feats):
+        """
+        روی دیتای threshold:
+        - اگر model یک EnsembleModel باشد:
+            * برای هر مدل داخلی یک جفت آستانه (neg,pos) پیدا می‌کند.
+            * برای احتمال میانگین ensemble هم یک آستانه‌ی کلی می‌سازد.
+        - در غیر این صورت، رفتار قبلی (یک مدل) حفظ می‌شود.
+        """
         if data_thr.empty:
             LOGGER.info("[threshold] No threshold data … skipped")
             return
 
         window = ind[8]
-        
+
         X_thr, y_thr, _, _ = prep.ready(
             data_thr,
-            window=window,
+            window=int(window),
             selected_features=self.final_cols,   # همان ستون‌های نهایی TRAIN
             mode="train",
             predict_drop_last=False,
-            train_drop_last=False                # ❗
+            train_drop_last=False,
         )
 
         X_thr = X_thr[self.final_cols]
 
-        # --- PATCH: پاک‌سازی X_thr قبل از predict_proba ---
         X_thr.replace([np.inf, -np.inf], np.nan, inplace=True)
         all_nan_cols = X_thr.columns[X_thr.isna().all()].tolist()
         if all_nan_cols:
@@ -782,12 +968,46 @@ class GeneticAlgorithmRunner:
             LOGGER.info("[threshold] X_thr empty – skipped after cleaning")
             return
 
-        y_prob = model.predict_proba(X_thr)[:, 1]
-
         tf = ThresholdFinder(steps=200, min_predictions_ratio=2/3)
+
+        # ---------- حالت Ensemble ----------
+        if isinstance(model, EnsembleModel):
+            names = getattr(model, "names", [f"model_{i}" for i in range(len(model.models))])
+            self.model_names = list(names)
+            self.neg_thrs = []
+            self.pos_thrs = []
+
+            for idx, m in enumerate(model.models):
+                y_prob_i = m.predict_proba(X_thr)[:, 1]
+                neg_i, pos_i, acc_i, *_ = tf.find_best_thresholds(y_prob_i, y_thr.values)
+                self.neg_thrs.append(float(neg_i))
+                self.pos_thrs.append(float(pos_i))
+                LOGGER.info(
+                    "[threshold] %s: neg=%.3f · pos=%.3f · bal_acc=%.4f",
+                    names[idx],
+                    neg_i,
+                    pos_i,
+                    acc_i,
+                )
+
+            # آستانه‌ی کلی روی احتمال میانگین ensemble
+            y_prob_ens = model.predict_proba(X_thr)[:, 1]
+            self.neg_thr, self.pos_thr, best_acc, *_ = tf.find_best_thresholds(
+                y_prob_ens, y_thr.values
+            )
+            LOGGER.info(
+                "[threshold] ensemble: neg=%.3f · pos=%.3f · bal_acc=%.4f",
+                self.neg_thr,
+                self.pos_thr,
+                best_acc,
+            )
+            return
+
+        # ---------- حالت یک‌مدلی (سازگاری قبلی) ----------
+        y_prob = model.predict_proba(X_thr)[:, 1]
         self.neg_thr, self.pos_thr, best_acc, *_ = tf.find_best_thresholds(y_prob, y_thr.values)
         LOGGER.info(
-            f"[threshold] neg={self.neg_thr:.3f} · pos={self.pos_thr:.3f} · bal_acc={best_acc:.4f}"
+            f"[threshold] single-model neg={self.neg_thr:.3f} · pos={self.pos_thr:.3f} · bal_acc={best_acc:.4f}"
         )
 
     def _eval(self, model, data_part, prep, ind, feats, label="Test"):
@@ -833,10 +1053,25 @@ class GeneticAlgorithmRunner:
             return
         
         # ── پیش‌بینی با دو آستانه ─────────────────────────────
-        y_prob = model.predict_proba(X)[:, 1]
-        y_pred = np.full(len(y_prob), -1, dtype=int)   # ← اینجا
-        y_pred[y_prob <= self.neg_thr] = 0
-        y_pred[y_prob >= self.pos_thr] = 1
+        # ── پیش‌بینی نهایی ─────────────────────────────
+        if isinstance(model, EnsembleModel) and self.neg_thrs and self.pos_thrs:
+            # رأی‌گیری با آستانه‌های جداگانه برای هر مدل
+            y_pred = model.predict_actions(
+                X,
+                self.neg_thrs,
+                self.pos_thrs,
+                min_conf_models=3,
+                buy_ratio=0.7,
+                sell_ratio=0.3,
+            )
+            # برای گزارش، احتمال میانگین ensemble را هم نگه می‌داریم
+            y_prob = model.predict_proba(X)[:, 1]
+        else:
+            # حالت تک‌مدلی قبلی
+            y_prob = model.predict_proba(X)[:, 1]
+            y_pred = np.full(len(y_prob), -1, dtype=int)
+            y_pred[y_prob <= self.neg_thr] = 0
+            y_pred[y_prob >= self.pos_thr] = 1
         # --- هم‌ترازی ایمن: اگر به هر دلیل طول‌ها متفاوت بود، کوتاه کن
         if len(price_ser) != len(y_pred):
             min_len = min(len(price_ser), len(y_pred))
@@ -897,33 +1132,98 @@ class GeneticAlgorithmRunner:
         )
 
     def _save(self, model, ind, feats):
-        (C, max_iter, tol, penalty, solver,
-         fit_intercept, class_weight, multi_class,
-         window, calib_method) = ind
-        hyper = {
-            "C":C,"max_iter":max_iter,"tol":tol,"penalty":penalty,
-            "solver":solver,"fit_intercept":fit_intercept,
-            "class_weight":class_weight,"multi_class":multi_class
+        """
+        ذخیره‌ی EnsembleModel + هایپرپارامترهای هر چهار مدل + آستانه‌ها.
+        """
+        (
+            C, max_iter, tol, penalty, solver,
+            fit_intercept, class_weight, multi_class,
+            window, calib_method,
+            rf_n_estimators, rf_max_depth, rf_min_samples_leaf,
+            rf_max_features, rf_class_weight,
+            hgb_lr, hgb_max_depth, hgb_max_leaf_nodes, hgb_max_iter,
+            xgb_n_estimators, xgb_lr, xgb_max_depth, xgb_subsample,
+            xgb_colsample, xgb_reg_lambda,
+        ) = ind
+
+        # سازگاری لاجستیک
+        if penalty == "l1" and solver not in ["liblinear", "saga"]:
+            solver = "saga"
+        if penalty == "l2" and solver not in ["lbfgs", "liblinear", "sag", "saga"]:
+            solver = "lbfgs"
+        if solver == "liblinear" and multi_class == "multinomial":
+            multi_class = "ovr"
+
+        hyper_logreg = {
+            "C": C,
+            "max_iter": int(max_iter),
+            "tol": tol,
+            "penalty": penalty,
+            "solver": solver,
+            "fit_intercept": bool(fit_intercept),
+            "class_weight": class_weight,
+            "multi_class": multi_class,
         }
+        if hyper_logreg.get("class_weight") == "balanced":
+            hyper_logreg["class_weight"] = None
+
+        hyper_rf = {
+            "n_estimators": int(rf_n_estimators),
+            "max_depth": None if rf_max_depth in (None, "None") else int(rf_max_depth),
+            "min_samples_leaf": max(1, int(rf_min_samples_leaf)),
+            "max_features": rf_max_features,
+            "class_weight": rf_class_weight,
+        }
+
+        hyper_hgb = {
+            "learning_rate": float(hgb_lr),
+            "max_depth": None if hgb_max_depth in (None, "None") else int(hgb_max_depth),
+            "max_leaf_nodes": int(hgb_max_leaf_nodes),
+            "max_iter": int(hgb_max_iter),
+        }
+
+        hyper_xgb = {
+            "n_estimators": int(xgb_n_estimators),
+            "learning_rate": float(xgb_lr),
+            "max_depth": int(xgb_max_depth),
+            "subsample": float(xgb_subsample),
+            "colsample_bytree": float(xgb_colsample),
+            "reg_lambda": float(xgb_reg_lambda),
+        }
+
+        hyper_all = {
+            "logreg": hyper_logreg,
+            "rf": hyper_rf,
+            "hgb": hyper_hgb,
+            "xgb": hyper_xgb,
+            "calib_method": calib_method,
+            "model_names": self.model_names,
+            "neg_thrs": list(self.neg_thrs),
+            "pos_thrs": list(self.pos_thrs),
+            "neg_thr_ensemble": float(self.neg_thr),
+            "pos_thr_ensemble": float(self.pos_thr),
+        }
+
         try:
-            scaler = model.get_scaler()   # مطمئن و سازگار با CalibratedCV
+            scaler = model.get_scaler()
         except Exception:
             scaler = None
 
-        saver = ModelSaver(model_dir=".")   # یا مسیر دلخواه
+        saver = ModelSaver(model_dir=".")
         saver.save_full(
-            pipeline=model.pipeline,
-            hyperparams=hyper,
-            window_size=window,
-            neg_thr=self.neg_thr,
-            pos_thr=self.pos_thr,
+            pipeline=model,                     # خود EnsembleModel
+            hyperparams=hyper_all,
+            window_size=int(window),
+            neg_thr=float(self.neg_thr),        # آستانه‌ی ensemble (میانگین)
+            pos_thr=float(self.pos_thr),
             feats=feats,
             feat_mask=[],
             train_window_cols=list(self.final_cols),
+            scaler=scaler,
             train_distribution_path="train_distribution.json",
         )
-        
-        LOGGER.info("[save] All artefacts persisted to disk successfull")
+
+        LOGGER.info("[save] Ensemble model & artefacts persisted to disk successfully")
 
 # ---------------------------------------------------------------------------
 # اجرای مستقیم

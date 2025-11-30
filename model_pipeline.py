@@ -71,21 +71,11 @@ class _CompatWrapper:
 
 class ModelPipeline:
     """
-    StandardScaler + LogisticRegression (+ Calibration اختیاری)
-
-    - پارامترها:
-        hyperparams         : دیکت تنظیمات LogisticRegression (مانند C, penalty, solver, ...)
-        calibrate           : اگر True باشد، از CalibratedClassifierCV استفاده می‌شود.
-        calib_method        : 'sigmoid' یا 'isotonic'
-        use_smote_in_fit    : اگر True باشد، فقط در TRAIN هنگام fit بازنمونه‌گیری انجام می‌شود.
-                              (در مسیر inference/لایو اثری ندارد)
-        smote_kwargs        : دیکت اختیاری برای SMOTE (sampling_strategy, k_neighbors, ...)
-        random_state        : بذر تصادفی برای تکرارپذیری
-
-    - توجه: هیچ import از imblearn در سطح ماژول انجام نشده تا اگر imblearn نصب نباشد،
-            لایو/پیش‌بینی بی‌خطا بماند. تنها هنگام fit و فقط اگر use_smote_in_fit=True باشد،
-            SMOTE به‌صورت دینامیک import می‌شود.
+    Pipeline عمومی برای چند الگوریتم (logreg / rf / hgb / svm / xgb)
+    - در صورت نیاز StandardScaler را به‌عنوان مرحله‌ی اول اضافه می‌کند.
+    - کالیبراسیون اختیاری با CalibratedClassifierCV.
     """
+
     def __init__(
         self,
         hyperparams: Dict[str, Any],
@@ -101,25 +91,36 @@ class ModelPipeline:
         self.calibrate = bool(calibrate)
         self.calib_method = str(calib_method)
         self.use_smote_in_fit = bool(use_smote_in_fit)
-        self.algo = algo
-        # اگر SMOTE در fit فعال است، balanced را خنثی کن تا دوباره‌وزن‌دهی رخ ندهد
+        self.algo = (algo or "logreg").lower()
+
+        # اگر SMOTE در fit فعال است، class_weight='balanced' را خنثی کن
         if self.use_smote_in_fit and self.hyperparams.get("class_weight") == "balanced":
             self.hyperparams["class_weight"] = None
 
         self.smote_kwargs = dict(smote_kwargs or {})
         self.random_state = random_state
 
-        # پایپ‌لاین پایه: StandardScaler سپس LogisticRegression
-        clf = LogisticRegression(**self.hyperparams)
-        base = Pipeline([
-            ("scaler", StandardScaler()),
-            ("clf", clf),
-        ])
+        # مدل پایه بر اساس self.algo
+        base_clf = self._build_base_estimator()
 
-        # در صورت نیاز، کالیبراسیون احتمالات
-        model = CalibratedClassifierCV(base, method=self.calib_method, cv=3) if self.calibrate else base
+        # فقط برای مدل‌هایی که به اسکیل حساس‌اند، StandardScaler می‌گذاریم
+        if self.algo in ("logreg", "svm"):
+            base = Pipeline(
+                [
+                    ("scaler", StandardScaler()),
+                    ("clf", base_clf),
+                ]
+            )
+        else:
+            base = Pipeline([("clf", base_clf)])
 
-        # رَپر سازگار برای ذخیره و شبیه‌ساز
+        # کالیبراسیون احتمالات (برای مدل نهایی)
+        if self.calibrate:
+            model = CalibratedClassifierCV(base, method=self.calib_method, cv=3)
+        else:
+            model = base
+
+        # Wrapper سازگار
         self.pipeline = _CompatWrapper(model)
 
     # ---------------- public API ----------------
@@ -190,99 +191,184 @@ class ModelPipeline:
     def _build_base_estimator(self):
         """
         بر اساس self.algo مدل پایه را می‌سازد.
+        پشتیبانی‌شده: logreg, rf, hgb, svm, xgb
         """
-        algo = self.algo.lower()
+        algo = (self.algo or "logreg").lower()
         params = dict(self.hyperparams)
 
         if algo == "logreg":
+            params.setdefault("max_iter", 10_000)
             return LogisticRegression(**params)
 
         elif algo == "svm":
             from sklearn.svm import SVC
-            # پارامترهای ساده: C, kernel, gamma
-            default = dict(C=1.0, kernel="rbf", gamma="scale", probability=True)
-            default.update(params)
-            return SVC(**default)
+            base = dict(
+                C=1.0,
+                kernel="rbf",
+                gamma="scale",
+                probability=True,
+            )
+            base.update(params)
+            return SVC(**base)
 
         elif algo == "rf":
             from sklearn.ensemble import RandomForestClassifier
-            default = dict(
-                n_estimators=params.pop("n_estimators", 200),
+
+            base = dict(
+                n_estimators=params.pop("n_estimators", 300),
                 max_depth=params.pop("max_depth", None),
-                min_samples_leaf=params.pop("min_samples_leaf", 2),
+                min_samples_leaf=params.pop("min_samples_leaf", 1),
+                max_features=params.pop("max_features", "sqrt"),
+                class_weight=params.pop("class_weight", None),
                 n_jobs=-1,
                 random_state=self.random_state,
             )
-            return RandomForestClassifier(**default)
+            base.update(params)
+            return RandomForestClassifier(**base)
 
         elif algo == "hgb":
             from sklearn.ensemble import HistGradientBoostingClassifier
-            default = dict(
+
+            base = dict(
                 learning_rate=params.pop("learning_rate", 0.05),
                 max_depth=params.pop("max_depth", None),
                 max_leaf_nodes=params.pop("max_leaf_nodes", 31),
                 max_iter=params.pop("max_iter", 200),
                 random_state=self.random_state,
             )
-            return HistGradientBoostingClassifier(**default)
+            base.update(params)
+            return HistGradientBoostingClassifier(**base)
+
+        elif algo == "xgb":
+            try:
+                from xgboost import XGBClassifier  # type: ignore
+            except Exception as e:  # اگر xgboost نصب نباشد
+                raise ImportError(
+                    "algo='xgb' انتخاب شده اما کتابخانه xgboost نصب نیست (pip install xgboost)."
+                ) from e
+
+            base = dict(
+                n_estimators=params.pop("n_estimators", 300),
+                learning_rate=params.pop("learning_rate", 0.05),
+                max_depth=params.pop("max_depth", 5),
+                subsample=params.pop("subsample", 0.8),
+                colsample_bytree=params.pop("colsample_bytree", 0.8),
+                reg_lambda=params.pop("reg_lambda", 1.0),
+                n_jobs=-1,
+                eval_metric="logloss",
+                random_state=self.random_state,
+            )
+            base.update(params)
+            return XGBClassifier(**base)
 
         else:
             raise ValueError(f"Unknown algo={algo}")
 
 class EnsembleModel:
     """
-    نگه‌دارنده‌ی چند ModelPipeline و انجام رای‌گیری/تجمیع احتمالات.
+    نگه‌دارنده‌ی چند ModelPipeline و انجام vote / میانگین.
     """
 
-    def __init__(self, models: list[ModelPipeline], vote_k: int = 3):
+    def __init__(
+        self,
+        models: list[ModelPipeline],
+        names: Optional[list[str]] = None,
+        vote_k: int = 3,
+    ):
         if not models:
             raise ValueError("EnsembleModel needs at least one ModelPipeline")
         self.models = models
-        self.vote_k = vote_k
+        self.vote_k = int(vote_k)
+        if names is None:
+            names = [getattr(m, "algo", f"model_{i}") for i, m in enumerate(models)]
+        self.names = names
 
     def predict_proba(self, X):
         """
         احتمال نهایی = میانگین احتمال کلاس ۱ بین همه‌ی مدل‌ها.
+        خروجی: (n_samples, 2)
         """
         probs = [m.predict_proba(X)[:, 1] for m in self.models]
         avg = np.mean(np.vstack(probs), axis=0)
-        # برگرداندن در قالب (n_samples, 2) مثل اسکیک‌لرن
         p1 = avg
         p0 = 1.0 - p1
         return np.vstack([p0, p1]).T
 
-    def predict_actions(self, X, neg_thrs: list[float], pos_thrs: list[float]) -> np.ndarray:
+    def predict(self, X) -> np.ndarray:
         """
-        اعمال آستانه‌ی جداگانه برای هر مدل و رای‌گیری:
-        - اگر حداقل vote_k مدل BUY بگویند → BUY
-        - اگر حداقل vote_k مدل SELL بگویند → SELL
-        - در غیر این صورت → NONE
+        پیش‌بینی کلاس نهایی با رأی‌گیری ساده روی آستانه‌ی ۰.۵
+        (برای داخل GA و بدون آستانه‌های اختصاصی).
         """
-        n = X.shape[0]
-        votes = np.zeros((len(self.models), n), dtype=int)  # 1=BUY, 0=SELL, -1=NONE
+        probs = [m.predict_proba(X)[:, 1] for m in self.models]
+        votes = (np.vstack(probs) >= 0.5).astype(int)  # (n_models, n_samples)
+        avg_vote = votes.mean(axis=0)
+        return (avg_vote >= 0.5).astype(int)
 
-        for i, m in enumerate(self.models):
-            p = m.predict_proba(X)[:, 1]
-            neg, pos = neg_thrs[i], pos_thrs[i]
-            v = np.full(n, -1, dtype=int)
-            v[p <= neg] = 0
-            v[p >= pos] = 1
-            votes[i, :] = v
+    def predict_actions(
+        self,
+        X,
+        neg_thrs: list[float],
+        pos_thrs: list[float],
+        *,
+        min_conf_models: int = 3,
+        buy_ratio: float = 0.7,
+        sell_ratio: float = 0.3,
+    ) -> np.ndarray:
+        """
+        رأی‌گیری با آستانه‌ی جداگانه برای هر مدل (الهام‌گرفته از اسکریپت تست):
 
-        final = np.full(n, -1, dtype=int)
-        # BUY اگر >= vote_k رای BUY
-        buy_mask = (votes == 1).sum(axis=0) >= self.vote_k
-        # SELL اگر >= vote_k رای SELL
-        sell_mask = (votes == 0).sum(axis=0) >= self.vote_k
+        - هر مدل:
+            p <= neg_thr[i]  → SELL (0)
+            p >= pos_thr[i]  → BUY  (1)
+            در غیر این صورت → NONE (-1)
 
-        final[buy_mask] = 1
-        final[sell_mask] = 0
-        # اگر هم BUY هم SELL شد (خیلی بعید) می‌توانی ترجیحی بگذاری؛ فعلاً اولویت را BUY بگذاریم:
-        conflict_mask = buy_mask & sell_mask
-        final[conflict_mask] = 1
+        - اگر حداقل min_conf_models مدل رأی داده باشند و
+            نسبت BUYها >= buy_ratio  → سیگنال BUY
+          اگر نسبت BUYها <= sell_ratio → سیگنال SELL
+          وگرنه → NONE
+        """
+        n_models = len(self.models)
+        if len(neg_thrs) != n_models or len(pos_thrs) != n_models:
+            raise ValueError(
+                f"len(neg_thrs) / len(pos_thrs) باید برابر تعداد مدل‌ها ({n_models}) باشد."
+            )
 
-        return final
+        probs = [m.predict_proba(X)[:, 1] for m in self.models]
+        probs_arr = np.vstack(probs)  # (n_models, n_samples)
+        n_samples = probs_arr.shape[1]
+
+        votes = np.full((n_models, n_samples), -1, dtype=int)
+
+        for i in range(n_models):
+            p = probs_arr[i]
+            v = votes[i]
+            v[p <= float(neg_thrs[i])] = 0
+            v[p >= float(pos_thrs[i])] = 1
+
+        confident = (votes != -1).sum(axis=0).astype(int)
+        buy_count = (votes == 1).sum(axis=0).astype(int)
+
+        actions = np.full(n_samples, -1, dtype=int)
+
+        safe_conf = confident.astype(float)
+        safe_conf[safe_conf == 0] = np.nan
+        vote_ratio = buy_count / safe_conf
+
+        buy_cond = (confident >= min_conf_models) & (vote_ratio >= buy_ratio)
+        sell_cond = (confident >= min_conf_models) & (vote_ratio <= sell_ratio)
+
+        actions[buy_cond] = 1
+        actions[sell_cond] = 0
+
+        return actions
 
     def get_scaler(self):
-        # از اولین مدل اسکیلر را بگیر (برای DriftChecker / compatibility)
-        return self.models[0].get_scaler()
+        """
+        برای DriftChecker: اسکیلر مدل اول (معمولاً logreg) را برمی‌گرداند.
+        """
+        if not self.models:
+            return None
+        m0 = self.models[0]
+        if hasattr(m0, "get_scaler"):
+            return m0.get_scaler()
+        return None
