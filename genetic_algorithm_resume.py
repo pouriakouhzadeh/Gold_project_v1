@@ -122,8 +122,8 @@ def load_checkpoint() -> tuple[int, list, float] | None:
 # ---------------------------------------------------------------------------
 @dataclass
 class GAConfig:
-    population_size: int = 16
-    n_generations: int = 8
+    population_size: int = 25
+    n_generations: int = 15
     cx_pb: float = 0.8
     mut_pb: float = 0.4
     early_stopping_threshold: float = 0.85
@@ -410,7 +410,7 @@ def evaluate_cv(ind):
         15..18: HGB
         19..24: XGB
     """
-    timeout_seconds = 10800  # 3 ساعت
+    timeout_seconds = 32400  # 3 ساعت
     old_handler = None
 
     if hasattr(signal, "SIGALRM"):
