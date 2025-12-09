@@ -72,50 +72,41 @@ np.random.seed(SEED)
 
 # ---------------- BLACKLIST ----------------
 
-def _load_feature_blacklist() -> set[str]:
-    """
-    لیست فیچرهایی که نباید در آموزش/پیش‌بینی استفاده شوند.
-    خروجی: نام فیچرهای *پایه* (بدون _tminus).
-    """
+# در بالای prepare_data_for_train.py (جایی که helper قبلی هست)
 
+def _load_feature_blacklist(parity_path: str = "features_parity_summary.csv") -> set[str]:
+    """
+    خواندن لیست فیچرهای مشکل‌دار از خروجی تست batch vs live.
+    فرض: فایل یک ستون 'feature' و یک ستون 'ratio_diff' دارد.
+    """
     bl: set[str] = set()
+    try:
+        df = pd.read_csv(parity_path)
+        if "feature" in df.columns and "ratio_diff" in df.columns:
+            bad = df[df["ratio_diff"] > 1e-3]["feature"].astype(str).tolist()
+            # bad = df[df["ratio_diff"] > 0.0]["feature"].astype(str).tolist()
+            bl |= set(bad)
+    except Exception:
+        pass
 
-    # ۱) فایل متنی دستی (هر خط یک نام فیچر پایه، مثل '30T_rsi_14')
-    txt_path = Path("feature_blacklist.txt")
-    if txt_path.exists():
-        for ln in txt_path.read_text(encoding="utf-8").splitlines():
-            ln = ln.strip()
-            if ln:
-                bl.add(ln)
+    # اگر فایل features_compare_summary.csv قدیمی هم وجود دارد، به آن اضافه کن
+    try:
+        df2 = pd.read_csv("features_compare_summary.csv")
+        if "feature" in df2.columns:
+            bl |= set(df2["feature"].astype(str).tolist())
+    except Exception:
+        pass
 
-    # ۲) فایل JSON دستی (لیست رشته‌ها)
-    json_path = Path("feature_blacklist.json")
-    if json_path.exists():
-        try:
-            arr = json.loads(json_path.read_text(encoding="utf-8"))
-            for name in arr:
-                if isinstance(name, str) and name.strip():
-                    bl.add(name.strip())
-        except Exception:
-            pass
-
-    # ۳) از گزارش compare (ستون feature معمولاً پنجره‌ای است، با _tminusN)
-    csv_path = Path("features_compare_summary.csv")
-    if csv_path.exists():
-        try:
-            import pandas as pd
-            dfc = pd.read_csv(csv_path)
-            if {"feature", "mismatch_cnt"}.issubset(dfc.columns):
-                mask = dfc["mismatch_cnt"] > 0
-                cand = dfc.loc[mask, "feature"].astype(str).tolist()
-                base_names = set()
-                for f in cand:
-                    # حذف suffix مثل _tminus0 یا _tminus12
-                    base = re.sub(r"_tminus\d+$", "", f)
-                    base_names.add(base)
-                bl |= base_names
-        except Exception:
-            pass
+    # اگر ستون‌های _tminus را هم می‌خواهی حذف کنی، اسم base را هم اضافه کن
+    try:
+        base_names = set()
+        for f in bl:
+            if "_tminus" in f:
+                base = re.sub(r"_tminus\d+$", "", f)
+                base_names.add(base)
+        bl |= base_names
+    except Exception:
+        pass
 
     return bl
 
