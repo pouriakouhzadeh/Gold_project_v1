@@ -52,6 +52,8 @@ from numba_utils import (
     numba_up_count,
 )
 from time_utils import TimeColumnFixer as TFix
+from stable_extra_features import add_stable_extra_features
+
 
 patch_sklearn(verbose=False)
 
@@ -76,37 +78,95 @@ np.random.seed(SEED)
 
 def _load_feature_blacklist(parity_path: str = "features_parity_summary.csv") -> set[str]:
     """
-    خواندن لیست فیچرهای مشکل‌دار از خروجی تست batch vs live.
-    فرض: فایل یک ستون 'feature' و یک ستون 'ratio_diff' دارد.
+    لیست فیچرهایی که نباید در آموزش/پیش‌بینی استفاده شوند.
+    خروجی: نام فیچرهای *پایه* (بدون suffix های _tminusN).
+
+    منابعی که با هم ادغام می‌شوند:
+      1) feature_blacklist.txt
+         - هر خط یک نام فیچر پایه؛ مثال: '30T_rsi_14'
+      2) feature_blacklist.json
+         - JSON array از رشته‌ها
+      3) features_compare_summary.csv
+         - خروجی compare_feature_feeds / اسکریپت‌های قدیمی
+      4) features_parity_summary.csv
+         - خروجی batch_vs_live_feature_parity.py
+           (ستون‌های feature و ratio_diff / n_diff)
     """
+
     bl: set[str] = set()
-    try:
-        df = pd.read_csv(parity_path)
-        if "feature" in df.columns and "ratio_diff" in df.columns:
-            bad = df[df["ratio_diff"] > 1e-3]["feature"].astype(str).tolist()
-            # bad = df[df["ratio_diff"] > 0.0]["feature"].astype(str).tolist()
-            bl |= set(bad)
-    except Exception:
-        pass
 
-    # اگر فایل features_compare_summary.csv قدیمی هم وجود دارد، به آن اضافه کن
-    try:
-        df2 = pd.read_csv("features_compare_summary.csv")
-        if "feature" in df2.columns:
-            bl |= set(df2["feature"].astype(str).tolist())
-    except Exception:
-        pass
+    def _add_base(name: str) -> None:
+        """نام فیچر (با یا بدون _tminusN) را به نام پایه تبدیل و در بلاک‌لیست اضافه می‌کند."""
+        name = (name or "").strip()
+        if not name:
+            return
+        # حذف suffix مثل _tminus0 یا _tminus12
+        base = re.sub(r"_tminus\d+$", "", name)
+        if base:
+            bl.add(base)
 
-    # اگر ستون‌های _tminus را هم می‌خواهی حذف کنی، اسم base را هم اضافه کن
-    try:
-        base_names = set()
-        for f in bl:
-            if "_tminus" in f:
-                base = re.sub(r"_tminus\d+$", "", f)
-                base_names.add(base)
-        bl |= base_names
-    except Exception:
-        pass
+    # ۱) فایل متنی دستی (feature_blacklist.txt)
+    txt_path = Path("feature_blacklist.txt")
+    if txt_path.exists():
+        for ln in txt_path.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if ln:
+                _add_base(ln)
+
+    # ۲) فایل JSON دستی (feature_blacklist.json)
+    json_path = Path("feature_blacklist.json")
+    if json_path.exists():
+        try:
+            arr = json.loads(json_path.read_text(encoding="utf-8"))
+            if isinstance(arr, (list, tuple)):
+                for name in arr:
+                    if isinstance(name, str) and name.strip():
+                        _add_base(name)
+        except Exception:
+            # اگر JSON خراب بود، کل ورودی را نادیده می‌گیریم
+            pass
+
+    # ۳) گزارش قدیمی features_compare_summary.csv
+    compare_path = Path("features_compare_summary.csv")
+    if compare_path.exists():
+        try:
+            dfc = pd.read_csv(compare_path)
+            if "feature" in dfc.columns:
+                if "mismatch_cnt" in dfc.columns:
+                    mask = dfc["mismatch_cnt"] > 0
+                    col = dfc.loc[mask, "feature"].astype(str)
+                else:
+                    # اگر ستون mismatch_cnt نبود، کل feature ها را می‌گیریم
+                    col = dfc["feature"].astype(str)
+
+                for f in col:
+                    _add_base(f)
+        except Exception:
+            pass
+
+    # ۴) گزارش جدید features_parity_summary.csv (batch vs live)
+    parity_path_obj = Path(parity_path)
+    if parity_path_obj.exists():
+        try:
+            dfp = pd.read_csv(parity_path_obj)
+            if "feature" in dfp.columns:
+                if "ratio_diff" in dfp.columns:
+                    # آستانه‌ی قابل تنظیم؛ فعلاً 1e-3
+                    mask = dfp["ratio_diff"] > 1e-3
+                    col = dfp.loc[mask, "feature"].astype(str)
+                else:
+                    # اگر ratio_diff نبود، از n_diff استفاده می‌کنیم
+                    if "n_diff" in dfp.columns:
+                        mask = dfp["n_diff"] > 0
+                        col = dfp.loc[mask, "feature"].astype(str)
+                    else:
+                        # آخرین fallback: همه‌ی feature ها
+                        col = dfp["feature"].astype(str)
+
+                for f in col:
+                    _add_base(f)
+        except Exception:
+            pass
 
     return bl
 
@@ -329,6 +389,31 @@ class PREPARE_DATA_FOR_TRAIN:
         if (not self.fast_mode) and (self.shared_start_date is not None):
             print(f"📅 Shared drift-aware training start date: {self.shared_start_date}")
 
+    # ---------------- EXTRA FEATURES (stable) ----------------
+    def _windows_for_tf(self, tf: str) -> tuple[int, ...]:
+        """
+        نگاشت پنجره‌ها به ازای هر TF (قابل تنظیم).
+        """
+        if tf in ("5T",):
+            return (8, 16, 32)
+        if tf in ("15T",):
+            return (6, 12, 24)
+        if tf in ("30T",):
+            return (5, 10, 20)
+        if tf in ("1H", "60T"):
+            return (4, 8, 16)
+        # پیش‌فرض
+        return (5, 10, 20)
+
+    def add_extra_features(self, df: pd.DataFrame, tf: str) -> pd.DataFrame:
+        """
+        اضافه‌کردن فیچرهای پایدار به «همه‌ی تایم‌فریم‌ها».
+        (هیچ look-forward ندارد و سطر آخر ناپایدار تولید نمی‌کند)
+        """
+        wins = self._windows_for_tf(tf)
+        # اگر خواستی لاگ بگیری:
+        # if self.verbose: print(f"[{tf}] add_stable_extra_features windows={wins}")
+        return add_stable_extra_features(df, tf=tf, windows=wins, use_log_price=True)
 
         # ================= 1) LOAD & FEATURE ENGINEER =================
     def load_and_process_timeframe(self, tf: str, filepath: str) -> pd.DataFrame:
@@ -451,6 +536,9 @@ class PREPARE_DATA_FOR_TRAIN:
         heavy_regex = r"(?:^|_)(?:volume|obv|vpt|adi|nvi|eom|vr)(?:_|$)"
         heavy_cols = df.columns[df.columns.str.contains(heavy_regex, regex=True, case=False)]
         df[heavy_cols] = np.sign(df[heavy_cols]) * np.log1p(np.abs(df[heavy_cols]))
+
+        # ---------------- add extra stable features (for ALL TFs) ---------------
+        df = self.add_extra_features(df, tf=tf)
 
         # ---------------- CALENDAR COLUMNS ----------------
         df.reset_index(inplace=True)
@@ -665,9 +753,10 @@ class PREPARE_DATA_FOR_TRAIN:
         base_candidates = num_cols
 
         # بلاک‌لیست فیچرها (از فایل‌ها)
-        _black = _load_feature_blacklist()
-        if _black:
-            base_candidates = [c for c in base_candidates if c not in _black]
+        black = _load_feature_blacklist()
+        if black:
+            base_candidates = [c for c in base_candidates if c not in black]
+
 
         # ----------------- تفسیر selected_features -----------------
         import re as _re
