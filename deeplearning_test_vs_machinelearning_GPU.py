@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-GPU-accelerated version of ensemble_deep.py
+GPU-accelerated version of ensemble_deep (ROCm-friendly for RX580).
 
 - منطق، اسپلـیت دیتاست، گرید سرچ، ThresholdFinder، گزارش‌ها، ensemble و ... 
   با اسکریپت CPU کاملاً یکسان است.
-- تنها تفاوت: تمام مدل‌های deep روی GPU (RX580/ROCm) اجرا می‌شوند.
+- تمام مدل‌های deep روی GPU (PyTorch-ROCm) اجرا می‌شوند.
 """
 
 # ---------- بخش 0: آرگومان‌ها و قفل‌کردن GPU قبل از import torch ----------
@@ -23,14 +23,14 @@ parser.add_argument("--grid-shard", type=str, default="1/1",
                     help="برای شارد کردن گرید سرچ، مثل 1/2 یا 2/2 (فعلاً معمولاً 1/1)")
 args, _ = parser.parse_known_args()
 
-# این متغیرها باید قبل از import torch ست شوند
+# این متغیرها باید قبل از import torch ست شوند (مطابق docker شما)
 os.environ.setdefault("ROCR_VISIBLE_DEVICES", str(args.gpu))
 os.environ.setdefault("HIP_VISIBLE_DEVICES",  str(args.gpu))
-# برای Polaris لازم است
 os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "8.0.3")
-# پایدارسازی حافظه HIP
-os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "garbage_collection_threshold:0.8,max_split_size_mb:64")
-# پرهیز از SDMA برای پایداری بیشتر
+os.environ.setdefault(
+    "PYTORCH_HIP_ALLOC_CONF",
+    "garbage_collection_threshold:0.8,max_split_size_mb:64"
+)
 os.environ.setdefault("HSA_ENABLE_SDMA", "0")
 os.environ.setdefault("HSA_ENABLE_PEER_SDMA", "0")
 
@@ -66,16 +66,39 @@ def stage(title: str):
 # ==============================
 # Torch helpers
 # ==============================
-def seed_all(seed=2025):
+def seed_all(seed: int = 2025) -> None:
+    """
+    Seed Python, NumPy و Torch (فقط CPU) برای reproducibility.
+
+    ⚠ برای جلوگیری از باگ ROCm ("tuple index out of range"):
+    - عمداً هیچ فراخوانی به torch.cuda.manual_seed / manual_seed_all انجام نمی‌دهیم.
+    - وزن‌های اولیه شبکه روی CPU ساخته می‌شوند، بنابراین torch.manual_seed کافی است.
+    """
     import random
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
-# دستگاه به صورت global (بعداً در main مقداردهی می‌شود)
-device = torch.device("cpu")
+    # تلاش برای دترمینستیک‌شدن الگوریتم‌ها بدون دست‌زدن به RNGهای CUDA/HIP
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
+
+    try:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        # روی ROCm ممکن است backend متفاوت باشد
+        pass
+
+
+# دستگاه پیش‌فرض (در main مجدداً روی cuda:index تنظیم خواهد شد)
+_FORCE_DEV = os.environ.get("FORCE_TORCH_DEVICE", "").lower()
+if _FORCE_DEV in {"cpu", "cuda"}:
+    device = torch.device(_FORCE_DEV)
+else:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ==============================
 # مدل‌ها
@@ -169,7 +192,7 @@ def make_loader(X, y, batch=512, shuffle=False):
         y_t = torch.from_numpy(y.astype(np.float32))
         ds = TensorDataset(X_t, y_t)
     # num_workers=0 برای پایداری روی ROCm/داکر،
-    # pin_memory=False چون داده‌ها روی CPU می‌مانند و فقط batchها به GPU منتقل می‌شوند.
+    # pin_memory=False چون batchها دستی به GPU منتقل می‌شوند.
     return DataLoader(
         ds,
         batch_size=batch,
@@ -180,7 +203,7 @@ def make_loader(X, y, batch=512, shuffle=False):
 
 @torch.no_grad()
 def predict_proba(model, X_np, batch=2048):
-    """دقیقاً همان منطق اسکریپت CPU؛ فقط device=GPU"""
+    """دقیقاً همان منطق اسکریپت CPU؛ فقط device=GPU (ROCm)"""
     model.eval()
     dl = make_loader(X_np, None, batch=batch, shuffle=False)
     outs = []
@@ -206,7 +229,7 @@ def train_one(
     pos_weight=None,
     patience=6,
 ):
-    """کپی تابع CPU، فقط با device=GPU"""
+    """همان train_one نسخهٔ CPU، فقط روی device (GPU/ROCm) اجرا می‌شود."""
     global device
     model = model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
@@ -217,7 +240,7 @@ def train_one(
     else:
         crit = nn.BCEWithLogitsLoss()
 
-    best = {"f1": -1, "state": None, "epoch": -1}
+    best = {"f1": -1.0, "state": None, "epoch": -1}
     dl_tr = make_loader(X_tr, y_tr, batch=batch, shuffle=True)
 
     no_improve = 0
@@ -281,7 +304,7 @@ def train_one(
     return model
 
 # ------------------------------
-# Grid search (با قابلیت shard مثل نسخه GPU قبلی)
+# Grid search (با قابلیت shard)
 # ------------------------------
 def all_param_combos(grid: dict):
     keys = list(grid.keys())
@@ -292,7 +315,7 @@ def all_param_combos(grid: dict):
 def shard_combos(combos, shard_str: str):
     """
     shard_str مثل "1/2" یا "2/3"
-    فقط برای این است که اگر خواستی چند کانتینر موازی اجرا کنی،
+    فقط برای این است که اگر چند کانتینر موازی اجرا شود،
     هر کدام بخشی از گرید را آموزش دهند.
     برای 1/1 همه‌ی کامبوها استفاده می‌شوند (مثل CPU).
     """
@@ -473,7 +496,7 @@ def main():
         pos_weight = None
     log.info(f"Class balance on train: pos_ratio={pos_ratio:.3f} → pos_weight={pos_weight}")
 
-    # 3) DEFINE MODELS & GRIDS (دقیقاً مثل CPU، فقط batch از args.batch می‌آید)
+    # 3) DEFINE MODELS & GRIDS (مثل CPU، batch از args.batch می‌آید)
     stage("Defining Deep models & hyperparameter grids")
     in_dim = X_train_s.shape[1]
 
@@ -528,7 +551,7 @@ def main():
         ),
     ]
 
-    # 4) TRAIN + GRID + VALIDATION (مثل CPU، با grid-shard)
+    # 4) TRAIN + GRID + VALIDATION
     stage("Training (grid-search per model) with bias control & early stopping")
     results = []
     for name, ctor, grid in MODELS:
@@ -568,6 +591,27 @@ def main():
         prob_thresh = predict_proba(best_model, X_thresh_s)[:, 1]
         neg_thr, pos_thr, thr_acc, *_ = tf.find_best_thresholds(prob_thresh, y_thresh)
 
+        # --- Safety nets for GPU runs ---
+        if neg_thr == 0.0 and pos_thr == 1.0:
+            tf_relaxed = ThresholdFinder(steps=600, min_predictions_ratio=0.70)
+            n2, p2, acc2, *_ = tf_relaxed.find_best_thresholds(prob_thresh, y_thresh)
+            if not (n2 == 0.0 and p2 == 1.0):
+                log.warning(
+                    "⚠ ThresholdFinder relaxed fallback applied: neg=%.3f pos=%.3f (bal_acc=%.4f)",
+                    n2, p2, acc2,
+                )
+                neg_thr, pos_thr, thr_acc = n2, p2, acc2
+            else:
+                q_low, q_high = np.quantile(prob_thresh, [0.25, 0.75])
+                neg_thr = float(min(q_low, 0.49))
+                pos_thr = float(max(q_high, 0.51))
+                if neg_thr >= pos_thr:
+                    neg_thr, pos_thr = 0.45, 0.55
+                log.warning(
+                    "⚠ ThresholdFinder quantile fallback applied: neg=%.3f pos=%.3f",
+                    neg_thr, pos_thr,
+                )
+
         # LIVE confident predictions
         prob_live = predict_proba(best_model, X_live_s)[:, 1]
         y_live_pred = np.full(len(prob_live), -1, dtype=int)
@@ -581,7 +625,6 @@ def main():
         else:
             acc_live = bal_live = f1_live = 0.0
 
-        # wins/loses روی live_confident (مثل CPU)
         wins = int(np.sum((y_live_pred == y_live) & mask))
         loses = int(np.sum((y_live_pred != y_live) & mask))
 
@@ -615,9 +658,10 @@ def main():
             }
         )
 
-    # 5) EXPORT stability / test report برای deep models (مثل CPU)
+    # 5) EXPORT stability / test report برای deep models
     stage("Exporting deep model stability report")
     deep_report_path = "deep_stability_report_gpu.csv"
+
     try:
         if results:
             rep = pd.DataFrame(results)[
@@ -657,7 +701,7 @@ def main():
     except Exception as e:
         log.error(f"❌ Failed to write {deep_report_path}: {e}")
 
-    # 6) ENSEMBLE VOTING over deep models (مثل اسکریپت CPU)
+    # 6) ENSEMBLE VOTING over deep models
     stage("Deep-ensemble voting on LIVE (balanced ratio logic with safe divide)")
 
     N = len(X_live_s)
@@ -695,6 +739,8 @@ def main():
         }
     )
     deep_ens_path = "deep_ensemble_predictions_gpu.csv"
+    deep_sig_path = "deep_signals_gpu.csv"
+
     ens_df.to_csv(deep_ens_path, index=False)
     log.info(f"💾 {deep_ens_path} saved.")
 
@@ -724,7 +770,7 @@ def main():
     sig_df.to_csv(deep_sig_path, index=False)
     log.info(f"💾 {deep_sig_path} saved with {len(sig_df)} rows.")
 
-    # 7) COVERAGE + FINAL LIVE ACCURACY (همان لاجیک CPU برای ensemble)
+    # 7) COVERAGE + FINAL LIVE ACCURACY برای ensemble
     stage("Final LIVE accuracy & coverage for deep-ensemble")
     buy_n = int(np.sum(signals == "BUY"))
     sell_n = int(np.sum(signals == "SELL"))

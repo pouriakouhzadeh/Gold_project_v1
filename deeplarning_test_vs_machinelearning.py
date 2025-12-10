@@ -39,9 +39,26 @@ def seed_all(seed=2025):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
+
+    try:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
+
+_FORCE_DEV = os.environ.get("FORCE_TORCH_DEVICE", "").lower()
+if _FORCE_DEV in {"cpu", "cuda"}:
+    device = torch.device(_FORCE_DEV)
+else:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 
 class MLPBlock(nn.Module):
     def __init__(self, in_dim, out_dim, dropout=0.1):
