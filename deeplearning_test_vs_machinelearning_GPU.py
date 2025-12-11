@@ -13,6 +13,7 @@ GPU-accelerated version of ensemble_deep (ROCm-friendly for RX580).
 import os, sys, argparse, math, itertools, logging
 import numpy as np
 import pandas as pd
+import math
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--gpu", type=int, default=0,
@@ -89,7 +90,6 @@ def seed_all(seed: int = 2025) -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
     except Exception:
-        # روی ROCm ممکن است backend متفاوت باشد
         pass
 
 
@@ -701,33 +701,95 @@ def main():
     except Exception as e:
         log.error(f"❌ Failed to write {deep_report_path}: {e}")
 
-    # 6) ENSEMBLE VOTING over deep models
+    # 6) ENSEMBLE VOTING over deep models (مثل اسکریپت CPU ولی با هندلینگ قوی‌تر)
     stage("Deep-ensemble voting on LIVE (balanced ratio logic with safe divide)")
 
     N = len(X_live_s)
-    if results:
-        votes = []
-        probas = []
-        for r in results:
-            proba = r["Prob_Live"]
-            y_c = np.full(N, -1, dtype=int)
-            y_c[proba <= r["NegThr"]] = 0
-            y_c[proba >= r["PosThr"]] = 1
-            votes.append(y_c)
-            probas.append(proba)
-        votes = np.array(votes) if votes else np.empty((0, N))
-        probas = np.array(probas) if probas else np.empty((0, N))
-    else:
-        votes = np.empty((0, N))
-        probas = np.empty((0, N))
 
-    vote_sum = np.sum(votes == 1, axis=0) if votes.size else np.zeros(N)
-    vote_conf = np.sum(votes != -1, axis=0) if votes.size else np.zeros(N)
-    mean_conf = (
-        np.nanmean(np.where(votes != -1, probas, np.nan), axis=0)
-        if votes.size
-        else np.zeros(N)
-    )
+    # مدل‌هایی که روی LIVE هیچ پیش‌بینی مطمئنی ندارند را کنار می‌گذاریم
+    usable = []
+    for r in results:
+        proba = r["Prob_Live"]
+        neg_thr, pos_thr = r["NegThr"], r["PosThr"]
+        if len(proba) == 0:
+            continue
+
+        conf_mask = (proba <= neg_thr) | (proba >= pos_thr)
+        coverage = float(conf_mask.mean()) if proba.size else 0.0
+
+        # Live_F1 در بالا در دیکشنری results ذخیره شده؛
+        # مدل‌هایی با F1=0 یا coverage=0 روی LIVE کمکی به ensemble نمی‌کنند.
+        live_f1 = float(r.get("Live_F1", 0.0))
+        if coverage > 0.0 and live_f1 > 0.0:
+            r = dict(r)  # یک کپی کوچک تا coverage را هم ذخیره کنیم
+            r["Live_Coverage"] = coverage
+            usable.append(r)
+
+    if not usable:
+        log.warning("⚠️ No deep model with non-zero LIVE coverage; ensemble cannot vote.")
+        # با این وجود فایل‌ها را خالی می‌نویسیم تا کدهای بعدی ارور ندهند
+        empty_votes = np.zeros(N, dtype=int)
+        empty_conf  = np.zeros(N, dtype=int)
+        empty_confidence = np.zeros(N, dtype=float)
+
+        ens_df = pd.DataFrame(
+            {
+                "Index": np.arange(N),
+                "y_true": y_live,
+                "Votes_BUY": empty_votes,
+                "Confident_Models": empty_conf,
+                "Mean_Confidence": empty_confidence,
+            }
+        )
+        ens_df.to_csv("deep_ensemble_predictions_gpu.csv", index=False)
+
+        sig_df = pd.DataFrame(
+            {
+                "Index": np.arange(N),
+                "Signal": np.full(N, "NONE", dtype=object),
+                "Price": price_live,
+                "Confidence": empty_confidence,
+                "Votes_BUY": empty_votes,
+                "Confident_Models": empty_conf,
+            }
+        )
+        sig_df.to_csv("deep_signals_gpu.csv", index=False)
+        log.info("💾 deep_ensemble_predictions_gpu.csv & deep_signals_gpu.csv saved (empty ensemble).")
+        return
+
+    n_models = len(usable)
+    log.info(f"Using {n_models} deep models in ensemble (filtered by LIVE coverage/F1).")
+
+    votes = []
+    probas = []
+    for r in usable:
+        proba = r["Prob_Live"]
+        neg_thr, pos_thr = r["NegThr"], r["PosThr"]
+
+        y_c = np.full(N, -1, dtype=int)
+        y_c[proba <= neg_thr] = 0
+        y_c[proba >= pos_thr] = 1
+
+        votes.append(y_c)
+        probas.append(proba)
+
+    votes = np.array(votes)  # شکل (M, N)
+    probas = np.array(probas)
+
+    if votes.size:
+        vote_sum = np.sum(votes == 1, axis=0)
+        vote_conf = np.sum(votes != -1, axis=0)
+
+        with np.errstate(all="ignore"):
+            mean_conf = np.nanmean(
+                np.where(votes != -1, probas, np.nan), axis=0
+            )
+        # اگر جایی همه مدل‌ها NaN بودند، صفر می‌گذاریم تا warning ندهد
+        mean_conf = np.nan_to_num(mean_conf, nan=0.0)
+    else:
+        vote_sum = np.zeros(N, dtype=int)
+        vote_conf = np.zeros(N, dtype=int)
+        mean_conf = np.zeros(N, dtype=float)
 
     ens_df = pd.DataFrame(
         {
@@ -739,22 +801,21 @@ def main():
         }
     )
     deep_ens_path = "deep_ensemble_predictions_gpu.csv"
-    deep_sig_path = "deep_signals_gpu.csv"
-
     ens_df.to_csv(deep_ens_path, index=False)
     log.info(f"💾 {deep_ens_path} saved.")
 
-    # Balanced ratio voting (نیاز به حداقل 3 مدل با رأی confident)
+    # حداقل تعداد مدل‌های لازم برای رأی‌گیری: ۶۰٪ مدل‌های usable، حداقل ۱ مدل
+    min_conf_models = max(1, int(math.ceil(0.6 * n_models)))
+
     signals = np.full(N, "NONE", dtype=object)
     safe_conf = np.where(vote_conf == 0, np.nan, vote_conf)
     vote_ratio = np.divide(vote_sum, safe_conf)  # BUY ratio among confident votes
 
-    buy_condition = (vote_ratio >= 0.7) & (vote_conf >= 3)
-    sell_condition = (vote_ratio <= 0.3) & (vote_conf >= 3)
+    buy_condition = (vote_ratio >= 0.7) & (vote_conf >= min_conf_models)
+    sell_condition = (vote_ratio <= 0.3) & (vote_conf >= min_conf_models)
 
     signals[buy_condition] = "BUY"
     signals[sell_condition] = "SELL"
-    signals[~(buy_condition | sell_condition)] = "NONE"
 
     sig_df = pd.DataFrame(
         {

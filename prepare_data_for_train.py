@@ -53,6 +53,7 @@ from numba_utils import (
 )
 from time_utils import TimeColumnFixer as TFix
 from stable_extra_features import add_stable_extra_features
+from strong_feature_selector import StrongFeatureSelector  
 
 
 patch_sklearn(verbose=False)
@@ -1032,8 +1033,58 @@ class PREPARE_DATA_FOR_TRAIN:
 
     # ================= 6) OUTER INTERFACE =================
     def get_prepared_data(self, window=1, mode="train") -> Tuple[pd.DataFrame, pd.Series, List[str]]:
+        """
+        لایه‌ی نهایی آماده‌سازی داده برای استفاده در مدل‌های ML / DL.
+
+        - تمام منطق مهندسی ویژگی و پنجره‌بندی در ready انجام می‌شود.
+        - در حالت TRAIN، اگر تعداد فیچرها > 300 باشد، یک مرحله‌ی
+          feature selection نهایی (StrongFeatureSelector) روی ماتریس
+          کامل X اجرا می‌شود و حداکثر 300 فیچر با ارتباط قوی‌تر با
+          تارگت نگه داشته می‌شود.
+        """
         merged = self.load_data()
         X, y, feats, _ = self.ready(merged, window=window, mode=mode)
+
+        # --- NEW: مرحله‌ی نهایی feature selection فقط در TRAIN ---
+        MAX_FEATS = 300  # حد بالای فیچر برای سخت‌افزار شما
+
+        if mode == "train" and X.shape[1] > MAX_FEATS:
+            fs_logger = logging.getLogger(__name__)
+            fs_logger.info(
+                "[get_prepared_data] strong FS input shape: rows=%d, cols=%d",
+                X.shape[0],
+                X.shape[1],
+            )
+
+            selector = StrongFeatureSelector(
+                max_features=MAX_FEATS,
+                pre_selection_factor=3,  # یعنی ابتدا تا 3×300 = 900 فیچر برتر با corr نگه می‌دارد
+                random_state=SEED,
+                n_estimators=256,
+            )
+
+            # فقط ستون‌ها کم می‌شود؛ index و مقادیر X دست نمی‌خورد
+            X_selected = selector.fit_transform(X, y)
+            selected_cols = list(X_selected.columns)
+
+            fs_logger.info(
+                "[get_prepared_data] strong FS reduced features from %d to %d",
+                X.shape[1],
+                len(selected_cols),
+            )
+
+            # به‌روزرسانی خروجی و لیست فیچرها
+            X = X_selected
+            feats = selected_cols
+
+            # برای سازگاری با کدهایی که از این پراپرتی استفاده می‌کنند
+            self.train_columns_after_window = selected_cols
+
+        elif mode == "train":
+            # اگر feature selection نهایی اجرا نشد (مثلاً cols <= 300)
+            # همان لیست فیچرهای قبلی را ذخیره کن
+            self.train_columns_after_window = list(feats)
+
         return X, y, feats
 
 
