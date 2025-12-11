@@ -351,6 +351,8 @@ def _fit_and_score_fold(tr_idx, ts_idx, X_full, y_full, price_series, hyper_all,
             df.fillna(df.median(), inplace=True)
 
     # ۴ ModelPipeline بدون کالیبراسیون (برای سرعت GA)
+    logging.info(f"Shape of Data for sending to pipeline models in fit and score fold func => X = {X.shape} & y = {y.shape} ")
+
     models: list[ModelPipeline] = []
     for algo in ("logreg", "rf", "hgb", "xgb"):
         h = hyper_all[algo]
@@ -875,8 +877,8 @@ class GeneticAlgorithmRunner:
         }
 
         # --- آموزش چهار مدل با کالیبراسیون ---
+        logging.info(f"Shape of Data for sending to pipeline models is X = {X.shape} & y = {y.shape} ")
         try:
-            logging.info(f"Shape of Data for sending to pipeline models is X = {X.shape} & y = {y.shape} ")
             mdl_lr = ModelPipeline(
                 hyper_logreg,
                 algo="logreg",
