@@ -876,7 +876,7 @@ class GeneticAlgorithmRunner:
 
         # --- آموزش چهار مدل با کالیبراسیون ---
         try:
-            logging.info(f"Shape of Data for sending to pipeline models is X = {shape(X)} & y = {shape(y)} ")
+            logging.info(f"Shape of Data for sending to pipeline models is X = {X.shape} & y = {y.shape} ")
             mdl_lr = ModelPipeline(
                 hyper_logreg,
                 algo="logreg",
