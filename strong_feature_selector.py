@@ -165,6 +165,7 @@ class StrongFeatureSelector:
                 "[StrongFeatureSelector] No numeric features; nothing selected."
             )
             self.selected_features_ = []
+            
             return self
 
         # --- پاکسازی داخلی برای محاسبات (بدون تغییر X اصلی) ---
@@ -241,7 +242,13 @@ class StrongFeatureSelector:
             self.selected_features_ = cols_corr[: self.max_features]
         else:
             self.selected_features_ = list(non_zero.index[: self.max_features])
-
+        self.logger.info(
+            "[StrongFeatureSelector] selected %d features (max=%d, pre=%d, total=%d)",
+            len(self.selected_features_),
+            self.max_features,
+            self.pre_selection_factor * self.max_features,
+            X_num.shape[1],
+        )
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:

@@ -750,7 +750,6 @@ class GeneticAlgorithmRunner:
         ) = ind
 
         # --- آماده‌سازی X,y ---
-        # --- آماده‌سازی X,y ---
         try:
             X, y, feats, _ = prep.ready(
                 data_tr,
@@ -761,6 +760,13 @@ class GeneticAlgorithmRunner:
                 train_drop_last=False,
                 apply_strong_fs=True,     # ⬅️ اینجا StrongFeatureSelector را فعال می‌کنیم
                 strong_fs_max_features=300,
+            )
+
+            LOGGER.info(
+                "[_build_final_model] ready() returned X shape=%s (cols=%d, feats_list=%d)",
+                X.shape,
+                X.shape[1],
+                len(feats),
             )
 
             # ذخیره‌ی دیتا برای اسکریپت تست ۴ مدلی (همان قبلی)
@@ -797,6 +803,16 @@ class GeneticAlgorithmRunner:
         if X.empty:
             LOGGER.error("[_build_final_model] X became empty after cleaning; aborting final model.")
             return None, []
+        # --- گارد نهایی: حداکثر 300 فیچر در مدل نهایی ---
+        MAX_FEATS = 300
+        if X.shape[1] > MAX_FEATS:
+            LOGGER.warning(
+                "[_build_final_model] X has %d columns after ready()/cleaning; "
+                "truncating to first %d to match StrongFeatureSelector setup.",
+                X.shape[1],
+                MAX_FEATS,
+            )
+            X = X.iloc[:, :MAX_FEATS].copy()
 
         # سازگاری لاجستیک
         if penalty == "l1" and solver not in ["liblinear", "saga"]:

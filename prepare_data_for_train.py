@@ -912,9 +912,13 @@ class PREPARE_DATA_FOR_TRAIN:
 
                 if len(selected_cols) == 0:
                     fs_logger.warning(
-                        "[ready] StrongFeatureSelector returned 0 columns – fallback to original %d features",
+                        "[ready] StrongFeatureSelector returned 0 columns – "
+                        "falling back to first %d features (out of %d).",
+                        MAX_FEATS,
                         X_f.shape[1],
                     )
+                    # fallback: truncate به  MAX_FEATS
+                    X_f = X_f.iloc[:, :MAX_FEATS].copy()
                 else:
                     fs_logger.info(
                         "[ready] StrongFeatureSelector reduced features from %d to %d",
@@ -925,10 +929,14 @@ class PREPARE_DATA_FOR_TRAIN:
 
             except Exception as e:
                 fs_logger.warning(
-                    "[ready] StrongFeatureSelector failed (%s); keeping all %d features.",
+                    "[ready] StrongFeatureSelector failed (%s); "
+                    "falling back to first %d features (out of %d).",
                     e,
+                    MAX_FEATS,
                     X_f.shape[1],
                 )
+                if X_f.shape[1] > MAX_FEATS:
+                    X_f = X_f.iloc[:, :MAX_FEATS].copy()
 
         if mode != "train":
             if predict_drop_last and len(X_f) > 0:

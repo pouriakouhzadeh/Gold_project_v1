@@ -1,36 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-generating_data_for_predict_script.py
--------------------------------------
-ژنراتور آفلاین که نقش MT4 را بازی می‌کند و عملکرد دپلوی را با منطق
-«پیش‌بینی کندل بعدی (t → t+1)» می‌سنجد.
+generation_data_for_predict_script.py (بازنویسی شده)
 
-منطق کلی:
-- روی CSVهای خام متاتریدر (XAUUSD_M30 / M15 / M5 / H1) کار می‌کند.
+ژنراتور آفلاین که نقش MT4 را بازی می‌کند:
+
+- روی CSVهای خام متاتریدر (XAUUSD_M30/M15/M5/H1) کار می‌کند.
 - در هر استپ روی یک کندل M30 با زمان ts_now:
-    1) برای هر تایم‌فریم، تا زمان ts_now یک فایل *_live.csv می‌سازد
-       (فقط آخرین N ردیف هر TF برای سبک بودن).
-    2) منتظر می‌ماند دپلوی روی *_live ها مدل را اجرا کند و answer.txt را
-       با یکی از مقادیر BUY/SELL/NONE بنویسد.
-    3) آخرین ردیف deploy_X_feed_log.csv را می‌خواند و y_prob و cover_cum_deploy
-       را برمی‌دارد.
+    1) برای هر تایم‌فریم تا زمان ts_now یک فایل *_live.csv می‌سازد.
+    2) منتظر می‌ماند دپلوی روی *_live مدل را اجرا کند و answer.txt را
+       با یکی از BUY/SELL/NONE بنویسد.
+    3) آخرین سطر deploy_X_feed_log.csv را می‌خواند (y_prob و cover_cum_deploy).
     4) برچسب واقعی y_true را از روی M30 خام به صورت
-           y_true(t) = 1{ close(t+1) > close(t) }
-       می‌سازد (کندل بعدی).
+           y_true(t_feat) = 1{ close(t_feat+1) > close(t_feat) }
+       حساب می‌کند؛ ts_feat همان ستون 'timestamp' در لاگ دپلوی است.
     5) دقت و کاور تجمعی ژنراتور را به‌روز کرده و در generator_predictions.csv
        ذخیره می‌کند.
-
-خروجی:
-- فایل generator_predictions.csv شامل ستون‌های:
-    timestamp          : زمان فیچر (کندل t)
-    timestamp_trigger  : زمان تریگر (ts_now = زمان همان کندل t)
-    action             : BUY/SELL/NONE
-    y_true             : 0/1 (جهت کندل t→t+1) یا NaN اگر قابل‌محاسبه نباشد
-    y_prob             : احتمال لانگ از دپلوی
-    cover_cum_deploy   : کاور تجمعی دپلوی (از لاگ خودش)
-    cover_cum_gen      : کاور تجمعی ژنراتور (بر اساس BUY/SELL)
-    acc_cum_gen        : دقت تجمعی ژنراتور روی نمونه‌های معامله‌شده
 """
 
 from __future__ import annotations
@@ -46,7 +31,6 @@ import pandas as pd
 
 LOG = logging.getLogger("generator_mt4")
 
-
 # ---------- Logging ----------
 def setup_logging(verbosity: int = 1) -> None:
     level = logging.INFO if verbosity > 0 else logging.WARNING
@@ -56,17 +40,8 @@ def setup_logging(verbosity: int = 1) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-
 # ---------- Helpers ----------
 def resolve_raw_paths(base: Path, symbol: str) -> Dict[str, Path]:
-    """
-    ساخت مسیر CSVهای خام برای هر تایم‌فریم.
-    انتظار داریم فایل‌های متاتریدر این نام‌ها را داشته باشند:
-        symbol_M30.csv
-        symbol_M15.csv
-        symbol_M5.csv
-        symbol_H1.csv  یا  symbol_M1H.csv
-    """
     p_1h = base / f"{symbol}_M1H.csv"
     if not p_1h.is_file():
         p_1h = base / f"{symbol}_H1.csv"
@@ -78,23 +53,16 @@ def resolve_raw_paths(base: Path, symbol: str) -> Dict[str, Path]:
         "1H":  p_1h,
     }
 
-
 def live_name(path: Path) -> Path:
     """XAUUSD_M30.csv → XAUUSD_M30_live.csv"""
     return path.with_name(path.stem + "_live" + path.suffix)
 
-
 def _detect_close_col(df: pd.DataFrame) -> str:
-    """
-    پیدا کردن نام ستون close در دیتافریم M30.
-    معمول‌ترین حالت: 'close'. برای ایمنی چند حالت دیگر را هم چک می‌کنیم.
-    """
     candidates = ["close", "Close", "CLOSE"]
     for c in candidates:
         if c in df.columns:
             return c
     raise ValueError(f"No close column found in M30 data. Available columns: {list(df.columns)}")
-
 
 # ---------- MAIN ----------
 def main() -> None:
@@ -107,7 +75,7 @@ def main() -> None:
         "--last-n",
         default=200,
         type=int,
-        help="تعداد استپ‌هایی که می‌خواهی شبیه‌سازی شود (از انتهای دیتای M30)",
+        help="تعداد استپ‌هایی که می‌خواهی شبیه‌سازی شود (از انتهای M30)",
     )
     ap.add_argument("--sleep", default=0.5, type=float,
                     help="تاخیر بین چک‌کردن answer.txt (ثانیه)")
@@ -122,7 +90,7 @@ def main() -> None:
     LOG.info("=== Generator (MT4-like, next-candle target) started ===")
     LOG.info("Base dir=%s | Symbol=%s | last-n=%d", base, symbol, args.last_n)
 
-    # ---------- مسیر CSVهای خام ----------
+    # ---------- 1) مسیر CSVهای خام ----------
     raw_paths = resolve_raw_paths(base, symbol)
     for tf, p in raw_paths.items():
         if not p.is_file():
@@ -130,7 +98,7 @@ def main() -> None:
             return
         LOG.info("[raw] %s -> %s", tf, p)
 
-    # ---------- بارگذاری CSVهای خام ----------
+    # ---------- 2) بارگذاری CSVهای خام ----------
     raw: Dict[str, pd.DataFrame] = {}
     for tf, p in raw_paths.items():
         df = pd.read_csv(p)
@@ -150,8 +118,7 @@ def main() -> None:
     close_col_30 = _detect_close_col(df30)
 
     total = len(df30)
-    # حداکثر ایندکسی که می‌توانیم برایش برچسب t→t+1 بسازیم (نیاز به t+1 داریم)
-    max_idx_for_label = total - 2
+    max_idx_for_label = total - 2  # نیاز به t+1 داریم
     if max_idx_for_label <= 0:
         LOG.error("Not enough M30 rows for labels (need at least 2).")
         return
@@ -167,14 +134,13 @@ def main() -> None:
         start_idx + n_steps - 1,
     )
 
-    # نگه داشتن فقط آخرین N ردیف در *_live برای سبک بودن
+    # تعداد ردیف‌هایی که در *_live نگه می‌داریم
     SL = {"30T": 1000, "15T": 2000, "5T": 5000, "1H": 1000}
 
     ans_path = base / "answer.txt"
     feed_log_path = base / "deploy_X_feed_log.csv"
     gen_pred_path = base / "generator_predictions.csv"
 
-    # پاک کردن نتیجهٔ قبلی ژنراتور، اگر وجود دارد
     gen_pred_path.unlink(missing_ok=True)
 
     wins = 0
@@ -183,11 +149,11 @@ def main() -> None:
     acc_gen = 0.0
     cover_gen = 0.0
 
-    # ---------- حلقه‌ی اصلی روی کندل‌های M30 ----------
+    # ---------- 3) حلقه‌ی اصلی روی کندل‌های M30 ----------
     for step, idx in enumerate(idx_range, start=1):
         ts_now = df30.loc[idx, "time"]
 
-        # --- 1) ساخت CSVهای زنده تا ts_now ---
+        # --- 3.1) ساخت CSVهای زنده تا ts_now ---
         for tf, df in raw.items():
             cut = df[df["time"] <= ts_now].tail(SL.get(tf, 500)).copy()
             out = live_name(raw_paths[tf])
@@ -200,7 +166,7 @@ def main() -> None:
             ts_now,
         )
 
-        # --- 2) انتظار برای answer.txt از دپلوی ---
+        # --- 3.2) انتظار برای answer.txt از دپلوی ---
         while not ans_path.exists():
             time.sleep(args.sleep)
 
@@ -209,7 +175,6 @@ def main() -> None:
         except Exception:
             ans_raw = ""
         finally:
-            # برای استپ بعدی پاک شود
             try:
                 ans_path.unlink(missing_ok=True)
             except Exception:
@@ -220,8 +185,7 @@ def main() -> None:
         else:
             ans = ans_raw
 
-        # --- 3) خواندن آخرین ردیف از deploy_X_feed_log.csv
-        #      (ts_feat, y_prob, cover_cum_deploy) -- بدون y_true
+        # --- 3.3) خواندن آخرین رکورد deploy_X_feed_log.csv ---
         ts_feat = ts_now
         y_prob = np.nan
         cover_dep = np.nan
@@ -254,7 +218,6 @@ def main() -> None:
                 except Exception:
                     cover_dep = np.nan
 
-            # چک کوچک: timestamp_trigger دپلوی باید با ts_now ژنراتور برابر باشد
             if "timestamp_trigger" in last and not pd.isna(last["timestamp_trigger"]):
                 ts_trig = pd.to_datetime(last["timestamp_trigger"])
                 if ts_trig != ts_now:
@@ -270,19 +233,14 @@ def main() -> None:
                 "Could not read deploy_X_feed_log.csv (using ts_now as ts_feat): %s", e
             )
 
-        # --- 4) محاسبه‌ی y_true بر اساس زمان فیچر (ts_feat) ---
+        # --- 3.4) محاسبه‌ی y_true بر اساس ts_feat (زمان فیچر) ---
         y_true_dep: Optional[float] = None
         y_true_int = np.nan
 
         try:
-            # ts_feat زمانی است که دپلوی برایش فیچر ساخته (ستون 'timestamp' در لاگ دپلوی)
-            # ما باید در M30 ردیفی با این زمان پیدا کنیم و جهت کندل بعدیِ آن را حساب کنیم.
             ts_feat_norm = pd.to_datetime(ts_feat)
-
-            # پیدا کردن ایندکس کندلی که time == ts_feat
             idx_feat_arr = np.where(df30["time"].values == ts_feat_norm)[0]
             if len(idx_feat_arr) == 0:
-                # اگر به هر دلیل پیدا نشد، از idx فعلی استفاده می‌کنیم (رفتار قبلی)
                 idx_feat = idx
             else:
                 idx_feat = int(idx_feat_arr[0])
@@ -293,7 +251,6 @@ def main() -> None:
                 y_true_dep = 1.0 if (c_next > c_now) else 0.0
                 y_true_int = int(y_true_dep)
             else:
-                # آخرین کندل دیتاست: جهت کندل بعدی را نمی‌توان حساب کرد
                 y_true_dep = None
                 y_true_int = np.nan
 
@@ -302,7 +259,7 @@ def main() -> None:
             y_true_dep = None
             y_true_int = np.nan
 
-        # نگاشت اکشن مدل به برچسب باینری
+        # --- 3.5) به‌روزرسانی آمار ژنراتور ---
         if ans == "BUY":
             pred_label: Optional[int] = 1
         elif ans == "SELL":
@@ -339,7 +296,7 @@ def main() -> None:
             cover_dep,
         )
 
-        # --- 5) ذخیره‌ی رکورد این استپ در generator_predictions.csv ---
+        # --- 3.6) ذخیره‌ی رکورد در generator_predictions.csv ---
         row = {
             "timestamp": ts_feat,
             "timestamp_trigger": ts_now,
@@ -358,7 +315,7 @@ def main() -> None:
             index=False,
         )
 
-    # --- گزارش نهایی ---
+    # ---------- 4) گزارش نهایی ----------
     LOG.info(
         "[Final] acc_gen=%.3f cover_gen=%.3f wins=%d loses=%d none=%d",
         acc_gen,
@@ -371,4 +328,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main() 
+    main()
