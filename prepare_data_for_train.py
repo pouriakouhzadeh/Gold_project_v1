@@ -657,6 +657,8 @@ class PREPARE_DATA_FOR_TRAIN:
             with_times: bool = False,
             predict_drop_last: bool = False,
             train_drop_last: bool = False,
+            apply_strong_fs: bool = False,
+            strong_fs_max_features: int = 300,
         ):
         """
         نسخه‌ی هم‌معنا با «پیش‌بینی کندل بعدی»:
@@ -879,6 +881,55 @@ class PREPARE_DATA_FOR_TRAIN:
             t_idx = t_idx.iloc[:-1].reset_index(drop=True)
             close = close.iloc[:-1].reset_index(drop=True)
 
+        # ----------------- StrongFeatureSelector (فقط TRAIN نهایی) -----------------
+        if (
+            mode == "train"
+            and apply_strong_fs
+            and selected_features is None    # یعنی نه CV در GA، نه کال با لیست خاص
+            and X_f.shape[1] > int(strong_fs_max_features)
+        ):
+            fs_logger = logging.getLogger(__name__)
+            MAX_FEATS = int(strong_fs_max_features)
+
+            fs_logger.info(
+                "[ready] StrongFeatureSelector input shape: rows=%d, cols=%d",
+                X_f.shape[0],
+                X_f.shape[1],
+            )
+
+            selector = StrongFeatureSelector(
+                max_features=MAX_FEATS,
+                pre_selection_factor=3,
+                random_state=SEED,
+                n_estimators=256,
+                n_jobs=1,          # برای جلوگیری از oversubscription در GA
+                corr_n_jobs=1,
+            )
+
+            try:
+                X_selected = selector.fit_transform(X_f, y)
+                selected_cols = list(X_selected.columns)
+
+                if len(selected_cols) == 0:
+                    fs_logger.warning(
+                        "[ready] StrongFeatureSelector returned 0 columns – fallback to original %d features",
+                        X_f.shape[1],
+                    )
+                else:
+                    fs_logger.info(
+                        "[ready] StrongFeatureSelector reduced features from %d to %d",
+                        X_f.shape[1],
+                        len(selected_cols),
+                    )
+                    X_f = X_selected
+
+            except Exception as e:
+                fs_logger.warning(
+                    "[ready] StrongFeatureSelector failed (%s); keeping all %d features.",
+                    e,
+                    X_f.shape[1],
+                )
+
         if mode != "train":
             if predict_drop_last and len(X_f) > 0:
                 X_f = X_f.iloc[:-1].reset_index(drop=True)
@@ -892,7 +943,7 @@ class PREPARE_DATA_FOR_TRAIN:
 
         if mode == "train":
             y = y.astype("int64")
-            # ذخیره‌ی ستون‌های نهایی بعد از پنجره برای سازگاری
+            # ذخیره‌ی ستون‌های نهایی بعد از پنجره برای سازگاری با live / threshold / test
             self.train_columns_after_window = feats_final
 
         if with_times:
@@ -1037,52 +1088,22 @@ class PREPARE_DATA_FOR_TRAIN:
         لایه‌ی نهایی آماده‌سازی داده برای استفاده در مدل‌های ML / DL.
 
         - تمام منطق مهندسی ویژگی و پنجره‌بندی در ready انجام می‌شود.
-        - در حالت TRAIN، اگر تعداد فیچرها > 300 باشد، یک مرحله‌ی
-          feature selection نهایی (StrongFeatureSelector) روی ماتریس
-          کامل X اجرا می‌شود و حداکثر 300 فیچر با ارتباط قوی‌تر با
-          تارگت نگه داشته می‌شود.
+        - در حالت TRAIN، اگر apply_strong_fs=True باشد، یک مرحله‌ی
+          StrongFeatureSelector روی ماتریس نهایی X (بعد از window) اجرا می‌شود
+          و حداکثر strong_fs_max_features ستون نگه داشته می‌شود.
         """
         merged = self.load_data()
-        X, y, feats, _ = self.ready(merged, window=window, mode=mode)
+        X, y, feats, _ = self.ready(
+            merged,
+            window=window,
+            mode=mode,
+            apply_strong_fs=(mode == "train"),
+            strong_fs_max_features=300,
+        )
 
-        # --- NEW: مرحله‌ی نهایی feature selection فقط در TRAIN ---
-        MAX_FEATS = 300  # حد بالای فیچر برای سخت‌افزار شما
-
-        if mode == "train" and X.shape[1] > MAX_FEATS:
-            fs_logger = logging.getLogger(__name__)
-            fs_logger.info(
-                "[get_prepared_data] strong FS input shape: rows=%d, cols=%d",
-                X.shape[0],
-                X.shape[1],
-            )
-
-            selector = StrongFeatureSelector(
-                max_features=MAX_FEATS,
-                pre_selection_factor=3,  # یعنی ابتدا تا 3×300 = 900 فیچر برتر با corr نگه می‌دارد
-                random_state=SEED,
-                n_estimators=256,
-            )
-
-            # فقط ستون‌ها کم می‌شود؛ index و مقادیر X دست نمی‌خورد
-            X_selected = selector.fit_transform(X, y)
-            selected_cols = list(X_selected.columns)
-
-            fs_logger.info(
-                "[get_prepared_data] strong FS reduced features from %d to %d",
-                X.shape[1],
-                len(selected_cols),
-            )
-
-            # به‌روزرسانی خروجی و لیست فیچرها
-            X = X_selected
-            feats = selected_cols
-
-            # برای سازگاری با کدهایی که از این پراپرتی استفاده می‌کنند
-            self.train_columns_after_window = selected_cols
-
-        elif mode == "train":
-            # اگر feature selection نهایی اجرا نشد (مثلاً cols <= 300)
-            # همان لیست فیچرهای قبلی را ذخیره کن
+        if mode == "train":
+            # ready خودش train_columns_after_window را ست می‌کند،
+            # ولی برای اطمینان sync می‌کنیم
             self.train_columns_after_window = list(feats)
 
         return X, y, feats

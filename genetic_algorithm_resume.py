@@ -3,15 +3,18 @@
 from __future__ import annotations
 # ---------- Enronviment variable --------------------
 import os, multiprocessing as mp
-cores = str(mp.cpu_count())          # ← تعداد واقعی هسته‌ها
-# اگر می‌خواهید کاملاً آزاد باشد «پاک» کنید؛ در غیر این صورت مساوی cores
-for var in ("OMP_NUM_THREADS",
-            "MKL_NUM_THREADS",
-            "OPENBLAS_NUM_THREADS",
-            "NUMEXPR_NUM_THREADS",
-            "TBB_NUM_THREADS"):
-    os.environ.pop(var, None)        # ➊ پاک‌کردن محدودیت
-    # یا: os.environ[var] = cores    # ➋ تنظیم روی حداکثر
+
+# قبل از هر چیز، تعداد ترد کتابخانه‌های عددی را محدود کن
+NUM_THREADS_PER_PROC = "1"  # برای GA موازی، 1 بهترین گزینه است
+
+for var in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "TBB_NUM_THREADS",
+):
+    os.environ[var] = NUM_THREADS_PER_PROC
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +137,13 @@ LOGGER.info(f"population_size = {CFG.population_size} && generations = {CFG.n_ge
 # ---------------------------------------------------------------------------
 # DEAP primitives
 # ---------------------------------------------------------------------------
-creator.create("FitnessMax", base.Fitness, weights=(1.0,))
-creator.create("Individual", list, fitness=creator.FitnessMax)
+# ---------------------------------------------------------------------------
+# DEAP primitives
+# ---------------------------------------------------------------------------
+if not hasattr(creator, "FitnessMax"):
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+if not hasattr(creator, "Individual"):
+    creator.create("Individual", list, fitness=creator.FitnessMax)
 TOOLBOX = base.Toolbox()
 
 # --------------------Logestic regression --------------------
@@ -627,7 +635,6 @@ class GeneticAlgorithmRunner:
             LOGGER.info(f"[main] Split → train={len(data_tr)}, thresh={len(data_thr)}, test={len(data_te)}")
 
             # ------ pool ------
-    # ------ pool ------
             n_proc = min(mp.cpu_count(), 8)
             pool = mp.Pool(n_proc, initializer=pool_init, initargs=(data_tr, prep))
             LOGGER.info(f"[main] Multiprocessing pool with {n_proc} workers created")
@@ -743,14 +750,17 @@ class GeneticAlgorithmRunner:
         ) = ind
 
         # --- آماده‌سازی X,y ---
+        # --- آماده‌سازی X,y ---
         try:
             X, y, feats, _ = prep.ready(
                 data_tr,
                 window=int(window),
-                selected_features=None,   # انتخاب فیچر در خود ready
+                selected_features=None,   # انتخاب فیچر در خود ready (MI + StrongFS)
                 mode="train",
                 predict_drop_last=False,
                 train_drop_last=False,
+                apply_strong_fs=True,     # ⬅️ اینجا StrongFeatureSelector را فعال می‌کنیم
+                strong_fs_max_features=300,
             )
 
             # ذخیره‌ی دیتا برای اسکریپت تست ۴ مدلی (همان قبلی)

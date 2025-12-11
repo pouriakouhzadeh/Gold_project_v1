@@ -18,12 +18,14 @@ Feature selector نهایی برای مدل‌های کلاسیفیکیشن (ب�
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 import logging
+import multiprocessing as mp
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
+from joblib import Parallel, delayed
 
 
 class StrongFeatureSelector:
@@ -36,6 +38,11 @@ class StrongFeatureSelector:
          Keep at most `pre_selection_factor * max_features`.
       3) Train a RandomForestClassifier on the reduced set and keep
          at most `max_features` features with the highest importances.
+
+    پارالل:
+      - RandomForest با n_jobs اجرا می‌شود (thread-level).
+      - محاسبه‌ی correlation اگر corr_n_jobs > 1 باشد، به صورت block-wise
+        با joblib موازی می‌شود.
     """
 
     def __init__(
@@ -44,6 +51,8 @@ class StrongFeatureSelector:
         pre_selection_factor: int = 3,
         random_state: int = 2025,
         n_estimators: int = 256,
+        n_jobs: int = 1,
+        corr_n_jobs: int = 1,
     ) -> None:
         """
         Parameters
@@ -52,20 +61,82 @@ class StrongFeatureSelector:
             حداکثر تعداد فیچر نهایی که نگه می‌داریم.
         pre_selection_factor : int
             چند برابر max_features را در مرحله‌ی correlation نگه داریم.
-            مثال: اگر max_features=300 و pre_selection_factor=3 باشد
-            حداکثر 900 فیچرِ برتر از نظر correlation با تارگت باقی می‌مانند.
         random_state : int
             جهت reproducibility برای RandomForest.
         n_estimators : int
             تعداد درخت‌های RandomForest.
+        n_jobs : int
+            تعداد تردهای RandomForest (مانند sklearn، -1 یعنی همه‌ی CPUها).
+        corr_n_jobs : int
+            تعداد job برای محاسبه‌ی corrwith به صورت موازی.
+            1 یا کمتر → تک‌تردی. مقادیر منفی مثل joblib رفتار می‌کند.
         """
         self.max_features = int(max_features)
         self.pre_selection_factor = int(max(1, pre_selection_factor))
         self.random_state = int(random_state)
         self.n_estimators = int(n_estimators)
+        self.n_jobs = int(n_jobs)
+        self.corr_n_jobs = int(corr_n_jobs)
 
         self.selected_features_: List[str] = []
         self.logger = logging.getLogger(__name__)
+
+    # ------------------------------------------------------------------ #
+    # کمک‌تابع: correlation به صورت (امکاناً) موازی
+    # ------------------------------------------------------------------ #
+    def _corr_with_target(
+        self,
+        X: pd.DataFrame,
+        y_float: pd.Series,
+    ) -> pd.Series:
+        """
+        محاسبه‌ی corrwith به صورت تک‌تردی یا block-wise موازی.
+        خروجی: |corr| با fillna(0).
+        """
+        # تک‌تردی یا دیتافریم کوچک → روش ساده
+        if self.corr_n_jobs <= 1 or X.shape[1] <= 1:
+            return X.corrwith(y_float).abs().fillna(0.0)
+
+        try:
+            # محاسبه‌ی n_jobs مؤثر
+            if self.corr_n_jobs < 0:
+                try:
+                    cpu = mp.cpu_count()
+                except Exception:
+                    cpu = 1
+                n_jobs = max(1, cpu + self.corr_n_jobs + 1)
+            else:
+                n_jobs = self.corr_n_jobs
+
+            n_jobs = max(1, int(n_jobs))
+            cols = list(X.columns)
+            n_blocks = min(len(cols), n_jobs * 4)  # چند بلاک بیشتر از تردها برای بالانس
+
+            if n_blocks <= 1:
+                return X.corrwith(y_float).abs().fillna(0.0)
+
+            blocks = np.array_split(cols, n_blocks)
+
+            def _block_corr(col_block: List[str]) -> pd.Series:
+                if not col_block:
+                    return pd.Series(dtype=float)
+                return X[col_block].corrwith(y_float)
+
+            parts = Parallel(n_jobs=n_jobs)(
+                delayed(_block_corr)(block.tolist())
+                for block in blocks
+                if len(block) > 0
+            )
+
+            corr = pd.concat(parts)
+            return corr.abs().fillna(0.0)
+
+        except Exception as e:
+            self.logger.warning(
+                "[StrongFeatureSelector] parallel corr failed (%s); falling back to single-thread.",
+                e,
+            )
+            return X.corrwith(y_float).abs().fillna(0.0)
 
     # ------------------------------------------------------------------ #
     # core API
@@ -115,7 +186,8 @@ class StrongFeatureSelector:
         # ------------------------------------------------------------------
         # 1) پیش‌انتخاب بر اساس correlation با تارگت
         # ------------------------------------------------------------------
-        corr = X_work.corrwith(y_float).abs().fillna(0.0)
+        corr = self._corr_with_target(X_work, y_float)
+
         if corr.empty:
             self.logger.warning(
                 "[StrongFeatureSelector] Correlation computation failed; "
@@ -147,7 +219,7 @@ class StrongFeatureSelector:
         rf = RandomForestClassifier(
             n_estimators=self.n_estimators,
             random_state=self.random_state,
-            n_jobs=-1,
+            n_jobs=self.n_jobs,
             class_weight="balanced_subsample",
         )
 
