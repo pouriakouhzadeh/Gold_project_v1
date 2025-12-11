@@ -351,7 +351,7 @@ def _fit_and_score_fold(tr_idx, ts_idx, X_full, y_full, price_series, hyper_all,
             df.fillna(df.median(), inplace=True)
 
     # ۴ ModelPipeline بدون کالیبراسیون (برای سرعت GA)
-    logging.info(f"Shape of Data for sending to pipeline models in fit and score fold func => X = {X.shape} & y = {y.shape} ")
+    LOGGER.INFO(f"Shape of Data for sending to pipeline models in fit and score fold func => X_full = {X_tr.shape} & y_full = {y_tr.shape} ")
 
     models: list[ModelPipeline] = []
     for algo in ("logreg", "rf", "hgb", "xgb"):
